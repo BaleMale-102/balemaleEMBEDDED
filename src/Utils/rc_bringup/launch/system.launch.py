@@ -19,6 +19,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, GroupAction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.conditions import IfCondition
 from launch_ros.actions import Node, PushRosNamespace
 from launch_ros.substitutions import FindPackageShare
 from ament_index_python.packages import get_package_share_directory
@@ -108,12 +109,46 @@ def generate_launch_description():
         output='screen'
     )
     
+    # MQTT Bridge (optional)
+    use_mqtt_arg = DeclareLaunchArgument(
+        'use_mqtt',
+        default_value='false',
+        description='Enable MQTT bridge for server communication'
+    )
+    car_id_arg = DeclareLaunchArgument(
+        'car_id',
+        default_value='car_01',
+        description='Car ID for MQTT topics'
+    )
+    mqtt_host_arg = DeclareLaunchArgument(
+        'mqtt_host',
+        default_value='localhost',
+        description='MQTT broker host'
+    )
+    
+    mqtt_bridge_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(
+                get_package_share_directory('rc_mqtt_bridge'),
+                'launch', 'mqtt_bridge.launch.py'
+            )
+        ),
+        launch_arguments={
+            'car_id': LaunchConfiguration('car_id'),
+            'mqtt_host': LaunchConfiguration('mqtt_host'),
+        }.items(),
+        condition=IfCondition(LaunchConfiguration('use_mqtt'))
+    )
+    
     return LaunchDescription([
         # Arguments
         marker_map_arg,
         serial_port_arg,
         use_ekf_arg,
         show_debug_arg,
+        use_mqtt_arg,
+        car_id_arg,
+        mqtt_host_arg,
         
         # Launches
         sensors_launch,
@@ -121,4 +156,5 @@ def generate_launch_description():
         localization_launch,
         control_launch,
         mission_node,
+        mqtt_bridge_launch,
     ])
