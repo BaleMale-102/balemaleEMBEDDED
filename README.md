@@ -61,30 +61,27 @@
 |------|------|------------|
 | USB 카메라 × 3 | 전방/하단/측면 | USB (v4l2) |
 | MPU6050 | IMU (자이로/가속도) | I2C (bus 7) |
-| 엔코더 × 4 | 휠 속도 | Arduino GPIO |
 
 ### 액추에이터
 | 구성요소 | 사양 |
 |----------|------|
-| 모터 | DC 기어드 모터 × 4 |
-| 드라이버 | PCA9685 (PWM) + L298N |
-| 휠 | 메카넘 휠 (Φ60mm) |
+| 모터 | JGB37-520 DC 기어드 모터 × 4 |
+| 드라이버 | MoebiusTech (PCA9685 + HR8833) |
+| 휠 | 메카넘 휠 (Φ80mm) |
+| PWM 범위 | 300 ~ 2000 (FaBoPWM) |
 
-### 핀 배치 (Arduino)
+### 핀 배치 (Arduino + MoebiusTech)
 ```
-모터 방향 핀:
-  Motor A: D4, D5
-  Motor B: D6, D7
-  Motor C: D8, D9
-  Motor D: D10, D11
+MoebiusTech 보드 (PCA9685 기반):
+  Motor A (FL): CH0, CH1
+  Motor B (FR): CH2, CH3
+  Motor C (RL): CH4, CH5
+  Motor D (RR): CH6, CH7
 
-엔코더 핀:
-  Encoder A: D2 (INT), A0
-  Encoder B: D3 (INT), A1
-  Encoder C: A2, A3 (Polling)
-  Encoder D: A4, A5 (Polling)
+PCA9685: I2C (0x40)
+FaBoPWM 라이브러리 사용
 
-PCA9685: I2C (A4=SDA, A5=SCL) - 충돌 시 소프트웨어 I2C 사용
+엔코더: MoebiusTech 보드 내장 (현재 미사용)
 ```
 
 ---
@@ -244,7 +241,7 @@ ros2_ws/src/
 │           └── mqtt_bridge.launch.py
 │
 └── Arduino/
-    └── Arduino_motor_pid.ino       # Arduino 펌웨어
+    └── Arduino_MoebiusTech_v2.ino   # Arduino 펌웨어 (FaBoPWM)
 ```
 
 ---
@@ -453,9 +450,12 @@ Arduino UART 통신
 |------|------|------|
 | D | `D vx vy wz` | 정규화 속도 (-1~+1) |
 | V | `V vx vy wz` | 실제 속도 (m/s, rad/s) |
+| Z | `Z` | 정지 (enable=false) |
 | O | `O` | Odometry 요청 |
-| K | `K kp ki kd` | PID 게인 설정 |
+| P | `P max_pwm` | 최대 PWM 설정 |
+| C | `C idx scale` | 모터 보정값 설정 |
 | S | `S` | 즉시 정지 |
+| ? | `?` | 상태 확인 |
 
 ---
 
@@ -783,18 +783,34 @@ sudo i2cdetect -y 7
 ### 2단계: Arduino 통신 테스트
 
 ```bash
-# 시리얼 모니터
-screen /dev/ttyUSB0 115200
+# Python으로 테스트 (권장)
+python3 -c "
+import serial
+import time
+s = serial.Serial('/dev/ttyUSB0', 115200, timeout=2)
+time.sleep(2)
+print('INIT:', s.read(200).decode())
 
-# Arduino 응답 확인
-# "READY" 메시지 출력되어야 함
+s.write(b'?\n')
+time.sleep(0.3)
+print('STATUS:', s.read(200).decode())
 
-# 명령 테스트
-D 0.5 0 0    # 전진
-D 0 0.5 0    # 좌측 이동
-D 0 0 0.5    # 좌회전
-S            # 정지
-O            # Odometry 요청
+s.write(b'D 0.15 0 0\n')
+time.sleep(0.3)
+print('D:', s.read(100).decode())
+time.sleep(2)
+
+s.write(b'Z\n')
+s.close()
+"
+
+# 명령어 테스트
+# D vx vy wz  : 정규화 속도 (-1~1)
+# V vx vy wz  : 실제 속도 (m/s)
+# Z           : 정지
+# C           : 보정값 확인
+# C 1 1.1     : Motor B 보정값 1.1로
+# ?           : 상태 확인
 ```
 
 ### 3단계: ROS2 토픽 확인
@@ -983,21 +999,40 @@ r_marker_y: 0.02
 r_marker_theta: 0.05
 ```
 
-### Arduino PID 파라미터
+### Arduino 모터 제어 파라미터
 
 ```cpp
-// Arduino_motor_pid.ino
-#define DEFAULT_KP  80.0f   // 비례 (↑ 빠른 응답, 진동 위험)
-#define DEFAULT_KI  40.0f   // 적분 (↑ 정상상태 오차 제거)
-#define DEFAULT_KD  0.5f    // 미분 (↑ 오버슈트 감소)
+// Arduino_MoebiusTech_v2.ino
+static int MAX_PWM = 2000;           // 최대 PWM (P 명령으로 변경 가능)
+static const int MIN_PWM = 300;      // 최소 PWM (deadband)
+
+// 속도 변환 (V 명령용)
+static const float MAX_VEL_LINEAR = 0.05f;   // 5cm/s에서 normalized 1.0
+static const float MAX_VEL_ANGULAR = 0.5f;   // 0.5rad/s에서 normalized 1.0
+
+// 모터 보정값 (C 명령으로 변경 가능)
+static float motorScale[4] = {1.0f, 1.1f, 1.0f, 1.0f};  // A, B, C, D
 ```
 
-**PID 튜닝 방법:**
-1. KI, KD를 0으로 설정
-2. KP를 진동 직전까지 증가
-3. KP를 절반으로 줄임
-4. KI를 천천히 증가 (정상상태 오차 제거)
-5. 오버슈트가 있으면 KD 추가
+**PWM 매핑:**
+```
+D 0.15 → PWM = 300 + 0.15 * 1700 = 555 (느림)
+D 0.5  → PWM = 300 + 0.5 * 1700 = 1150 (중간)
+D 1.0  → PWM = 2000 (최대)
+```
+
+**모터 보정 방법:**
+1. `D 0.3 0 0` 명령으로 직진 테스트
+2. 휘어지는 방향 확인
+3. 빠른 바퀴의 scale 낮추기
+
+```bash
+# 보정값 확인
+echo "C" > /dev/ttyUSB0
+
+# Motor B(우측) scale을 1.15로 조정
+echo "C 1 1.15" > /dev/ttyUSB0
+```
 
 ---
 
