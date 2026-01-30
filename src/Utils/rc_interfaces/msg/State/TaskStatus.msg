@@ -1,12 +1,11 @@
-# TaskStatus
+# TaskStatus.msg
+# 태스크 수행 상태
+
 std_msgs/Header header
-string task_id
 
-# IDLE / PLATE_CHECK / LOAD / DRIVE / PARK / UNLOAD / FINISH / ERROR
-string state
-
-int32 current_marker_id # 여기서
-int32 next_marker_id    # 요기로 이동중
-
-float32 progress_0_1    # 현재 edge에서 어느정도 진행됐는지 (안될수도있음)
-string detail
+string task_id            # 태스크 고유 ID
+string status             # 상태 (RUNNING, COMPLETED, FAILED, CANCELLED)
+string current_state      # 현재 FSM 상태
+int32 current_marker_id   # 현재 위치 마커 ID
+float32 progress          # 진행률 (0 ~ 1)
+string message            # 상태 메시지

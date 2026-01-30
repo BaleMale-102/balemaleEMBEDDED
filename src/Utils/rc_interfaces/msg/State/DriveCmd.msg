@@ -1,6 +1,10 @@
+# DriveCmd.msg
+# 주행 명령
+
 std_msgs/Header header
-bool enable
-float32 vx  # 앞/뒤
-float32 vy  # 좌/우
-float32 wz  # 평행이동
-string source # Node 어디서 오는지
+
+bool enable               # 주행 활성화
+float32 vx                # 전진 속도 (m/s, 전방 양수)
+float32 vy                # 횡방향 속도 (m/s, 왼쪽 양수)
+float32 wz                # 회전 속도 (rad/s, 반시계 양수)
+string source             # 명령 출처 (디버그용)

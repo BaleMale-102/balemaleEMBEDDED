@@ -1,0 +1,45 @@
+# rc_localization/config/ekf_localization.yaml
+
+ekf_localization_node:
+  ros__parameters:
+    # 입력 토픽
+    marker_status_topic: /perception/marker_status
+    imu_topic: /imu/data
+    odom_topic: /odom/wheel
+    
+    # 출력 토픽
+    pose_topic: /localization/pose
+    odom_out_topic: /localization/odom
+    fix_valid_topic: /localization/fix_valid
+    
+    # Frame IDs
+    map_frame: map
+    odom_frame: odom
+    base_frame: base_link
+    
+    # TF 발행
+    publish_tf: true
+    tf_map_to_odom: true
+    
+    # Marker Map
+    marker_map_yaml: ""   # Launch에서 설정
+    map_unit_scale: 0.01  # cm -> m
+    
+    # 카메라 오프셋 (base_link -> camera_front)
+    cam_offset_x: 0.06    # 6cm 전방
+    cam_offset_y: 0.0
+    
+    # 품질 필터
+    min_marker_quality: 0.25
+    
+    # Timeout
+    marker_timeout_sec: 1.0
+    imu_timeout_sec: 0.3
+    odom_timeout_sec: 0.5
+    
+    # 주기
+    predict_rate_hz: 50.0
+    publish_rate_hz: 20.0
+    
+    # Logging
+    log_throttle_sec: 2.0
