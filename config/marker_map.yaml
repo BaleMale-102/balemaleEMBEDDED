@@ -87,52 +87,74 @@ markers:
 #=================================================#
 #                 주차칸 markers
 #                  id: 16 ~ 27
+#
+# Parking spot layout (between y=111 and y=187):
+#   - Row A (y=130): Slots aligned with markers 5-8
+#   - Row B (y=168): Slots aligned with markers 11-14
+#   - x positions match road marker spacing
+#
+# Parking spots face the entrance (yaw toward road)
 #=================================================#
 
-  - id: 16   
-    x: 
-    y: 
+  # Row A - Upper parking slots (facing down toward y=111)
+  - id: 16   # Slot A1 - aligned with marker 5
+    x: 42.5
+    y: 130.0
+    yaw: -1.5708  # facing down (-90deg)
 
-  - id: 17   
-    x: 
-    y: 
+  - id: 17   # Slot A2 - aligned with marker 6
+    x: 54.5
+    y: 130.0
+    yaw: -1.5708
 
-  - id: 18   
-    x: 
-    y: 
+  - id: 18   # Slot A3 - aligned with marker 7
+    x: 66.0
+    y: 130.0
+    yaw: -1.5708
 
-  - id: 19   
-    x: 
-    y: 
+  - id: 19   # Slot A4 - aligned with marker 8
+    x: 78.0
+    y: 130.0
+    yaw: -1.5708
 
-  - id: 20   
-    x: 
-    y: 
+  # Row B - Lower parking slots (facing up toward y=187)
+  - id: 20   # Slot B1 - aligned with marker 11
+    x: 42.5
+    y: 168.0
+    yaw: 1.5708   # facing up (+90deg)
 
-  - id: 21   
-    x: 
-    y: 
+  - id: 21   # Slot B2 - aligned with marker 12
+    x: 54.5
+    y: 168.0
+    yaw: 1.5708
 
-  - id: 22
-    x: 
-    y: 
+  - id: 22   # Slot B3 - aligned with marker 13
+    x: 66.0
+    y: 168.0
+    yaw: 1.5708
 
-  - id: 23   
-    x: 
-    y: 
-  
-  - id: 24       
-    x: 
-    y: 
-  
-  - id: 25   
-    x: 
-    y: 
-  
-  - id: 26
-    x: 
-    y: 
-  
-  - id: 27   
-    x: 
-    y: 
+  - id: 23   # Slot B4 - aligned with marker 14
+    x: 78.0
+    y: 168.0
+    yaw: 1.5708
+
+  # Row C - Middle parking slots (center lane, y=149)
+  - id: 24   # Slot C1
+    x: 42.5
+    y: 149.0
+    yaw: 0.0      # facing right (0deg)
+
+  - id: 25   # Slot C2
+    x: 54.5
+    y: 149.0
+    yaw: 0.0
+
+  - id: 26   # Slot C3
+    x: 66.0
+    y: 149.0
+    yaw: 3.1416   # facing left (180deg)
+
+  - id: 27   # Slot C4
+    x: 78.0
+    y: 149.0
+    yaw: 3.1416
