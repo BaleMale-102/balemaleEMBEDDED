@@ -1,0 +1,167 @@
+control_stack_node:
+  ros__parameters:
+    # =====================
+    # topics
+    # =====================
+    lane_topic: /perception/lane
+    parking_line_topic: /perception/parking_line
+    slot_marker_pose_topic: /perception/slot_marker_pose
+    marker_pose_topic: /perception/marker_pose
+
+    enable_drive_topic: /control/enable_drive
+    mission_state_topic: /mission/state
+    turn_target_topic: /mission/turn_target_rad
+    align_done_topic: /mission/align_done
+
+    publish_raw_cmd: true
+    out_raw_topic: /control/drive_cmd
+    unload_topic: /unload/start
+
+    # emergency suppress
+    emergency_topic: /control/drive_cmd_emergency
+    emergency_timeout_ms: 300
+
+    # =====================
+    # frames
+    # =====================
+    base_frame: base_link
+    front_cam_frame: camera_front
+    side_cam_frame: camera_side
+
+    # =====================
+    # loop
+    # =====================
+    timer_hz: 30.0
+    log_throttle_sec: 1.0
+
+    # =====================
+    # lane follower (NEW steering 기반)
+    # =====================
+    lane_timeout_ms: 300
+    min_quality: 0.20
+    stop_on_lane_lost: true
+
+    max_error_norm: 0.30            # offset_norm clamp
+    angle_max_rad: 0.60             # (NEW) lane.angle clamp (rad) 0.6~0.7 추천
+
+    # steering (NEW)
+    k_psi: 2.0                      # (NEW) heading gain
+    k_y: 2.5                        # (NEW) lateral gain
+    v0: 0.10                        # (NEW) atan 분모 보호 (0.05 -> 0.10: 저속 흔들림↓)
+    err_lpf_alpha: 0.25             # (NEW) 0.15~0.35 범위
+    deadband_offset: 0.02           # (NEW) 작은 오프셋 무시
+    deadband_angle: 0.03            # (NEW) 작은 각도 무시 (rad)
+    lowq_steer_gain: 0.35           # (NEW) q<min_q일 때 조향 약화(증폭 X)
+
+    invert_steering: false          # 방향 반대면 true로
+
+    # speed + limits
+    linear_speed: 0.10
+    vx_max: 0.25
+    vx_min: 0.08
+    enforce_vx_min: false
+
+    wz_max: 0.85                    # 1.0 -> 0.85 (튀는거↓)
+    vx_when_turning: 0.10           # 0.12 -> 0.10 (회전 시 속도↓)
+    turn_threshold: 0.15            # 0.30 -> 0.15 (조금만 꺾여도 감속)
+
+    # slew (안전)
+    vx_slew: 1.0
+    wz_slew: 2.0                    # 3.0 -> 2.0 (급조향 완화)
+
+    # low quality 동작
+    stop_on_low_quality: false
+    low_quality_speed_scale: 0.30
+
+    # (LEGACY: NEW steering에선 사용 안 함)
+    # k_wz: 1.2
+    # loss_factor: 1.2
+
+    # =====================
+    # advance
+    # =====================
+    advance_vx: 0.12
+    advance_wz: 0.0
+    advance_vx_slew: 1.2
+    advance_wz_slew: 6.0
+    advance_stop_on_lane_lost: false
+    advance_require_lane_fresh: false
+
+    # =====================
+    # turning
+    # =====================
+    wz_turn: 0.8
+    wz_turn_slew: 6.0
+    turn_vx: 0.0
+    turn_invert: false
+
+    # =====================
+    # global scales
+    # =====================
+    speed_scale: 1.0
+    wz_scale: 1.0
+
+    # =====================
+    # parking
+    # =====================
+    parking_active_state_name: PARK
+    parking_publish_disable_once_on_deactivate: true
+
+    park_k_offset: 1.2
+    park_k_angle: 0.8
+    park_max_wz: 1.2
+    park_vx_cmd: 0.10
+    park_vy_cmd: 0.0
+
+    park_require_valid: true
+    park_min_quality: 0.20
+
+    park_align_offset_eps: 0.03
+    park_align_angle_eps: 0.10
+    park_auto_hold_when_aligned: true
+
+    park_k_x: 0.8
+    park_k_y: 1.2
+    park_k_yaw: 1.0
+
+    park_vx_max: 0.12
+    park_vy_max: 0.18
+    park_wz_max2: 1.2
+
+    park_desired_standoff_x: 0.20
+
+    park_eps_x: 0.02
+    park_eps_y: 0.02
+    park_eps_yaw: 0.10
+    park_use_marker_yaw: false
+
+    # =====================
+    # ALIGN_TO_MARKER
+    # =====================
+    marker_pose_timeout_ms: 250
+
+    align_k_x: 0.8
+    align_k_y: 1.2
+    align_k_yaw: 1.0
+
+    align_vx_max: 0.10
+    align_vy_max: 0.12
+    align_wz_max: 0.9
+
+    align_desired_x: 0.20
+    align_desired_y: 0.0
+
+    align_eps_x: 0.02
+    align_eps_y: 0.02
+    align_eps_yaw: 0.10
+    align_use_marker_yaw: false
+
+# 빠른 튜닝 룰 (실차에서 바로 적용)
+
+# 차가 라인을 “반대로” 꺾으면 → invert_steering: true --> 이런적은 없었음
+
+# 직진 중 좌우로 “출렁출렁” → wz_slew 더 낮추기(2.0→1.5) + v0 더 올리기(0.10→0.12)
+
+# 코너에서 못 따라가고 바깥으로 밀림 → k_y 올리기(2.5→3.0) 또는 wz_max 올리기(0.85→0.95)
+
+# 너무 느리게 가서 답답 → linear_speed 0.20→0.23, 단 wz_max는 그대로 유지

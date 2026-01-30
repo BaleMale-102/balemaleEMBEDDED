@@ -1,0 +1,29 @@
+# colcon / ROS build artifacts
+/build/
+/install/
+/log/
+
+# python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# editor / ide
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# CMake leftovers
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Makefile
+
+# rosbag / sqlite
+*.db3
+*.bag
+*.bag*
+config/calibration_front/
