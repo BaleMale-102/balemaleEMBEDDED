@@ -1,0 +1,95 @@
+# Robot Parameters Configuration
+# All units: meters, radians, seconds
+
+# ============================================
+# Perception Parameters
+# ============================================
+marker_detector:
+  ros__parameters:
+    dictionary: "DICT_4X4_50"
+    marker_size: 0.10                # 10cm markers
+    publish_debug_image: true
+    image_topic: "/camera/front/image_raw"
+    camera_info_topic: "/camera/front/camera_info"
+    frame_id: "camera_front_link"
+
+marker_tracker:
+  ros__parameters:
+    process_noise: 0.01
+    measurement_noise: 0.05
+    prediction_timeout: 2.0
+    min_prediction_confidence: 0.3
+
+lane_detector:
+  ros__parameters:
+    image_topic: "/camera/bottom/image_raw"
+    publish_debug_image: true
+    roi_top_ratio: 0.5
+    roi_bottom_ratio: 1.0
+    sobel_threshold: 50
+    min_line_pixels: 100
+    line_color: "black"
+    kalman_q: 0.01
+    kalman_r: 0.05
+
+# ============================================
+# Control Parameters
+# ============================================
+motion_controller:
+  ros__parameters:
+    control_rate: 20.0
+    max_vx: 0.05
+    max_vy: 0.05
+    max_wz: 0.5
+    # Lane following
+    lane_vx: 0.03
+    lane_vy_kp: 0.03
+    lane_vy_ki: 0.0
+    lane_vy_kd: 0.005
+    lane_wz_kp: 0.3
+    lane_wz_ki: 0.0
+    lane_wz_kd: 0.05
+    # Marker approach
+    marker_vx_kp: 0.1
+    marker_vy_kp: 0.05
+    marker_wz_kp: 0.3
+    marker_reach_distance: 0.15
+    marker_min_distance: 0.08
+    # Turn
+    turn_wz: 0.3
+    turn_tolerance: 0.05
+
+wheel_controller:
+  ros__parameters:
+    # Kinematics
+    wheel_radius: 0.03              # 30mm
+    wheel_base_x: 0.08              # 80mm
+    wheel_base_y: 0.06              # 60mm
+    max_wheel_speed: 10.0           # rad/s
+    max_pwm: 3000
+    pwm_deadzone: 100
+    # Serial
+    serial_port: "/dev/ttyUSB0"
+    serial_baud: 115200
+    simulation: false
+    # Safety
+    watchdog_timeout: 0.3
+    cmd_rate: 20.0
+
+# ============================================
+# Planning Parameters
+# ============================================
+mission_manager:
+  ros__parameters:
+    update_rate: 10.0
+    default_turn_angle: 1.57        # 90 degrees
+
+server_bridge:
+  ros__parameters:
+    mqtt_host: "localhost"
+    mqtt_port: 1883
+    mqtt_username: ""
+    mqtt_password: ""
+    car_id: "car_01"
+    simulation: false
+    status_rate: 2.0
