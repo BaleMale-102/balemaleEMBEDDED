@@ -40,7 +40,7 @@ def generate_launch_description():
     
     use_lane_arg = DeclareLaunchArgument(
         'use_lane', default_value='true',
-        description='Enable lane detection (for turning)'
+        description='Enable lane detection (front_cam)'
     )
     
     serial_port_arg = DeclareLaunchArgument(
@@ -63,13 +63,23 @@ def generate_launch_description():
         description='ArUco marker size (m)'
     )
     
+    cam_calib_arg = DeclareLaunchArgument(
+        'cam_calib', default_value='/home/a102/balemaleEMBEDDED/config/cam_front_calib.yaml',
+        description='Camera calibration file'
+    )
+    
     turn_invert_arg = DeclareLaunchArgument(
         'turn_invert', default_value='false',
         description='Invert turn direction'
     )
     
+    turn_time_arg = DeclareLaunchArgument(
+        'turn_time', default_value='1.5',
+        description='Time for 90 degree turn (seconds) - tune this!'
+    )
+    
     extra_forward_arg = DeclareLaunchArgument(
-        'extra_forward', default_value='1.2',
+        'extra_forward', default_value='0.6',
         description='Extra forward time after marker lost (sec)'
     )
     
@@ -118,18 +128,21 @@ def generate_launch_description():
             'image_topic': '/cam_front/image_raw',
             'marker_size': LaunchConfiguration('marker_size'),
             'show_debug': LaunchConfiguration('show_debug'),
+            'camera_calib_yaml': LaunchConfiguration('cam_calib'),
         }],
         output='screen'
     )
     
-    # Lane Node (턴 종료 판단용)
+    # Lane Node (front_cam에서 라인 검출)
     lane_node = Node(
         package='rc_perception',
-        executable='lane_node_v2',
-        name='lane_node_v2',
+        executable='lane_node_v3',
+        name='lane_node_v3',
         parameters=[{
-            'image_topic': '/cam_bottom/image_raw',
+            'image_topic': '/cam_front/image_raw',
             'show_debug': LaunchConfiguration('show_debug'),
+            'offset_deadzone': 0.1,   # 10% 이내면 중앙
+            'angle_offset_deg': 0.0,  # 직선일때 오프셋 (튜닝 필요시)
         }],
         condition=IfCondition(LaunchConfiguration('use_lane')),
         output='screen'
@@ -138,7 +151,7 @@ def generate_launch_description():
     # IMU Node
     imu_node = Node(
         package='rc_imu_mpu6050',
-        executable='imu_node',
+        executable='imu_mpu6050_node',
         name='imu_node',
         parameters=[{
             'i2c_bus': 1,
@@ -176,12 +189,15 @@ def generate_launch_description():
         parameters=[{
             # 테스트 확정 파라미터
             'drive_vx': 0.003,
-            'drive_vy_gain': -0.03,
+            'drive_vy_gain': 0.03,  # 양수로 변경
             'drive_max_vy': 0.005,
+            'drive_wz_gain': 0.0,   # 일단 비활성화
+            'drive_max_wz': 0.1,
             'reach_distance': 0.30,
             'extra_forward_sec': LaunchConfiguration('extra_forward'),
-            'turn_wz': 0.08,  # 느리게
+            'turn_wz': 0.10,  # 회전 속도 (관성 줄이기 위해 느리게)
             'turn_wz_invert': LaunchConfiguration('turn_invert'),
+            'turn_time_90': LaunchConfiguration('turn_time'),
         }],
         output='screen'
     )
@@ -194,7 +210,9 @@ def generate_launch_description():
         front_cam_arg,
         bottom_cam_arg,
         marker_size_arg,
+        cam_calib_arg,
         turn_invert_arg,
+        turn_time_arg,
         extra_forward_arg,
         use_imu_arg,
         

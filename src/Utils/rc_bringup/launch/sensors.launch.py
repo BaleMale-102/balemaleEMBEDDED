@@ -114,7 +114,7 @@ def generate_launch_description():
         package='tf2_ros',
         executable='static_transform_publisher',
         name='tf_base_to_cam_front',
-        arguments=['0.06', '0', '0.05', '0', '0', '0', 'base_link', 'camera_front']
+        arguments=['0.05', '0', '0.01', '0', '0', '0', 'base_link', 'camera_front']
     )
     
     # base_link -> camera_bottom (아래 방향)

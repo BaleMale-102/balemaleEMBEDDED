@@ -24,7 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             # 핵심 노드
-            'lane_node = rc_perception.lane_node_v2:main',
+            'lane_node_v3 = rc_perception.lane_node_v3:main',
             'lane_node_v2 = rc_perception.lane_node_v2:main',
             'marker_pose_node = rc_perception.marker_pose_node:main',
             # 주차용 (stub - 실제 구현 필요)

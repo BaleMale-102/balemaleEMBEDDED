@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
-marker_pose_node.py
+marker_pose_node.py (v2 - 기울어진 마커 인식 개선)
 
-ArUco 마커 인식 및 상대 포즈 추정
+개선사항:
+- DetectorParameters 튜닝 (기울어진 마커)
+- Corner refinement (subpix)
+- CLAHE 전처리 (조명 변화에 강함)
+- 더 관대한 검출 파라미터
 
 토픽:
   Subscribe:
@@ -10,9 +14,8 @@ ArUco 마커 인식 및 상대 포즈 추정
     - /cam_front/camera_info (CameraInfo) [선택]
   
   Publish:
-    - /perception/marker_pose (PoseStamped) - 마커 포즈
-    - /perception/marker_status (MarkerStatus) - 마커 상태
-    - TF: camera_front -> marker_<id>
+    - /perception/marker_pose (PoseStamped)
+    - /perception/marker_status (MarkerStatus)
 """
 
 import math
@@ -28,7 +31,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
-from std_msgs.msg import Header
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from cv_bridge import CvBridge
@@ -53,15 +55,16 @@ class MarkerPoseNode(Node):
         
         # ArUco 설정
         self.declare_parameter('aruco_dict', 'DICT_4X4_50')
-        self.declare_parameter('marker_size_road', 0.04)    # 도로 마커 4cm
-        self.declare_parameter('marker_size_slot', 0.02)    # 주차칸 마커 2cm
-        self.declare_parameter('road_marker_max_id', 15)    # ID 0-15: 도로
+        self.declare_parameter('marker_size', 0.04)
+        self.declare_parameter('marker_size_road', 0.04)
+        self.declare_parameter('marker_size_slot', 0.02)
+        self.declare_parameter('road_marker_max_id', 15)
         
         # EMA smoothing
-        self.declare_parameter('ema_alpha', 0.3)
+        self.declare_parameter('ema_alpha', 0.5)
         
         # 품질 계산
-        self.declare_parameter('quality_area_min', 500.0)
+        self.declare_parameter('quality_area_min', 200.0)
         self.declare_parameter('quality_area_max', 50000.0)
         
         self.declare_parameter('frame_id', 'camera_front')
@@ -71,6 +74,7 @@ class MarkerPoseNode(Node):
         self.declare_parameter('show_debug', False)
         
         # Load params
+        self.marker_size = self.get_parameter('marker_size').value
         self.marker_size_road = self.get_parameter('marker_size_road').value
         self.marker_size_slot = self.get_parameter('marker_size_slot').value
         self.road_max_id = self.get_parameter('road_marker_max_id').value
@@ -81,11 +85,42 @@ class MarkerPoseNode(Node):
         self.publish_tf = self.get_parameter('publish_tf').value
         self.show_debug = self.get_parameter('show_debug').value
         
-        # ArUco detector
+        # ArUco detector with tuned parameters
         dict_name = self.get_parameter('aruco_dict').value
         aruco_dict_id = getattr(cv2.aruco, dict_name, cv2.aruco.DICT_4X4_50)
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict_id)
+        
+        # ===== 파라미터 튜닝 - 기울어진 마커 인식 개선 =====
         self.aruco_params = cv2.aruco.DetectorParameters()
+        
+        # Adaptive threshold - 조명 변화에 강하게
+        self.aruco_params.adaptiveThreshWinSizeMin = 3
+        self.aruco_params.adaptiveThreshWinSizeMax = 30
+        self.aruco_params.adaptiveThreshWinSizeStep = 5
+        self.aruco_params.adaptiveThreshConstant = 7
+        
+        # 마커 크기 범위 확장 (멀리/가까이 모두)
+        self.aruco_params.minMarkerPerimeterRate = 0.01  # 더 작은 마커도 검출
+        self.aruco_params.maxMarkerPerimeterRate = 4.0
+        
+        # 기울어진 마커 인식 개선
+        self.aruco_params.perspectiveRemoveIgnoredMarginPerCell = 0.1
+        self.aruco_params.perspectiveRemovePixelPerCell = 8
+        
+        # 코너 검출 관대하게
+        self.aruco_params.polygonalApproxAccuracyRate = 0.05
+        self.aruco_params.minCornerDistanceRate = 0.02
+        self.aruco_params.minDistanceToBorder = 2
+        
+        # 에러 보정 관대하게
+        self.aruco_params.errorCorrectionRate = 0.9
+        
+        # Corner refinement (subpixel 정확도)
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_params.cornerRefinementWinSize = 5
+        self.aruco_params.cornerRefinementMaxIterations = 50
+        self.aruco_params.cornerRefinementMinAccuracy = 0.01
+        
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
         
         # Camera intrinsics
@@ -97,59 +132,34 @@ class MarkerPoseNode(Node):
         self._lock = threading.Lock()
         self._frame: Optional[np.ndarray] = None
         
-        # EMA state (per marker id)
-        self._ema_pose = {}  # id -> (x, y, z, yaw)
+        # EMA state
+        self._ema_pose = {}
+        
+        # CLAHE for contrast enhancement
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         
         # TF broadcaster
         if self.publish_tf:
             self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         
         # Publishers
-        self.pub_pose = self.create_publisher(
-            PoseStamped, 
-            self.get_parameter('pose_topic').value, 
-            10
-        )
-        self.pub_status = self.create_publisher(
-            MarkerStatus, 
-            self.get_parameter('status_topic').value, 
-            10
-        )
+        self.pub_pose = self.create_publisher(PoseStamped, self.get_parameter('pose_topic').value, 10)
+        self.pub_status = self.create_publisher(MarkerStatus, self.get_parameter('status_topic').value, 10)
         
         # Subscribers
-        self.sub_img = self.create_subscription(
-            Image,
-            self.get_parameter('image_topic').value,
-            self.cb_image,
-            qos_profile_sensor_data
-        )
-        self.sub_info = self.create_subscription(
-            CameraInfo,
-            self.get_parameter('camera_info_topic').value,
-            self.cb_camera_info,
-            10
-        )
+        self.sub_img = self.create_subscription(Image, self.get_parameter('image_topic').value, self.cb_image, qos_profile_sensor_data)
+        self.sub_info = self.create_subscription(CameraInfo, self.get_parameter('camera_info_topic').value, self.cb_camera_info, 10)
         
         # Timer
         period = 1.0 / max(1.0, self.get_parameter('process_rate_hz').value)
         self.timer = self.create_timer(period, self.process_frame)
         
-        self.get_logger().info(
-            f"marker_pose_node started\n"
-            f"  road marker size: {self.marker_size_road}m\n"
-            f"  slot marker size: {self.marker_size_slot}m"
-        )
+        self.get_logger().info(f"marker_pose_node v2 started (improved detection)")
     
     def _load_camera_calib(self):
-        """카메라 캘리브레이션 파일 로드"""
         path = self.get_parameter('camera_calib_yaml').value
         if not path:
-            # 기본값 (640x480)
-            self.camera_matrix = np.array([
-                [600, 0, 320],
-                [0, 600, 240],
-                [0, 0, 1]
-            ], dtype=np.float64)
+            self.camera_matrix = np.array([[500, 0, 320], [0, 500, 240], [0, 0, 1]], dtype=np.float64)
             self.dist_coeffs = np.zeros(5, dtype=np.float64)
             self.get_logger().warn("Using default camera intrinsics")
             return
@@ -157,15 +167,12 @@ class MarkerPoseNode(Node):
         try:
             with open(path, 'r') as f:
                 data = yaml.safe_load(f)
-            
             self.camera_matrix = np.array(data['camera_matrix']['data'], dtype=np.float64).reshape(3, 3)
             self.dist_coeffs = np.array(data['distortion_coefficients']['data'], dtype=np.float64)
-            
             self.get_logger().info(f"Loaded camera calib: {path}")
-            
         except Exception as e:
             self.get_logger().error(f"Failed to load camera calib: {e}")
-            self.camera_matrix = np.array([[600, 0, 320], [0, 600, 240], [0, 0, 1]], dtype=np.float64)
+            self.camera_matrix = np.array([[500, 0, 320], [0, 500, 240], [0, 0, 1]], dtype=np.float64)
             self.dist_coeffs = np.zeros(5, dtype=np.float64)
     
     def cb_image(self, msg: Image):
@@ -177,9 +184,11 @@ class MarkerPoseNode(Node):
             self.get_logger().warn(f"cv_bridge error: {e}")
     
     def cb_camera_info(self, msg: CameraInfo):
-        if self.camera_matrix is None:
+        if self.camera_matrix is None or np.allclose(self.camera_matrix[0, 0], 500):
             self.camera_matrix = np.array(msg.k, dtype=np.float64).reshape(3, 3)
-            self.dist_coeffs = np.array(msg.d, dtype=np.float64)
+            if len(msg.d) > 0:
+                self.dist_coeffs = np.array(msg.d, dtype=np.float64)
+            self.get_logger().info(f"Got camera info: fx={msg.k[0]:.0f}")
     
     def process_frame(self):
         with self._lock:
@@ -192,27 +201,35 @@ class MarkerPoseNode(Node):
             self._publish_invalid()
             return
         
+        # 전처리: Grayscale + CLAHE
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        gray = self.clahe.apply(gray)
+        
         # 마커 검출
-        corners, ids, rejected = self.detector.detectMarkers(frame)
+        corners, ids, rejected = self.detector.detectMarkers(gray)
         
         if ids is None or len(ids) == 0:
             self._publish_invalid()
             if self.show_debug:
+                cv2.putText(frame, "No markers", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 cv2.imshow("marker_pose", frame)
                 cv2.waitKey(1)
             return
         
-        # 가장 가까운 마커 선택 (또는 가장 큰 마커)
-        best_idx = self._select_best_marker(corners, ids)
+        # 가장 큰 마커 선택
+        best_idx = 0
+        best_area = 0
+        for i, corner in enumerate(corners):
+            area = cv2.contourArea(corner)
+            if area > best_area:
+                best_area = area
+                best_idx = i
         
         marker_id = int(ids[best_idx][0])
         marker_corners = corners[best_idx]
         
-        # 마커 크기 결정
-        if marker_id <= self.road_max_id:
-            marker_size = self.marker_size_road
-        else:
-            marker_size = self.marker_size_slot
+        # 마커 크기
+        marker_size = self.marker_size_road if marker_id <= self.road_max_id else self.marker_size_slot
         
         # 포즈 추정
         rvec, tvec = self._estimate_pose(marker_corners, marker_size)
@@ -221,37 +238,32 @@ class MarkerPoseNode(Node):
             self._publish_invalid()
             return
         
-        # 좌표 변환 (OpenCV -> ROS)
-        # OpenCV: X-right, Y-down, Z-forward
-        # ROS: X-forward, Y-left, Z-up
-        rel_x = float(tvec[0])  # 오른쪽
-        rel_y = float(tvec[1])  # 아래
-        rel_z = float(tvec[2])  # 전방
+        rel_x = float(tvec[0])
+        rel_y = float(tvec[1])
+        rel_z = float(tvec[2])
         
-        # Yaw 추출
+        # Yaw
         rmat, _ = cv2.Rodrigues(rvec)
         yaw = math.atan2(rmat[1, 0], rmat[0, 0])
         
-        # EMA smoothing
+        # EMA
         if marker_id in self._ema_pose:
             prev = self._ema_pose[marker_id]
-            alpha = self.ema_alpha
-            rel_x = alpha * rel_x + (1 - alpha) * prev[0]
-            rel_y = alpha * rel_y + (1 - alpha) * prev[1]
-            rel_z = alpha * rel_z + (1 - alpha) * prev[2]
-            yaw = alpha * yaw + (1 - alpha) * prev[3]
+            a = self.ema_alpha
+            rel_x = a * rel_x + (1 - a) * prev[0]
+            rel_y = a * rel_y + (1 - a) * prev[1]
+            rel_z = a * rel_z + (1 - a) * prev[2]
+            yaw = a * yaw + (1 - a) * prev[3]
         
         self._ema_pose[marker_id] = (rel_x, rel_y, rel_z, yaw)
         
-        # 품질 계산 (면적 기반)
-        area = cv2.contourArea(marker_corners)
-        quality = (area - self.area_min) / (self.area_max - self.area_min)
+        # 품질
+        quality = (best_area - self.area_min) / (self.area_max - self.area_min)
         quality = max(0.0, min(1.0, quality))
         
         # 발행
         stamp = self.get_clock().now().to_msg()
         
-        # MarkerStatus
         status = MarkerStatus()
         status.header.stamp = stamp
         status.header.frame_id = self.frame_id
@@ -264,21 +276,15 @@ class MarkerPoseNode(Node):
         status.quality = float(quality)
         self.pub_status.publish(status)
         
-        # PoseStamped
         pose = PoseStamped()
         pose.header = status.header
-        pose.pose.position.x = rel_z  # ROS X = forward
-        pose.pose.position.y = -rel_x  # ROS Y = left
-        pose.pose.position.z = -rel_y  # ROS Z = up
-        
-        # Quaternion from yaw
-        pose.pose.orientation.x = 0.0
-        pose.pose.orientation.y = 0.0
+        pose.pose.position.x = rel_z
+        pose.pose.position.y = -rel_x
+        pose.pose.position.z = -rel_y
         pose.pose.orientation.z = math.sin(yaw / 2)
         pose.pose.orientation.w = math.cos(yaw / 2)
         self.pub_pose.publish(pose)
         
-        # TF
         if self.publish_tf:
             tf = TransformStamped()
             tf.header.stamp = stamp
@@ -290,31 +296,19 @@ class MarkerPoseNode(Node):
             tf.transform.rotation = pose.pose.orientation
             self.tf_broadcaster.sendTransform(tf)
         
-        # Debug
         if self.show_debug:
             debug = frame.copy()
             cv2.aruco.drawDetectedMarkers(debug, corners, ids)
             cv2.drawFrameAxes(debug, self.camera_matrix, self.dist_coeffs, rvec, tvec, 0.05)
-            cv2.putText(debug, f"ID:{marker_id} z:{rel_z:.3f}m q:{quality:.2f}",
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            info = f"ID:{marker_id} z:{rel_z:.2f}m x:{rel_x:.3f}m q:{quality:.2f}"
+            cv2.putText(debug, info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            cv2.putText(debug, f"Detected: {len(ids)}", (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            
             cv2.imshow("marker_pose", debug)
             cv2.waitKey(1)
     
-    def _select_best_marker(self, corners, ids) -> int:
-        """가장 좋은 마커 선택 (면적 기준)"""
-        best_idx = 0
-        best_area = 0
-        
-        for i, corner in enumerate(corners):
-            area = cv2.contourArea(corner)
-            if area > best_area:
-                best_area = area
-                best_idx = i
-        
-        return best_idx
-    
     def _estimate_pose(self, corners, marker_size) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        """solvePnP로 포즈 추정"""
         obj_points = np.array([
             [-marker_size/2,  marker_size/2, 0],
             [ marker_size/2,  marker_size/2, 0],
@@ -336,7 +330,6 @@ class MarkerPoseNode(Node):
         return rvec.flatten(), tvec.flatten()
     
     def _publish_invalid(self):
-        """마커 미검출 시 발행"""
         status = MarkerStatus()
         status.header.stamp = self.get_clock().now().to_msg()
         status.header.frame_id = self.frame_id
