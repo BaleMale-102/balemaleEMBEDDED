@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <n>rc_bringup</n>
+  <name>rc_bringup</name>
   <version>2.0.0</version>
   <description>Bringup launch files for smart parking RC car</description>
 
