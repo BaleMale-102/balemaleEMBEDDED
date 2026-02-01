@@ -1,9 +1,8 @@
-# GetRobotState.srv
-# 로봇 상태 조회 서비스
-
-# Request (empty)
+# Get current robot state
 ---
-# Response
-robot_interfaces/DrivingState state
-geometry_msgs/Pose pose
-bool is_localized
+string state
+int32 current_marker_id
+float32 x
+float32 y
+float32 yaw
+float32 battery_voltage

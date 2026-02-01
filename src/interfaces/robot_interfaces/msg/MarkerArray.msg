@@ -1,5 +1,4 @@
-# MarkerArray.msg
-# 검출된 모든 마커 배열
-
+# Array of detected markers
 std_msgs/Header header
+
 Marker[] markers

@@ -1,9 +1,8 @@
-# MissionCommand.msg
-# 미션 명령 (서버 → 로봇)
-
+# Mission command from server
 std_msgs/Header header
 
-string command                          # START, STOP, PAUSE, RESUME
-int32[] route                           # 마커 ID 시퀀스
-string mission_type                     # DELIVERY, PATROL, CUSTOM
-string mission_id                       # 미션 고유 ID
+string command                    # Command type: START, STOP, PAUSE, RESUME
+int32[] waypoint_ids              # List of marker IDs to visit
+int32 final_goal_id               # Final destination marker ID
+string task_type                  # PICKUP, DROPOFF, RETURN, etc.
+string task_id                    # Unique task identifier

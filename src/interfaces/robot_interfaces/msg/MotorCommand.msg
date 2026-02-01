@@ -1,11 +1,7 @@
-# MotorCommand.msg
-# 4개 메카넘 휠 PWM 명령
-
+# Motor PWM command for Arduino
 std_msgs/Header header
 
-int32 front_left                        # PWM 값 (300~2000, 1150=정지)
-int32 front_right
-int32 rear_left
-int32 rear_right
-
-bool enabled                            # 모터 활성화 여부
+int16 front_left                  # Front left motor PWM (-3000 to 3000)
+int16 front_right                 # Front right motor PWM (-3000 to 3000)
+int16 rear_left                   # Rear left motor PWM (-3000 to 3000)
+int16 rear_right                  # Rear right motor PWM (-3000 to 3000)

@@ -10,9 +10,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(sensor_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
-find_package(action_msgs REQUIRED)
 
 # Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -26,23 +24,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MissionCommand.msg"
   "msg/MissionStatus.msg"
   # Services
-  "srv/SetRoute.srv"
+  "srv/SetTargetMarker.srv"
   "srv/GetRobotState.srv"
   # Actions
   "action/NavigateToMarker.action"
-  DEPENDENCIES
-    std_msgs
-    geometry_msgs
-    sensor_msgs
-    builtin_interfaces
-    action_msgs
+  DEPENDENCIES std_msgs geometry_msgs builtin_interfaces
 )
-
-if(BUILD_TESTING)
-  find_package(ament_lint_auto REQUIRED)
-  set(ament_cmake_copyright_FOUND TRUE)
-  set(ament_cmake_cpplint_FOUND TRUE)
-  ament_lint_auto_find_test_dependencies()
-endif()
 
 ament_package()
