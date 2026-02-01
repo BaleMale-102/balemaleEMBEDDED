@@ -1,0 +1,9 @@
+# GetRobotState.srv
+# 로봇 상태 조회 서비스
+
+# Request (empty)
+---
+# Response
+robot_interfaces/DrivingState state
+geometry_msgs/Pose pose
+bool is_localized

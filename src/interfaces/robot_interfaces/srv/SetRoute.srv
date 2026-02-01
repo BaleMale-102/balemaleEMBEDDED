@@ -1,0 +1,9 @@
+# SetRoute.srv
+# 경로 설정 서비스
+
+# Request
+int32[] marker_ids                      # 마커 ID 시퀀스
+---
+# Response
+bool success
+string message

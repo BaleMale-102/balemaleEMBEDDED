@@ -1,0 +1,18 @@
+# NavigateToMarker.action
+# 마커로 네비게이션 액션
+
+# Goal
+int32 target_marker_id
+float32 timeout_sec                     # 타임아웃 (0=무제한)
+---
+# Result
+bool success
+float32 final_distance
+float32 total_time
+string message
+---
+# Feedback
+float32 distance_remaining
+float32 estimated_time_remaining
+string current_state
+float32 progress_percent
