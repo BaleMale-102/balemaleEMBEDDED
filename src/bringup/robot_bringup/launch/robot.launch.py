@@ -78,7 +78,7 @@ def generate_launch_description():
             name='lane_detector',
             parameters=[config_file],
             remappings=[
-                ('image_raw', '/camera/bottom/image_raw'),
+                ('image_raw', '/camera/front/image_raw'),
             ],
         ),
     ])

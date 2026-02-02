@@ -50,7 +50,7 @@ class LaneDetectorNode(Node):
         super().__init__('lane_detector_node')
 
         # Parameters
-        self.declare_parameter('image_topic', '/camera/bottom/image_raw')
+        self.declare_parameter('image_topic', '/camera/front/image_raw')
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('roi_top_ratio', 0.5)
         self.declare_parameter('roi_bottom_ratio', 1.0)
