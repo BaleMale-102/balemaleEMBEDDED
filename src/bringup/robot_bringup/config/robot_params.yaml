@@ -39,13 +39,13 @@ lane_detector:
 motion_controller:
   ros__parameters:
     control_rate: 20.0
-    max_vx: 0.05
-    max_vy: 0.05
-    max_wz: 0.5
+    max_vx: 0.008
+    max_vy: 0.008
+    max_wz: 0.05
     # Fallback (센서 없을 때)
-    reverse_vx: 0.015             # 후진 속도 (저속)
+    reverse_vx: 0.008
     # Lane following
-    lane_vx: 0.03
+    lane_vx: 0.004
     lane_vy_kp: 0.03
     lane_vy_ki: 0.0
     lane_vy_kd: 0.005
@@ -53,14 +53,16 @@ motion_controller:
     lane_wz_ki: 0.0
     lane_wz_kd: 0.05
     # Marker approach
-    marker_vx_kp: 0.1
-    marker_vy_kp: 0.05
-    marker_wz_kp: 0.3
-    marker_reach_distance: 0.15
+    marker_vx_kp: 0.015
+    marker_vy_kp: 0.005
+    marker_wz_kp: 0.025
+    marker_reach_distance: 0.25
     marker_min_distance: 0.08
+    marker_lost_reach_distance: 0.35
+    advance_vx: 0.5               # ADVANCE_TO_CENTER 전진 속도 (~0.5초에 0.25m)
     # Turn (PD 제어 + 오버슈팅 보정)
-    turn_wz: 0.3                # 최대 회전 속도 (rad/s)
-    turn_wz_min: 0.08           # 최소 회전 속도
+    turn_wz: 0.04               # 최대 회전 속도 (rad/s)
+    turn_wz_min: 0.015          # 최소 회전 속도
     turn_tolerance: 0.05        # 완료 허용 오차 (rad, ~3도)
     turn_kp: 1.5                # 비례 게인
     turn_kd: 0.3                # 미분 게인 (급정지 방지)

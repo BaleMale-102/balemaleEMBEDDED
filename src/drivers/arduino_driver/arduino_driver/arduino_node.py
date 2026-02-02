@@ -38,10 +38,11 @@ class ArduinoNode(Node):
         self.declare_parameter('timeout', 0.1)
         self.declare_parameter('simulate', False)
         self.declare_parameter('cmd_rate_hz', 20.0)
-        self.declare_parameter('watchdog_timeout', 0.5)
-        self.declare_parameter('max_vx', 0.10)
-        self.declare_parameter('max_vy', 0.10)
-        self.declare_parameter('max_wz', 1.0)
+        self.declare_parameter('watchdog_timeout', 0.15)  # Arduino watchdog: 200ms
+        self.declare_parameter('max_vx', 0.01)   # 20% of Arduino MAX_VEL_LINEAR
+        self.declare_parameter('max_vy', 0.01)   # 20% of Arduino MAX_VEL_LINEAR
+        self.declare_parameter('max_wz', 0.1)    # 20% of Arduino MAX_VEL_ANGULAR
+        self.declare_parameter('wz_offset', 0.0)  # 직진 보정용 (왼쪽 돌면 음수, 오른쪽 돌면 양수)
 
         # Load parameters
         port = self.get_parameter('port').value
@@ -53,6 +54,7 @@ class ArduinoNode(Node):
         self.max_vx = self.get_parameter('max_vx').value
         self.max_vy = self.get_parameter('max_vy').value
         self.max_wz = self.get_parameter('max_wz').value
+        self.wz_offset = self.get_parameter('wz_offset').value
 
         # Serial protocol
         self.protocol = SerialProtocol(
@@ -113,10 +115,13 @@ class ArduinoNode(Node):
         if not self._enabled:
             return
 
+        # wz에 보정값 적용 (직진 시 드리프트 보정)
+        wz_corrected = self._current_cmd.wz + self.wz_offset
+
         self.protocol.send_velocity(
             self._current_cmd.vx,
             self._current_cmd.vy,
-            self._current_cmd.wz
+            wz_corrected
         )
 
     def _watchdog_callback(self):
@@ -158,8 +163,11 @@ class ArduinoNode(Node):
 
     def destroy_node(self):
         """Cleanup"""
-        self.protocol.send_stop()
-        self.protocol.disconnect()
+        try:
+            self.protocol.send_stop()
+            self.protocol.disconnect()
+        except Exception:
+            pass  # 종료 중 에러 무시
         super().destroy_node()
 
 

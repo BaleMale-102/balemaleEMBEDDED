@@ -42,8 +42,9 @@ class MotionControllerNode(Node):
 
     # Control modes
     MODE_IDLE = 'IDLE'
-    MODE_LANE_FOLLOW = 'LANE_FOLLOW'
-    MODE_MARKER_APPROACH = 'MARKER_APPROACH'
+    MODE_DRIVE = 'DRIVE'
+    MODE_STOP_AT_MARKER = 'STOP_AT_MARKER'
+    MODE_ADVANCE_TO_CENTER = 'ADVANCE_TO_CENTER'
     MODE_TURN = 'TURN'
     MODE_STOP = 'STOP'
 
@@ -52,15 +53,15 @@ class MotionControllerNode(Node):
 
         # Parameters - general
         self.declare_parameter('control_rate', 20.0)
-        self.declare_parameter('max_vx', 0.05)
-        self.declare_parameter('max_vy', 0.05)
-        self.declare_parameter('max_wz', 0.5)
+        self.declare_parameter('max_vx', 0.008)
+        self.declare_parameter('max_vy', 0.008)
+        self.declare_parameter('max_wz', 0.05)
 
         # Parameters - fallback (센서 없을 때)
         self.declare_parameter('reverse_vx', 0.015)  # 후진 속도 (저속)
 
         # Parameters - lane following
-        self.declare_parameter('lane_vx', 0.03)
+        self.declare_parameter('lane_vx', 0.004)
         self.declare_parameter('lane_vy_kp', 0.03)
         self.declare_parameter('lane_vy_ki', 0.0)
         self.declare_parameter('lane_vy_kd', 0.005)
@@ -69,15 +70,17 @@ class MotionControllerNode(Node):
         self.declare_parameter('lane_wz_kd', 0.05)
 
         # Parameters - marker approach
-        self.declare_parameter('marker_vx_kp', 0.1)
-        self.declare_parameter('marker_vy_kp', 0.05)
-        self.declare_parameter('marker_wz_kp', 0.3)
-        self.declare_parameter('marker_reach_distance', 0.15)
+        self.declare_parameter('marker_vx_kp', 0.015)
+        self.declare_parameter('marker_vy_kp', 0.005)
+        self.declare_parameter('marker_wz_kp', 0.025)
+        self.declare_parameter('marker_reach_distance', 0.25)  # 마커 사라지기 전 도달 판정
         self.declare_parameter('marker_min_distance', 0.08)
+        self.declare_parameter('marker_lost_reach_distance', 0.35)  # 이 거리 이내에서 사라지면 도달로 판정
+        self.declare_parameter('advance_vx', 0.02)  # ADVANCE_TO_CENTER 전진 속도
 
         # Parameters - turn (PID + 오버슈팅 보정)
-        self.declare_parameter('turn_wz', 0.3)
-        self.declare_parameter('turn_wz_min', 0.08)     # 최소 회전 속도 (너무 느리면 안 움직임)
+        self.declare_parameter('turn_wz', 0.04)
+        self.declare_parameter('turn_wz_min', 0.015)     # 최소 회전 속도 (너무 느리면 안 움직임)
         self.declare_parameter('turn_tolerance', 0.05)  # rad (~3도)
         self.declare_parameter('turn_kp', 1.5)          # 비례 게인
         self.declare_parameter('turn_kd', 0.3)          # 미분 게인 (급정지 방지)
@@ -93,6 +96,8 @@ class MotionControllerNode(Node):
         self.lane_vx = self.get_parameter('lane_vx').value
         self.marker_reach_dist = self.get_parameter('marker_reach_distance').value
         self.marker_min_dist = self.get_parameter('marker_min_distance').value
+        self.marker_lost_reach_dist = self.get_parameter('marker_lost_reach_distance').value
+        self.advance_vx = self.get_parameter('advance_vx').value
         self.turn_wz = self.get_parameter('turn_wz').value
         self.turn_wz_min = self.get_parameter('turn_wz_min').value
         self.turn_tolerance = self.get_parameter('turn_tolerance').value
@@ -130,15 +135,26 @@ class MotionControllerNode(Node):
         self._turn_done_sent = False  # turn_done 중복 발행 방지
 
         # Perception data
-        self._lane_status = None
         self._tracked_marker = None
         self._imu_data = None
 
+        # 마커 추적 상태 (사라짐 감지용)
+        self._last_marker_distance = float('inf')
+        self._last_marker_id = -1
+
+        # ADVANCE_TO_CENTER 상태용
+        self._advance_target_distance = 0.0  # 전진할 거리
+        self._advance_start_time = 0.0       # 전진 시작 시간
+        self._advance_done_sent = False      # 완료 발행 여부
+
+        # 로그 출력 주기 (1초마다)
+        self._last_log_time = 0.0
+        self._log_interval = 1.0
+
         # Import custom interfaces
         try:
-            from robot_interfaces.msg import LaneStatus, TrackedMarker, DrivingState
+            from robot_interfaces.msg import TrackedMarker, DrivingState
             self._has_interface = True
-            self._LaneStatus = LaneStatus
             self._TrackedMarker = TrackedMarker
             self._DrivingState = DrivingState
         except ImportError:
@@ -176,10 +192,6 @@ class MotionControllerNode(Node):
         )
 
         if self._has_interface:
-            self.sub_lane = self.create_subscription(
-                self._LaneStatus, '/perception/lane_status',
-                self._lane_callback, qos_profile_sensor_data
-            )
             self.sub_marker = self.create_subscription(
                 self._TrackedMarker, '/perception/tracked_marker',
                 self._marker_callback, qos_profile_sensor_data
@@ -203,10 +215,23 @@ class MotionControllerNode(Node):
 
         if state == 'IDLE':
             self._mode = self.MODE_IDLE
-        elif state in ('DRIVE', 'LANE_FOLLOW'):
-            self._mode = self.MODE_LANE_FOLLOW
-        elif state in ('MARKER_APPROACH', 'APPROACH'):
-            self._mode = self.MODE_MARKER_APPROACH
+        elif state in ('DRIVE', 'LANE_FOLLOW', 'MARKER_APPROACH', 'APPROACH'):
+            self._mode = self.MODE_DRIVE
+        elif state == 'STOP_AT_MARKER':
+            self._mode = self.MODE_STOP_AT_MARKER
+            # 현재 마커 거리 저장
+            if prev_mode != self.MODE_STOP_AT_MARKER:
+                if self._tracked_marker is not None and self._tracked_marker.is_detected:
+                    self._advance_target_distance = self._tracked_marker.distance
+                else:
+                    self._advance_target_distance = self._last_marker_distance
+                self.get_logger().info(f'STOP_AT_MARKER: distance={self._advance_target_distance:.3f}m')
+        elif state == 'ADVANCE_TO_CENTER':
+            self._mode = self.MODE_ADVANCE_TO_CENTER
+            if prev_mode != self.MODE_ADVANCE_TO_CENTER:
+                self._advance_start_time = self.get_clock().now().nanoseconds / 1e9
+                self._advance_done_sent = False
+                self.get_logger().info(f'ADVANCE_TO_CENTER: target={self._advance_target_distance:.3f}m')
         elif state in ('TURN', 'TURNING'):
             self._mode = self.MODE_TURN
             # TURN 모드 진입 시 상태 초기화
@@ -215,7 +240,7 @@ class MotionControllerNode(Node):
                 self._prev_turn_error = 0.0
                 self._turn_done_sent = False
                 self.get_logger().info(f'TURN started: start_yaw={math.degrees(self._turn_start_yaw):.1f}deg, target={math.degrees(self._turn_target_rad):.1f}deg')
-        elif state in ('STOP', 'PARK', 'FINISH'):
+        elif state in ('STOP', 'PARK', 'FINISH', 'ALIGN_TO_MARKER', 'STOP_BUMP'):
             self._mode = self.MODE_STOP
         else:
             self._mode = self.MODE_IDLE
@@ -235,10 +260,6 @@ class MotionControllerNode(Node):
     def _turn_target_callback(self, msg):
         """Handle turn target angle (using Int32 as degrees * 100)."""
         self._turn_target_rad = msg.data / 100.0  # Convert from centidegrees
-
-    def _lane_callback(self, msg):
-        """Handle lane status updates."""
-        self._lane_status = msg
 
     def _marker_callback(self, msg):
         """Handle tracked marker updates."""
@@ -265,12 +286,16 @@ class MotionControllerNode(Node):
         if self._mode == self.MODE_IDLE:
             detail = 'Waiting for mission'
 
-        elif self._mode == self.MODE_LANE_FOLLOW:
-            # 마커 우선, lane은 보조
-            cmd, error_x, error_y, error_yaw, detail = self._drive_with_marker_priority()
+        elif self._mode == self.MODE_DRIVE:
+            # 마커 기반 주행
+            cmd, error_x, error_y, error_yaw, detail = self._drive_with_marker_only()
 
-        elif self._mode == self.MODE_MARKER_APPROACH:
-            cmd, error_x, error_y, error_yaw, detail = self._marker_approach()
+        elif self._mode == self.MODE_STOP_AT_MARKER:
+            # 정지 상태 - 마커 거리 측정 중
+            detail = f'Stopped at marker, dist={self._advance_target_distance:.3f}m'
+
+        elif self._mode == self.MODE_ADVANCE_TO_CENTER:
+            cmd, error_x, error_y, error_yaw, detail = self._advance_to_center()
 
         elif self._mode == self.MODE_TURN:
             cmd, error_x, error_y, error_yaw, detail = self._turn_control()
@@ -286,24 +311,26 @@ class MotionControllerNode(Node):
         self._publish_cmd(cmd)
         self._publish_state(self._mode, error_x, error_y, error_yaw, detail)
 
-    def _check_no_sensor(self) -> bool:
-        """차선과 마커 둘 다 없는지 확인"""
-        lane_ok = self._lane_status is not None and self._lane_status.valid
-        marker_ok = (self._tracked_marker is not None and
-                     (self._tracked_marker.is_detected or
-                      self._tracked_marker.prediction_confidence > 0.3))
-        return not lane_ok and not marker_ok
+        # 주기적 로그 출력
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self._last_log_time >= self._log_interval:
+            self._last_log_time = now
+            self.get_logger().info(
+                f'[{self._mode}] target={self._target_marker_id}, '
+                f'vx={cmd.linear.x:.4f}, vy={cmd.linear.y:.4f}, wz={cmd.angular.z:.4f} | {detail}'
+            )
 
-    def _drive_with_marker_priority(self):
-        """마커 우선 주행 (lane은 보조)."""
+    def _drive_with_marker_only(self):
+        """마커 전용 주행 (lane 사용 안 함)."""
         cmd = Twist()
         error_x = 0.0
         error_y = 0.0
         error_yaw = 0.0
 
-        # 마커 확인
+        # 마커 확인 (target ID와 일치하는 마커, ID 16 이상은 주차 슬롯이므로 주행 시 무시)
         marker_ok = (self._tracked_marker is not None and
                      self._tracked_marker.id == self._target_marker_id and
+                     self._tracked_marker.id < 16 and  # 주차 슬롯 마커 무시
                      (self._tracked_marker.is_detected or
                       self._tracked_marker.prediction_confidence > 0.3))
 
@@ -313,19 +340,24 @@ class MotionControllerNode(Node):
             distance = marker.distance
             angle = marker.angle
 
+            # 마지막 마커 정보 저장 (사라짐 감지용)
+            self._last_marker_distance = distance
+            self._last_marker_id = marker.id
+
             error_x = distance
             error_yaw = angle
 
             # 마커 도달 체크
             if distance < self.marker_reach_dist:
                 self._publish_marker_reached(marker.id)
+                # 거리는 리셋하지 않음 - STOP_AT_MARKER에서 사용
                 return cmd, error_x, error_y, error_yaw, f'Reached marker {marker.id}'
 
             # 마커 방향으로 주행
             vx = self.marker_vx_kp * (distance - self.marker_min_dist)
             vx = max(0.0, vx)
-            vy = -self.marker_vy_kp * math.sin(angle) * distance
-            wz = -self.marker_wz_kp * angle
+            vy = self.marker_vy_kp * angle  # 횡방향 보정 ON
+            wz = 0.0  # 회전 OFF
 
             cmd.linear.x = vx
             cmd.linear.y = vy
@@ -335,83 +367,77 @@ class MotionControllerNode(Node):
             detail = f'[MARKER] d={distance:.2f}m, a={math.degrees(angle):.1f}deg [{pred}]'
             return cmd, error_x, error_y, error_yaw, detail
 
-        # 마커 없음 → lane fallback
-        lane_ok = self._lane_status is not None and self._lane_status.valid
+        # 마커 없음 - 가까이 왔다가 사라지면 도달로 판정
+        if (self._last_marker_id == self._target_marker_id and
+            self._last_marker_distance < self.marker_lost_reach_dist):
+            self._publish_marker_reached(self._last_marker_id)
+            self.get_logger().info(
+                f'Marker {self._last_marker_id} lost at {self._last_marker_distance:.2f}m - counted as reached'
+            )
+            # 거리는 리셋하지 않음 - STOP_AT_MARKER에서 사용
+            return cmd, error_x, error_y, error_yaw, f'Marker lost but reached'
 
-        if lane_ok:
-            offset = self._lane_status.offset_normalized
-            # angle은 매우 보수적으로 (낮은 게인)
-            cmd.linear.x = self.lane_vx
-            cmd.linear.y = -self.lane_vy_pid.update(offset) * 0.5  # 50% 감쇠
-            cmd.angular.z = 0.0  # angle 무시 (불안정하므로)
+        # 마커 없음 → 저속 직진 (마커 찾을 때까지)
+        cmd.linear.x = self.lane_vx  # 저속 전진
+        return cmd, error_x, error_y, error_yaw, 'No marker - slow forward'
 
-            detail = f'[LANE] offset={offset:.2f} (angle ignored)'
-            return cmd, error_x, offset, 0.0, detail
-
-        # 둘 다 없음 → 후진
-        cmd.linear.x = -self.reverse_vx
-        return cmd, error_x, error_y, error_yaw, 'No sensor - reverse'
+    def _drive_with_marker_priority(self):
+        """마커 우선 주행 (lane 없이 마커만 사용)."""
+        return self._drive_with_marker_only()
 
     def _lane_follow(self):
         """Legacy lane following (사용 안 함)."""
-        return self._drive_with_marker_priority()
+        return self._drive_with_marker_only()
 
     def _marker_approach(self):
-        """Marker approach control."""
+        """Marker approach control (마커 전용)."""
+        # 마커 전용 주행으로 통합
+        return self._drive_with_marker_only()
+
+    def _advance_to_center(self):
+        """마커 중심까지 전진 (시간 기반)."""
         cmd = Twist()
-        error_x = 0.0
+        error_x = self._advance_target_distance
         error_y = 0.0
         error_yaw = 0.0
-        detail = 'No marker'
 
-        # 차선도 마커도 없으면 후진
-        if self._check_no_sensor():
-            cmd.linear.x = -self.reverse_vx  # 저속 후진
-            return cmd, error_x, error_y, error_yaw, 'No sensor - reverse'
+        # 전진 속도 (파라미터 사용)
+        advance_vx = self.advance_vx
 
-        if self._tracked_marker is None:
-            return cmd, error_x, error_y, error_yaw, 'No tracked marker'
+        # 거리 / 속도 = 시간
+        if advance_vx > 0:
+            required_time = self._advance_target_distance / advance_vx
+        else:
+            required_time = 3.0  # fallback
 
-        marker = self._tracked_marker
+        # 경과 시간
+        now = self.get_clock().now().nanoseconds / 1e9
+        elapsed = now - self._advance_start_time
 
-        if marker.id != self._target_marker_id:
-            return cmd, error_x, error_y, error_yaw, f'Wrong marker (got {marker.id})'
+        if elapsed >= required_time:
+            # 전진 완료
+            if not self._advance_done_sent:
+                self._publish_align_done()
+                self._advance_done_sent = True
+            detail = f'Advance complete, elapsed={elapsed:.2f}s'
+            return cmd, 0.0, error_y, error_yaw, detail
 
-        if not marker.is_detected and marker.prediction_confidence < 0.3:
-            return cmd, error_x, error_y, error_yaw, 'Marker lost, low confidence'
-
-        # Get marker position (in camera frame: z=forward, x=right)
-        distance = marker.distance
-        angle = marker.angle
-
-        error_x = distance
-        error_yaw = angle
-
-        # Check if reached
-        if distance < self.marker_reach_dist:
-            self._publish_marker_reached(marker.id)
-            detail = f'Reached marker {marker.id}'
-            return cmd, error_x, error_y, error_yaw, detail
-
-        # Proportional control toward marker
-        # Forward velocity proportional to distance
-        vx = self.marker_vx_kp * (distance - self.marker_min_dist)
-        vx = max(0.0, vx)  # Only forward
-
-        # Lateral correction based on angle
-        vy = -self.marker_vy_kp * math.sin(angle) * distance
-
-        # Yaw correction
-        wz = -self.marker_wz_kp * angle
-
-        cmd.linear.x = vx
-        cmd.linear.y = vy
-        cmd.angular.z = wz
-
-        pred = 'pred' if not marker.is_detected else 'det'
-        detail = f'd={distance:.2f}m, a={math.degrees(angle):.1f}deg [{pred}]'
+        # 전진 중
+        cmd.linear.x = advance_vx
+        remaining = required_time - elapsed
+        detail = f'Advancing: {elapsed:.2f}/{required_time:.2f}s, remaining={remaining:.2f}s'
 
         return cmd, error_x, error_y, error_yaw, detail
+
+    def _publish_align_done(self):
+        """Notify alignment/advance complete."""
+        msg = Bool()
+        msg.data = True
+        # /mission/align_done 토픽 사용
+        if not hasattr(self, 'pub_align_done'):
+            self.pub_align_done = self.create_publisher(Bool, '/mission/align_done', 10)
+        self.pub_align_done.publish(msg)
+        self.get_logger().info('Advance to center complete')
 
     def _turn_control(self):
         """In-place turn control (상대 회전 + PD 제어 + 오버슈팅 보정)."""

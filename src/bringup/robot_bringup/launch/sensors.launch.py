@@ -215,7 +215,7 @@ def generate_launch_description():
         # cam_bottom,  # TODO: 나중에 side_cam 사용 시 주석 해제
         # cam_side,
 
-        # Arduino
+        # Arduino (비활성화 - 별도 실행)
         arduino_node,
 
         # IMU

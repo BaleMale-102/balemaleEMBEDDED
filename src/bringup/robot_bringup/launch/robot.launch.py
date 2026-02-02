@@ -60,6 +60,9 @@ def generate_launch_description():
     config_file = LaunchConfiguration('config_file')
     marker_map = LaunchConfiguration('marker_map')
 
+    # Marker map parameter dict for nodes that need it
+    marker_map_param = {'marker_map_yaml': marker_map}
+
     # X11 환경변수 (SSH X11 forwarding용)
     display_env = os.environ.get('DISPLAY', ':0')
     x11_env = {
@@ -93,17 +96,17 @@ def generate_launch_description():
             parameters=[config_file],
         ),
 
-        # Lane Detector (전방 카메라 사용)
-        Node(
-            package='lane_detector',
-            executable='detector_node',
-            name='lane_detector',
-            parameters=[config_file, {'show_debug_window': show_debug}],
-            remappings=[
-                ('image_raw', '/cam_front/image_raw'),
-            ],
-            additional_env=x11_env,
-        ),
+        # Lane Detector (비활성화 - 마커 전용 주행)
+        # Node(
+        #     package='lane_detector',
+        #     executable='detector_node',
+        #     name='lane_detector',
+        #     parameters=[config_file, {'show_debug_window': show_debug}],
+        #     remappings=[
+        #         ('image_raw', '/cam_front/image_raw'),
+        #     ],
+        #     additional_env=x11_env,
+        # ),
     ])
 
     # ==========================================
@@ -129,7 +132,7 @@ def generate_launch_description():
             package='mission_manager',
             executable='manager_node',
             name='mission_manager',
-            parameters=[config_file],
+            parameters=[config_file, marker_map_param],
         ),
 
         # Server Bridge
@@ -149,6 +152,7 @@ def generate_launch_description():
         simulation_arg,
         show_debug_arg,
         config_file_arg,
+        marker_map_arg,
 
         # Node groups
         perception_group,

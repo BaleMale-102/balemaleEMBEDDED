@@ -80,7 +80,7 @@ class MarkerTrackerNode(Node):
             self._markers_callback, 10
         )
         self.sub_target = self.create_subscription(
-            Int32, '/navigation/target_marker',
+            Int32, '/mission/target_marker',
             self._target_callback, 10
         )
 

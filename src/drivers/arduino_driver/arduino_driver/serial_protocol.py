@@ -92,14 +92,19 @@ class SerialProtocol:
 
     def disconnect(self):
         """시리얼 연결 해제"""
+        self._running = False  # 먼저 플래그 설정
+
+        try:
+            if self.serial and self.serial.is_open:
+                # 모터 정지
+                self.send_stop()
+                time.sleep(0.05)
+                self.serial.cancel_read()  # 읽기 취소
+                self.serial.close()
+        except Exception:
+            pass  # 종료 중 에러 무시
+
         self.stop_read_thread()
-
-        if self.serial and self.serial.is_open:
-            # 모터 정지
-            self.send_stop()
-            time.sleep(0.1)
-            self.serial.close()
-
         self._connected = False
         self.logger.info('Disconnected')
 
@@ -132,18 +137,23 @@ class SerialProtocol:
                     time.sleep(0.1)
                     continue
 
+                # 타임아웃으로 블로킹 방지
                 if self.serial.in_waiting > 0:
                     line = self.serial.readline().decode('utf-8').strip()
                     if line:
                         self._last_response = line
                         if self._response_callback:
                             self._response_callback(line)
+                else:
+                    time.sleep(0.01)  # CPU 사용률 감소
 
             except serial.SerialException as e:
-                self.logger.error(f'Serial read error: {e}')
+                if self._running:  # 종료 중이면 에러 무시
+                    self.logger.error(f'Serial read error: {e}')
                 time.sleep(0.1)
             except Exception as e:
-                self.logger.error(f'Read loop error: {e}')
+                if self._running:
+                    self.logger.error(f'Read loop error: {e}')
                 time.sleep(0.01)
 
     def _send(self, message: str) -> bool:

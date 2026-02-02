@@ -96,10 +96,10 @@ class StateMachine:
         # Timeout configuration
         self._state_timeouts = {
             MissionState.STOP_AT_MARKER: 2.0,
-            MissionState.ADVANCE_TO_CENTER: 3.0,
+            MissionState.ADVANCE_TO_CENTER: 15.0,  # 마커까지 전진 시간
             MissionState.ALIGN_TO_MARKER: 5.0,
             MissionState.STOP_BUMP: 0.5,
-            MissionState.TURNING: 10.0,
+            MissionState.TURNING: 30.0,  # 회전 시간
             MissionState.PARK: 30.0,
         }
 
@@ -199,6 +199,8 @@ class StateMachine:
             self._context.turn_complete = False
         elif new_state == MissionState.ALIGN_TO_MARKER:
             self._context.align_complete = False
+        elif new_state == MissionState.ADVANCE_TO_CENTER:
+            self._context.align_complete = False
 
         if self._on_state_change:
             self._on_state_change(old_state, new_state)
@@ -225,10 +227,9 @@ class StateMachine:
         return None
 
     def _advance_transition(self) -> Optional[MissionState]:
-        # Move to marker center, then align
-        elapsed = time.time() - self._context.state_enter_time
-        if elapsed > 1.0:
-            return MissionState.ALIGN_TO_MARKER
+        # Move to marker center, wait for align_done signal
+        if self._context.align_complete:
+            return MissionState.STOP_BUMP
         return None
 
     def _align_transition(self) -> Optional[MissionState]:
