@@ -35,12 +35,14 @@ class MarkerTrackerNode(Node):
         self.declare_parameter('measurement_noise', 0.05)
         self.declare_parameter('prediction_timeout', 2.0)
         self.declare_parameter('min_prediction_confidence', 0.3)
+        self.declare_parameter('camera_offset_x', 0.05)  # 카메라→base_link 오프셋 (m)
 
         # Load parameters
         process_noise = self.get_parameter('process_noise').value
         measurement_noise = self.get_parameter('measurement_noise').value
         self.prediction_timeout = self.get_parameter('prediction_timeout').value
         self.min_confidence = self.get_parameter('min_prediction_confidence').value
+        self.camera_offset_x = self.get_parameter('camera_offset_x').value  # 전방 오프셋
 
         # Kalman filters
         self.kf_position = KalmanFilter2D(
@@ -204,7 +206,7 @@ class MarkerTrackerNode(Node):
         """TrackedMarker 메시지 퍼블리시"""
         msg = self._TrackedMarker()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'camera_front_link'
+        msg.header.frame_id = 'base_link'
 
         msg.id = self._target_marker_id
 
@@ -225,9 +227,10 @@ class MarkerTrackerNode(Node):
         msg.velocity.y = 0.0
         msg.velocity.z = state.vz
 
-        # 거리, 각도
-        msg.distance = math.sqrt(state.x**2 + state.z**2)
-        msg.angle = angle
+        # 거리, 각도 (base_link 기준: z에 카메라 오프셋 추가)
+        z_base = state.z + self.camera_offset_x
+        msg.distance = math.sqrt(state.x**2 + z_base**2)
+        msg.angle = math.atan2(-state.x, z_base)  # base_link 기준 각도
 
         # 상태
         msg.is_detected = is_detected
@@ -241,7 +244,7 @@ class MarkerTrackerNode(Node):
         """마커 손실 메시지"""
         msg = self._TrackedMarker()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = 'camera_front_link'
+        msg.header.frame_id = 'base_link'
         msg.id = self._target_marker_id
         msg.is_detected = False
         msg.prediction_confidence = 0.0

@@ -7,7 +7,7 @@
 marker_detector:
   ros__parameters:
     dictionary: "DICT_4X4_50"
-    marker_size: 0.10                # 10cm markers
+    marker_size: 0.04                # 4cm markers
     publish_debug_image: true
     image_topic: "/cam_front/image_raw"
     camera_info_topic: "/cam_front/camera_info"
@@ -19,6 +19,7 @@ marker_tracker:
     measurement_noise: 0.05
     prediction_timeout: 2.0
     min_prediction_confidence: 0.3
+    camera_offset_x: 0.10             # 카메라→base_link 전방 오프셋 (m)
 
 lane_detector:
   ros__parameters:
@@ -27,7 +28,7 @@ lane_detector:
     roi_top_ratio: 0.5
     roi_bottom_ratio: 1.0
     sobel_threshold: 50
-    min_line_pixels: 500              # 최소 라인 픽셀 수 (노이즈 필터링)
+    min_line_pixels: 100              # 최소 라인 픽셀 수 (노이즈 필터링)
     line_color: "black"
     kalman_q: 0.01
     kalman_r: 0.05

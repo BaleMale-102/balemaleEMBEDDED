@@ -161,12 +161,12 @@ def generate_launch_description():
     # Static TF Publishers
     # ==========================================
 
-    # base_link -> camera_front (5cm forward, 1cm up)
+    # base_link -> camera_front (10cm forward, 1cm up)
     tf_base_to_cam_front = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='tf_base_to_cam_front',
-        arguments=['0.05', '0', '0.01', '0', '0', '0', 'base_link', 'camera_front']
+        arguments=['0.10', '0', '0.01', '0', '0', '0', 'base_link', 'camera_front']
     )
 
     # TODO: 나중에 side_cam 사용 시 주석 해제

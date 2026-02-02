@@ -87,7 +87,8 @@ class MarkerDetectorNode(Node):
             qos_profile_sensor_data
         )
         self.sub_camera_info = self.create_subscription(
-            CameraInfo, camera_info_topic, self._camera_info_callback, 10
+            CameraInfo, camera_info_topic, self._camera_info_callback,
+            qos_profile_sensor_data
         )
 
         self.get_logger().info(

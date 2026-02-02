@@ -82,8 +82,8 @@ class LaneDetector:
         # 라인 검출
         offset_px, angle, confidence, n_pixels = self._find_line(binary)
 
-        # 유효성 체크 (더 엄격한 조건)
-        valid = n_pixels >= self.min_line_pixels and confidence > 0.35
+        # 유효성 체크
+        valid = n_pixels >= self.min_line_pixels and confidence > 0.2
 
         # 픽셀 → 실제 단위 변환
         offset_normalized = offset_px / (w / 2) if w > 0 else 0.0
@@ -120,12 +120,12 @@ class LaneDetector:
 
         # 적응형 임계값 또는 Sobel
         if self.line_color == 'black':
-            # 검은 라인: 적응형 임계값
+            # 검은 라인: 적응형 임계값 (더 엄격하게)
             binary = cv2.adaptiveThreshold(
                 blurred, 255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY_INV,
-                25, 10
+                31, 15  # blockSize 증가, C 증가 → 더 어두운 것만 검출
             )
         else:
             # 흰 라인: Sobel 엣지
@@ -133,10 +133,11 @@ class LaneDetector:
             abs_sobel = np.abs(sobel)
             binary = (abs_sobel > self.sobel_threshold).astype(np.uint8) * 255
 
-        # 모폴로지 연산
-        kernel = np.ones((3, 3), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        # 모폴로지 연산 (노이즈 제거 강화)
+        kernel_small = np.ones((3, 3), np.uint8)
+        kernel_large = np.ones((5, 5), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel_large)   # 작은 노이즈 제거
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel_small)  # 라인 연결
 
         return binary
 
@@ -165,8 +166,8 @@ class LaneDetector:
 
         # 픽셀 비율 체크 (너무 많으면 노이즈, 너무 적으면 라인 없음)
         pixel_ratio = n_pixels / total_pixels
-        if pixel_ratio > 0.4 or pixel_ratio < 0.01:
-            # 40% 이상이면 전체가 검정 또는 노이즈, 1% 미만이면 라인 없음
+        if pixel_ratio > 0.5 or pixel_ratio < 0.005:
+            # 50% 이상이면 전체가 검정 또는 노이즈, 0.5% 미만이면 라인 없음
             return 0.0, 0.0, 0.0, 0
 
         # 라인 중심 (x 평균)
@@ -201,9 +202,9 @@ class LaneDetector:
         confidence = pixel_confidence * (0.5 + 0.5 * linearity)
 
         # 직선성이 낮으면 라인이 아닐 가능성 높음
-        if linearity < 0.3 and n_pixels > 500:
+        if linearity < 0.2 and n_pixels > 1000:
             # 많은 픽셀인데 직선이 아니면 노이즈
-            confidence *= 0.3
+            confidence *= 0.5
 
         return offset_px, angle, confidence, n_pixels
 

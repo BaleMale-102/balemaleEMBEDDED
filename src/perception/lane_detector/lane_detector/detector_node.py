@@ -124,6 +124,13 @@ class LaneDetectorNode(Node):
         # 라인 검출
         result = self.detector.detect(cv_image, generate_debug=self.publish_debug)
 
+        # 디버그 로깅 (왜 invalid인지 확인)
+        if not result.valid:
+            self.get_logger().warn(
+                f'Lane invalid: conf={result.confidence:.2f}, offset={result.offset_normalized:.2f}',
+                throttle_duration_sec=1.0
+            )
+
         # Kalman 필터 적용
         if result.valid:
             filtered_offset = self.kf_offset.update(result.offset_normalized)
@@ -138,7 +145,7 @@ class LaneDetectorNode(Node):
             lane_msg.header.stamp = msg.header.stamp
             lane_msg.header.frame_id = 'camera_front_link'
 
-            lane_msg.valid = result.valid
+            lane_msg.valid = bool(result.valid)
             lane_msg.offset = float(result.offset)
             lane_msg.offset_normalized = float(filtered_offset)
             lane_msg.angle = float(filtered_angle)

@@ -266,7 +266,8 @@ class MotionControllerNode(Node):
             detail = 'Waiting for mission'
 
         elif self._mode == self.MODE_LANE_FOLLOW:
-            cmd, error_x, error_y, error_yaw, detail = self._lane_follow()
+            # 마커 우선, lane은 보조
+            cmd, error_x, error_y, error_yaw, detail = self._drive_with_marker_priority()
 
         elif self._mode == self.MODE_MARKER_APPROACH:
             cmd, error_x, error_y, error_yaw, detail = self._marker_approach()
@@ -293,39 +294,67 @@ class MotionControllerNode(Node):
                       self._tracked_marker.prediction_confidence > 0.3))
         return not lane_ok and not marker_ok
 
-    def _lane_follow(self):
-        """Lane following control (보조 역할 - 마커 기반 주행이 메인)."""
+    def _drive_with_marker_priority(self):
+        """마커 우선 주행 (lane은 보조)."""
         cmd = Twist()
         error_x = 0.0
         error_y = 0.0
         error_yaw = 0.0
-        detail = 'No lane'
 
-        # 차선도 마커도 없으면 후진
-        if self._check_no_sensor():
-            cmd.linear.x = -self.reverse_vx  # 저속 후진
-            return cmd, error_x, error_y, error_yaw, 'No sensor - reverse'
+        # 마커 확인
+        marker_ok = (self._tracked_marker is not None and
+                     self._tracked_marker.id == self._target_marker_id and
+                     (self._tracked_marker.is_detected or
+                      self._tracked_marker.prediction_confidence > 0.3))
 
-        if self._lane_status is None or not self._lane_status.valid:
-            # 차선 없지만 마커는 있음 → 정지 (마커 모드로 전환 대기)
-            return cmd, error_x, error_y, error_yaw, 'Lane lost - stop'
+        # 마커가 있으면 마커 기반 주행
+        if marker_ok:
+            marker = self._tracked_marker
+            distance = marker.distance
+            angle = marker.angle
 
-        # Lane detected
-        offset = self._lane_status.offset_normalized  # -1 to +1
-        angle = self._lane_status.angle  # rad
+            error_x = distance
+            error_yaw = angle
 
-        error_y = offset
-        error_yaw = angle
+            # 마커 도달 체크
+            if distance < self.marker_reach_dist:
+                self._publish_marker_reached(marker.id)
+                return cmd, error_x, error_y, error_yaw, f'Reached marker {marker.id}'
 
-        # PID control
-        cmd.linear.x = self.lane_vx
-        cmd.linear.y = -self.lane_vy_pid.update(offset)  # Negative to correct
-        cmd.angular.z = -self.lane_wz_pid.update(angle)  # Negative to correct
+            # 마커 방향으로 주행
+            vx = self.marker_vx_kp * (distance - self.marker_min_dist)
+            vx = max(0.0, vx)
+            vy = -self.marker_vy_kp * math.sin(angle) * distance
+            wz = -self.marker_wz_kp * angle
 
-        confidence = self._lane_status.confidence
-        detail = f'offset={offset:.2f}, angle={math.degrees(angle):.1f}deg, conf={confidence:.2f}'
+            cmd.linear.x = vx
+            cmd.linear.y = vy
+            cmd.angular.z = wz
 
-        return cmd, error_x, error_y, error_yaw, detail
+            pred = 'pred' if not marker.is_detected else 'det'
+            detail = f'[MARKER] d={distance:.2f}m, a={math.degrees(angle):.1f}deg [{pred}]'
+            return cmd, error_x, error_y, error_yaw, detail
+
+        # 마커 없음 → lane fallback
+        lane_ok = self._lane_status is not None and self._lane_status.valid
+
+        if lane_ok:
+            offset = self._lane_status.offset_normalized
+            # angle은 매우 보수적으로 (낮은 게인)
+            cmd.linear.x = self.lane_vx
+            cmd.linear.y = -self.lane_vy_pid.update(offset) * 0.5  # 50% 감쇠
+            cmd.angular.z = 0.0  # angle 무시 (불안정하므로)
+
+            detail = f'[LANE] offset={offset:.2f} (angle ignored)'
+            return cmd, error_x, offset, 0.0, detail
+
+        # 둘 다 없음 → 후진
+        cmd.linear.x = -self.reverse_vx
+        return cmd, error_x, error_y, error_yaw, 'No sensor - reverse'
+
+    def _lane_follow(self):
+        """Legacy lane following (사용 안 함)."""
+        return self._drive_with_marker_priority()
 
     def _marker_approach(self):
         """Marker approach control."""
