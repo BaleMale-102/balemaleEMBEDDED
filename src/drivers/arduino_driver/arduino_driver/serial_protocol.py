@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """
-serial_protocol.py - Arduino 시리얼 통신 프로토콜
+serial_protocol.py - Arduino ROS2 Bridge 시리얼 프로토콜
 
-프로토콜 정의:
-- 명령 전송 (Jetson → Arduino):
-  "M,FL,FR,RL,RR\n"  - 모터 PWM 명령 (각 값: 300~2000)
-  "E,0\n" or "E,1\n" - 모터 비활성화/활성화
+프로토콜 (115200 baud):
+  송신 (Jetson → Arduino):
+    "V vx vy wz\n"    - 속도 명령 (m/s, rad/s)
+    "D nx ny nw\n"    - 정규화 속도 (-1 ~ +1)
+    "S\n"             - 긴급 정지
+    "P max_pwm\n"     - 최대 PWM 설정
+    "?\n"             - 상태 조회
 
-- 데이터 수신 (Arduino → Jetson):
-  "I,ax,ay,az,gx,gy,gz,yaw\n" - IMU 데이터
-  "S,status_code\n"           - 상태 코드
+  수신 (Arduino → Jetson):
+    "OK\n"            - 명령 확인
+    "READY\n"         - 부팅 완료
+    "STOPPED\n"       - 정지됨
+    "ERR\n"           - 에러
 """
 
 import serial
@@ -21,34 +26,15 @@ import logging
 
 
 @dataclass
-class IMUData:
-    """IMU 데이터 구조체"""
-    ax: float = 0.0    # 가속도 X (m/s²)
-    ay: float = 0.0    # 가속도 Y (m/s²)
-    az: float = 0.0    # 가속도 Z (m/s²)
-    gx: float = 0.0    # 자이로 X (rad/s)
-    gy: float = 0.0    # 자이로 Y (rad/s)
-    gz: float = 0.0    # 자이로 Z (rad/s)
-    yaw: float = 0.0   # Yaw 각도 (rad)
-    timestamp: float = 0.0
-
-
-@dataclass
-class MotorCommand:
-    """모터 명령 구조체"""
-    front_left: int = 1150   # PWM 중립값
-    front_right: int = 1150
-    rear_left: int = 1150
-    rear_right: int = 1150
-    enabled: bool = False
+class VelocityCommand:
+    """속도 명령"""
+    vx: float = 0.0    # 전진 속도 (m/s)
+    vy: float = 0.0    # 횡방향 속도 (m/s)
+    wz: float = 0.0    # 회전 속도 (rad/s)
 
 
 class SerialProtocol:
-    """Arduino 시리얼 통신 프로토콜 핸들러"""
-
-    PWM_CENTER = 1150
-    PWM_MIN = 300
-    PWM_MAX = 2000
+    """Arduino ROS2 Bridge 시리얼 통신"""
 
     def __init__(
         self,
@@ -70,13 +56,11 @@ class SerialProtocol:
         self._lock = threading.Lock()
 
         # Callbacks
-        self._imu_callback: Optional[Callable[[IMUData], None]] = None
-        self._status_callback: Optional[Callable[[int], None]] = None
+        self._response_callback: Optional[Callable[[str], None]] = None
 
         # State
-        self._last_motor_cmd = MotorCommand()
-        self._last_imu = IMUData()
         self._connected = False
+        self._last_response = ""
 
     def connect(self) -> bool:
         """시리얼 연결"""
@@ -111,8 +95,8 @@ class SerialProtocol:
         self.stop_read_thread()
 
         if self.serial and self.serial.is_open:
-            # 모터 정지 명령
-            self.send_motor_command(MotorCommand(enabled=False))
+            # 모터 정지
+            self.send_stop()
             time.sleep(0.1)
             self.serial.close()
 
@@ -141,27 +125,19 @@ class SerialProtocol:
         while self._running:
             try:
                 if self.simulate:
-                    # 시뮬레이션: 가상 IMU 데이터 생성
-                    time.sleep(0.02)  # 50Hz
-                    imu = IMUData(
-                        ax=0.0, ay=0.0, az=9.81,
-                        gx=0.0, gy=0.0, gz=0.0,
-                        yaw=0.0,
-                        timestamp=time.time()
-                    )
-                    if self._imu_callback:
-                        self._imu_callback(imu)
+                    time.sleep(0.1)
                     continue
 
                 if not self.serial or not self.serial.is_open:
                     time.sleep(0.1)
                     continue
 
-                line = self.serial.readline().decode('utf-8').strip()
-                if not line:
-                    continue
-
-                self._parse_line(line)
+                if self.serial.in_waiting > 0:
+                    line = self.serial.readline().decode('utf-8').strip()
+                    if line:
+                        self._last_response = line
+                        if self._response_callback:
+                            self._response_callback(line)
 
             except serial.SerialException as e:
                 self.logger.error(f'Serial read error: {e}')
@@ -170,80 +146,49 @@ class SerialProtocol:
                 self.logger.error(f'Read loop error: {e}')
                 time.sleep(0.01)
 
-    def _parse_line(self, line: str):
-        """수신 라인 파싱"""
-        parts = line.split(',')
-        if len(parts) < 2:
-            return
+    def _send(self, message: str) -> bool:
+        """메시지 전송"""
+        if self.simulate:
+            return True
 
-        msg_type = parts[0]
+        if not self.serial or not self.serial.is_open:
+            return False
 
-        if msg_type == 'I' and len(parts) >= 8:
-            # IMU 데이터
-            try:
-                imu = IMUData(
-                    ax=float(parts[1]),
-                    ay=float(parts[2]),
-                    az=float(parts[3]),
-                    gx=float(parts[4]),
-                    gy=float(parts[5]),
-                    gz=float(parts[6]),
-                    yaw=float(parts[7]),
-                    timestamp=time.time()
-                )
-                self._last_imu = imu
-                if self._imu_callback:
-                    self._imu_callback(imu)
-            except ValueError:
-                pass
-
-        elif msg_type == 'S' and len(parts) >= 2:
-            # 상태 코드
-            try:
-                status = int(parts[1])
-                if self._status_callback:
-                    self._status_callback(status)
-            except ValueError:
-                pass
-
-    def send_motor_command(self, cmd: MotorCommand) -> bool:
-        """모터 명령 전송"""
         with self._lock:
-            self._last_motor_cmd = cmd
-
-            if not cmd.enabled:
-                # 비활성화 명령
-                message = "E,0\n"
-            else:
-                # PWM 값 클램핑
-                fl = max(self.PWM_MIN, min(self.PWM_MAX, cmd.front_left))
-                fr = max(self.PWM_MIN, min(self.PWM_MAX, cmd.front_right))
-                rl = max(self.PWM_MIN, min(self.PWM_MAX, cmd.rear_left))
-                rr = max(self.PWM_MIN, min(self.PWM_MAX, cmd.rear_right))
-
-                message = f"M,{fl},{fr},{rl},{rr}\n"
-
-            if self.simulate:
-                return True
-
-            if not self.serial or not self.serial.is_open:
-                return False
-
             try:
-                self.serial.write(message.encode('utf-8'))
+                self.serial.write((message + '\n').encode('utf-8'))
                 self.serial.flush()
                 return True
             except serial.SerialException as e:
                 self.logger.error(f'Serial write error: {e}')
                 return False
 
-    def set_imu_callback(self, callback: Callable[[IMUData], None]):
-        """IMU 데이터 콜백 설정"""
-        self._imu_callback = callback
+    def send_velocity(self, vx: float, vy: float, wz: float) -> bool:
+        """속도 명령 전송 (m/s, rad/s)"""
+        message = f"V {vx:.4f} {vy:.4f} {wz:.4f}"
+        return self._send(message)
 
-    def set_status_callback(self, callback: Callable[[int], None]):
-        """상태 코드 콜백 설정"""
-        self._status_callback = callback
+    def send_velocity_normalized(self, nx: float, ny: float, nw: float) -> bool:
+        """정규화 속도 명령 전송 (-1 ~ +1)"""
+        message = f"D {nx:.4f} {ny:.4f} {nw:.4f}"
+        return self._send(message)
+
+    def send_stop(self) -> bool:
+        """긴급 정지"""
+        return self._send("S")
+
+    def send_set_max_pwm(self, max_pwm: int) -> bool:
+        """최대 PWM 설정"""
+        message = f"P {max_pwm}"
+        return self._send(message)
+
+    def send_query_status(self) -> bool:
+        """상태 조회"""
+        return self._send("?")
+
+    def set_response_callback(self, callback: Callable[[str], None]):
+        """응답 콜백 설정"""
+        self._response_callback = callback
 
     @property
     def is_connected(self) -> bool:
@@ -251,6 +196,6 @@ class SerialProtocol:
         return self._connected
 
     @property
-    def last_imu(self) -> IMUData:
-        """마지막 IMU 데이터"""
-        return self._last_imu
+    def last_response(self) -> str:
+        """마지막 응답"""
+        return self._last_response

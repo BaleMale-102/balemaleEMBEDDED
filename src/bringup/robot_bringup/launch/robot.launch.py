@@ -2,12 +2,18 @@
 """
 robot.launch.py - Main Robot Launch File
 
-Launches all nodes for autonomous operation.
+Launches all nodes for autonomous operation (without sensors).
+Use system.launch.py to launch everything including sensors.
 
 Arguments:
     simulation: Run in simulation mode (default: false)
     show_debug: Show debug images (default: true)
     config_file: Path to parameter file (default: robot_params.yaml)
+
+Nodes:
+    Perception: marker_detector, marker_tracker, lane_detector
+    Control: motion_controller, wheel_controller
+    Planning: mission_manager, server_bridge
 """
 
 import os
@@ -42,24 +48,31 @@ def generate_launch_description():
         description='Path to parameter file'
     )
 
+    marker_map_arg = DeclareLaunchArgument(
+        'marker_map',
+        default_value=os.path.join(bringup_dir, 'config', 'marker_map.yaml'),
+        description='Path to marker map file'
+    )
+
     # Get launch configurations
     simulation = LaunchConfiguration('simulation')
     show_debug = LaunchConfiguration('show_debug')
     config_file = LaunchConfiguration('config_file')
+    marker_map = LaunchConfiguration('marker_map')
 
     # ==========================================
     # Perception Nodes
     # ==========================================
     perception_group = GroupAction([
-        # Marker Detector
+        # Marker Detector (전방 카메라)
         Node(
             package='marker_detector',
             executable='detector_node',
             name='marker_detector',
             parameters=[config_file],
             remappings=[
-                ('image_raw', '/camera/front/image_raw'),
-                ('camera_info', '/camera/front/camera_info'),
+                ('image_raw', '/cam_front/image_raw'),
+                ('camera_info', '/cam_front/camera_info'),
             ],
         ),
 
@@ -71,14 +84,14 @@ def generate_launch_description():
             parameters=[config_file],
         ),
 
-        # Lane Detector
+        # Lane Detector (하단 카메라)
         Node(
             package='lane_detector',
             executable='detector_node',
             name='lane_detector',
             parameters=[config_file],
             remappings=[
-                ('image_raw', '/camera/front/image_raw'),
+                ('image_raw', '/cam_bottom/image_raw'),
             ],
         ),
     ])
@@ -86,6 +99,7 @@ def generate_launch_description():
     # ==========================================
     # Control Nodes
     # ==========================================
+    # Note: arduino_driver is launched in sensors.launch.py
     control_group = GroupAction([
         # Motion Controller
         Node(
@@ -93,17 +107,6 @@ def generate_launch_description():
             executable='controller_node',
             name='motion_controller',
             parameters=[config_file],
-        ),
-
-        # Wheel Controller
-        Node(
-            package='wheel_controller',
-            executable='controller_node',
-            name='wheel_controller',
-            parameters=[
-                config_file,
-                {'simulation': simulation},
-            ],
         ),
     ])
 

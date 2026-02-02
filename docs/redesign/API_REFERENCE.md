@@ -37,6 +37,15 @@ float32 curvature            # 곡률
 float32 confidence
 ```
 
+### ParkingLineStatus.msg (측면 카메라)
+```
+std_msgs/Header header
+bool valid                   # 주차선 검출 여부
+float32 offset_norm          # 정규화 오프셋 (-1~+1)
+float32 angle                # 주차선 각도 (rad)
+float32 quality              # 검출 품질 (0~1)
+```
+
 ### MotorCommand.msg
 ```
 std_msgs/Header header
@@ -139,34 +148,66 @@ float32 elapsed_time
 | kalman_r | 0.05 | 측정 노이즈 |
 
 ### motion_controller
+차선 추종에 시각 서보 PID 사용 (엔코더 기반 속도 PID 아님)
+
 | 파라미터 | 기본값 | 설명 |
 |---------|--------|------|
-| max_vx | 0.05 | 최대 전진 속도 |
-| max_vy | 0.05 | 최대 횡방향 속도 |
-| max_wz | 0.5 | 최대 회전 속도 |
-| lane_vx | 0.03 | 차선 추종 속도 |
-| marker_reach_distance | 0.15 | 마커 도달 거리 |
+| max_vx | 0.05 | 최대 전진 속도 (m/s) |
+| max_vy | 0.05 | 최대 횡방향 속도 (m/s) |
+| max_wz | 0.5 | 최대 회전 속도 (rad/s) |
+| lane_vx | 0.03 | 차선 추종 속도 (m/s) |
+| lane_vy_kp | 0.03 | 차선 오프셋 P 게인 (시각 서보) |
+| lane_wz_kp | 0.3 | 차선 각도 P 게인 (시각 서보) |
+| marker_reach_distance | 0.15 | 마커 도달 거리 (m) |
+| marker_vx_kp | 0.1 | 마커 접근 속도 게인 |
+| marker_vy_kp | 0.05 | 마커 횡방향 보정 게인 |
+| marker_wz_kp | 0.3 | 마커 방향 보정 게인 |
 
-### wheel_controller
+### arduino_driver (arduino_node)
 | 파라미터 | 기본값 | 설명 |
 |---------|--------|------|
-| wheel_radius | 0.03 | 휠 반경 (m) |
-| wheel_base_x | 0.08 | X축 휠 거리 |
-| wheel_base_y | 0.06 | Y축 휠 거리 |
-| max_pwm | 3000 | 최대 PWM |
-| serial_port | /dev/ttyUSB0 | Arduino 포트 |
-| watchdog_timeout | 0.3 | 명령 타임아웃 |
+| port | /dev/ttyUSB0 | Arduino 시리얼 포트 |
+| baudrate | 115200 | 통신 속도 |
+| timeout | 0.1 | 시리얼 타임아웃 (초) |
+| simulate | false | 시뮬레이션 모드 |
+| cmd_rate_hz | 20.0 | 명령 전송 주기 |
+| watchdog_timeout | 0.5 | Watchdog 타임아웃 (초) |
+| max_vx | 0.10 | 최대 전진 속도 (m/s) |
+| max_vy | 0.10 | 최대 횡방향 속도 (m/s) |
+| max_wz | 1.0 | 최대 회전 속도 (rad/s) |
 
-## Arduino Protocol
+### 참고: 메카넘 기구학 파라미터 (Arduino 펌웨어 내장)
+| 파라미터 | 값 | 설명 |
+|---------|-----|------|
+| WHEEL_RADIUS | 0.040 | 휠 반경 (m) |
+| WHEEL_BASE_X | 0.075 | 중심~앞/뒤 바퀴 거리 (m) |
+| WHEEL_BASE_Y | 0.090 | 중심~좌/우 바퀴 거리 (m) |
+| MAX_PWM | 2000 | 최대 PWM (조정 가능) |
+| MIN_PWM | 300 | 최소 PWM (데드존) |
+
+## Arduino Protocol (115200 baud)
+
+Arduino UNO + MoebiusTech Motor Hat 기반 Open-loop 제어
 
 ### TX (Jetson → Arduino)
 ```
-M,FL,FR,RL,RR\n    # 모터 명령 (PWM 값)
+V vx vy wz\n       # 속도 명령 (m/s, rad/s) - 역기구학 Arduino에서 처리
+D nx ny nw\n       # 정규화 속도 (-1 ~ +1)
+S\n                # 긴급 정지
+P max_pwm\n        # 최대 PWM 설정 (300~4000)
+?\n                # 상태 조회
 ```
 
 ### RX (Arduino → Jetson)
 ```
-I,ax,ay,az,gx,gy,gz,yaw\n    # IMU 데이터
-E,fl,fr,rl,rr\n              # 엔코더 데이터
-S,status\n                    # 상태 메시지
+OK\n               # 명령 확인
+READY\n            # 부팅 완료
+STOPPED\n          # 정지됨
+ERR\n              # 에러
+ROS2_BRIDGE v1.0   # 상태 응답
 ```
+
+### 주의사항
+- **엔코더 미사용**: Motor Hat이 엔코더 신호를 통과시키지 않음
+- **IMU 별도**: MPU6050은 Jetson I2C에 직접 연결 (imu_mpu6050_node)
+- **Watchdog**: 300ms 내 명령 없으면 자동 정지

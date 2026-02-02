@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
 """
-arduino_node.py - Arduino 시리얼 브릿지 노드
+arduino_node.py - Arduino ROS2 Bridge 노드
 
 기능:
 - Arduino와 시리얼 통신
-- 모터 PWM 명령 전송
-- IMU 데이터 수신 및 퍼블리시
-- 시뮬레이션 모드 지원
+- 속도 명령 전송 (vx, vy, wz)
+- Watchdog (명령 없으면 정지)
 
 토픽:
   Subscribe:
-    /motor/command: robot_interfaces/MotorCommand
+    /control/cmd_vel: geometry_msgs/Twist - 속도 명령
+
   Publish:
-    /imu/data: sensor_msgs/Imu
+    /arduino/status: std_msgs/String - 상태
+
+서비스:
+  /arduino/stop: std_srvs/Trigger - 긴급 정지
 """
 
-import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Imu
-from std_msgs.msg import Bool
-from std_srvs.srv import SetBool
+from geometry_msgs.msg import Twist
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
 
-from .serial_protocol import SerialProtocol, IMUData, MotorCommand
+from .serial_protocol import SerialProtocol, VelocityCommand
 
 
 class ArduinoNode(Node):
@@ -35,14 +37,22 @@ class ArduinoNode(Node):
         self.declare_parameter('baudrate', 115200)
         self.declare_parameter('timeout', 0.1)
         self.declare_parameter('simulate', False)
-        self.declare_parameter('imu_frame_id', 'imu_link')
+        self.declare_parameter('cmd_rate_hz', 20.0)
+        self.declare_parameter('watchdog_timeout', 0.5)
+        self.declare_parameter('max_vx', 0.10)
+        self.declare_parameter('max_vy', 0.10)
+        self.declare_parameter('max_wz', 1.0)
 
         # Load parameters
         port = self.get_parameter('port').value
         baudrate = self.get_parameter('baudrate').value
         timeout = self.get_parameter('timeout').value
         simulate = self.get_parameter('simulate').value
-        self.imu_frame_id = self.get_parameter('imu_frame_id').value
+        cmd_rate = self.get_parameter('cmd_rate_hz').value
+        self.watchdog_timeout = self.get_parameter('watchdog_timeout').value
+        self.max_vx = self.get_parameter('max_vx').value
+        self.max_vy = self.get_parameter('max_vy').value
+        self.max_wz = self.get_parameter('max_wz').value
 
         # Serial protocol
         self.protocol = SerialProtocol(
@@ -53,136 +63,102 @@ class ArduinoNode(Node):
             logger=self.get_logger()
         )
 
+        # State
+        self._last_cmd_time = self.get_clock().now()
+        self._current_cmd = VelocityCommand()
+        self._enabled = True
+
         # Publishers
-        self.pub_imu = self.create_publisher(
-            Imu, '/imu/data', qos_profile_sensor_data
-        )
+        self.pub_status = self.create_publisher(String, '/arduino/status', 10)
 
         # Subscribers
-        # Note: robot_interfaces needs to be imported after sourcing
-        try:
-            from robot_interfaces.msg import MotorCommand as MotorCommandMsg
-            self.sub_motor = self.create_subscription(
-                MotorCommandMsg,
-                '/motor/command',
-                self._motor_callback,
-                10
-            )
-            self._has_motor_interface = True
-        except ImportError:
-            self.get_logger().warn('robot_interfaces not found, using fallback')
-            self._has_motor_interface = False
-
-        # Services
-        self.srv_enable = self.create_service(
-            SetBool, '/motor/enable', self._enable_callback
+        self.sub_cmd_vel = self.create_subscription(
+            Twist, '/control/cmd_vel', self._cmd_vel_callback, 10
         )
 
-        # State
-        self._motor_enabled = False
+        # Services
+        self.srv_stop = self.create_service(
+            Trigger, '/arduino/stop', self._stop_callback
+        )
 
-        # Connect
-        if not self.protocol.connect():
+        # Connect to Arduino
+        if self.protocol.connect():
+            self.get_logger().info('Connected to Arduino')
+            self.protocol.set_response_callback(self._response_callback)
+            self.protocol.start_read_thread()
+        else:
             self.get_logger().error('Failed to connect to Arduino')
 
-        # Set IMU callback
-        self.protocol.set_imu_callback(self._imu_callback)
+        # Timer for sending commands
+        self.cmd_timer = self.create_timer(1.0 / cmd_rate, self._cmd_timer_callback)
 
-        # Start read thread
-        self.protocol.start_read_thread()
-
-        # Watchdog timer (stop motors if no command received)
-        self.declare_parameter('watchdog_timeout', 0.5)
-        self._watchdog_timeout = self.get_parameter('watchdog_timeout').value
-        self._last_cmd_time = self.get_clock().now()
-        self._watchdog_timer = self.create_timer(0.1, self._watchdog_callback)
+        # Timer for watchdog
+        self.watchdog_timer = self.create_timer(0.1, self._watchdog_callback)
 
         self.get_logger().info(
             f'ArduinoNode started: {port} @ {baudrate} (simulate={simulate})'
         )
 
-    def _imu_callback(self, data: IMUData):
-        """IMU 데이터 수신 콜백"""
-        msg = Imu()
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.header.frame_id = self.imu_frame_id
-
-        # Linear acceleration
-        msg.linear_acceleration.x = data.ax
-        msg.linear_acceleration.y = data.ay
-        msg.linear_acceleration.z = data.az
-
-        # Angular velocity
-        msg.angular_velocity.x = data.gx
-        msg.angular_velocity.y = data.gy
-        msg.angular_velocity.z = data.gz
-
-        # Orientation from yaw (assuming flat surface)
-        yaw = data.yaw
-        msg.orientation.x = 0.0
-        msg.orientation.y = 0.0
-        msg.orientation.z = math.sin(yaw / 2.0)
-        msg.orientation.w = math.cos(yaw / 2.0)
-
-        # Covariance (approximate)
-        msg.linear_acceleration_covariance[0] = 0.01
-        msg.linear_acceleration_covariance[4] = 0.01
-        msg.linear_acceleration_covariance[8] = 0.01
-
-        msg.angular_velocity_covariance[0] = 0.001
-        msg.angular_velocity_covariance[4] = 0.001
-        msg.angular_velocity_covariance[8] = 0.001
-
-        msg.orientation_covariance[0] = 0.01
-        msg.orientation_covariance[4] = 0.01
-        msg.orientation_covariance[8] = 0.01
-
-        self.pub_imu.publish(msg)
-
-    def _motor_callback(self, msg):
-        """모터 명령 수신 콜백"""
+    def _cmd_vel_callback(self, msg: Twist):
+        """속도 명령 수신 콜백"""
         self._last_cmd_time = self.get_clock().now()
 
-        cmd = MotorCommand(
-            front_left=msg.front_left,
-            front_right=msg.front_right,
-            rear_left=msg.rear_left,
-            rear_right=msg.rear_right,
-            enabled=msg.enabled and self._motor_enabled
+        # 속도 제한
+        self._current_cmd.vx = self._clamp(msg.linear.x, -self.max_vx, self.max_vx)
+        self._current_cmd.vy = self._clamp(msg.linear.y, -self.max_vy, self.max_vy)
+        self._current_cmd.wz = self._clamp(msg.angular.z, -self.max_wz, self.max_wz)
+
+    def _cmd_timer_callback(self):
+        """주기적 명령 전송"""
+        if not self._enabled:
+            return
+
+        self.protocol.send_velocity(
+            self._current_cmd.vx,
+            self._current_cmd.vy,
+            self._current_cmd.wz
         )
 
-        self.protocol.send_motor_command(cmd)
-
-    def _enable_callback(self, request, response):
-        """모터 활성화 서비스 콜백"""
-        self._motor_enabled = request.data
-
-        if not request.data:
-            # 비활성화 시 모터 정지
-            self.protocol.send_motor_command(MotorCommand(enabled=False))
-
-        response.success = True
-        response.message = f'Motor {"enabled" if request.data else "disabled"}'
-        self.get_logger().info(response.message)
-
-        return response
-
     def _watchdog_callback(self):
-        """Watchdog 콜백 - 명령 없으면 모터 정지"""
-        if not self._motor_enabled:
+        """Watchdog: 명령 없으면 정지"""
+        if not self._enabled:
             return
 
         elapsed = (self.get_clock().now() - self._last_cmd_time).nanoseconds / 1e9
-        if elapsed > self._watchdog_timeout:
-            # 모터 정지
-            self.protocol.send_motor_command(MotorCommand(enabled=False))
-            self.get_logger().warn(
-                f'Watchdog: No command for {elapsed:.2f}s, motors stopped',
-                throttle_duration_sec=2.0
-            )
+
+        if elapsed > self.watchdog_timeout:
+            # 속도 0으로 설정
+            self._current_cmd.vx = 0.0
+            self._current_cmd.vy = 0.0
+            self._current_cmd.wz = 0.0
+
+    def _stop_callback(self, request, response):
+        """긴급 정지 서비스 콜백"""
+        self.protocol.send_stop()
+        self._current_cmd = VelocityCommand()
+
+        response.success = True
+        response.message = 'Emergency stop sent'
+        self.get_logger().warn('Emergency stop!')
+
+        return response
+
+    def _response_callback(self, line: str):
+        """Arduino 응답 콜백"""
+        msg = String()
+        msg.data = line
+        self.pub_status.publish(msg)
+
+        if 'ERR' in line:
+            self.get_logger().warn(f'Arduino error: {line}')
+
+    @staticmethod
+    def _clamp(value: float, min_val: float, max_val: float) -> float:
+        return max(min_val, min(max_val, value))
 
     def destroy_node(self):
         """Cleanup"""
+        self.protocol.send_stop()
         self.protocol.disconnect()
         super().destroy_node()
 

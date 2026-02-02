@@ -243,48 +243,54 @@
           ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                          arduino_driver_node                                 │
-│  - Serial 통신                                                               │
-│  - PWM 명령 전송                                                             │
-│  - IMU 데이터 수신                                                           │
+│  - Serial 통신 (115200 baud)                                                 │
+│  - 속도 명령 전송 (V vx vy wz)                                               │
+│  - Watchdog (명령 없으면 자동 정지)                                          │
 └─────────────────────────────────────────────────────────────────────────────┘
-          │                                     ▲
-          │ USB Serial                          │ /imu/data
-          ▼                                     │
+          │
+          │ USB Serial (/dev/ttyUSB0)
+          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              Arduino Mega                                    │
-│  - 모터 드라이버 제어                                                        │
-│  - IMU 읽기 (MPU6050)                                                        │
+│                              Arduino UNO                                     │
+│  - MoebiusTech Motor Hat (PCA9685)                                          │
+│  - 메카넘 역기구학 (내장)                                                    │
+│  - Open-loop 모터 제어 (엔코더 없음)                                         │
 └─────────────────────────────────────────────────────────────────────────────┘
+
+※ IMU (MPU6050)는 Jetson에 I2C로 직접 연결됨 (별도 imu_mpu6050 드라이버)
 
 
                     ═══════════════════════════════════════
                                  인식 파이프라인
                     ═══════════════════════════════════════
 
-┌──────────────────────┐     ┌──────────────────────┐
-│  camera_node         │     │  camera_node         │
-│  (front_cam)         │     │  (bottom_cam)        │
-│  /dev/video0         │     │  /dev/video2         │
-└──────────────────────┘     └──────────────────────┘
-          │                            │
-          │ /camera/front/image_raw    │ /camera/bottom/image_raw
-          ▼                            ▼
-┌──────────────────────┐     ┌──────────────────────┐
-│ marker_detector_node │     │ lane_detector_node   │
-│ - ArUco 검출         │     │ - Sobel 엣지         │
-│ - 포즈 추정          │     │ - 라인 피팅          │
-└──────────────────────┘     └──────────────────────┘
-          │                            │
-          │ /perception/markers        │ /perception/lane_status
-          ▼                            │
-┌──────────────────────┐               │
-│ marker_tracker_node  │               │
-│ - Kalman Filter      │               │
-│ - 마커 예측          │               │
-└──────────────────────┘               │
-          │                            │
-          │ /perception/tracked_marker │
-          └────────────────────────────┴──────────▶ motion_controller_node
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│  camera_node     │  │  camera_node     │  │  camera_node     │
+│  (front_cam)     │  │  (bottom_cam)    │  │  (side_cam)      │
+│  /dev/video0     │  │  /dev/video2     │  │  /dev/video4     │
+└──────────────────┘  └──────────────────┘  └──────────────────┘
+          │                    │                    │
+          │ /cam_front/        │ /cam_bottom/       │ /cam_side/
+          │  image_raw         │  image_raw         │  image_raw
+          ▼                    ▼                    ▼
+┌──────────────────┐  ┌──────────────────┐  ┌──────────────────┐
+│marker_detector   │  │lane_detector     │  │parking_line_node │
+│ - ArUco 검출     │  │ - 차선 검출      │  │ - 주차선 검출    │
+│ - 포즈 추정      │  │ - PID 서보       │  │ - 슬롯 마커      │
+└──────────────────┘  └──────────────────┘  └──────────────────┘
+          │                    │                    │
+          │ /perception/       │ /perception/       │ /perception/
+          │  markers           │  lane_status       │  parking_line
+          ▼                    │                    │
+┌──────────────────┐           │                    │
+│marker_tracker    │           │                    │
+│ - Kalman Filter  │           │                    │
+│ - 마커 예측      │           │                    │
+└──────────────────┘           │                    │
+          │                    │                    │
+          │ /perception/       │                    │
+          │  tracked_marker    │                    │
+          └────────────────────┴────────────────────┴──▶ motion_controller_node
 ```
 
 ---
@@ -295,10 +301,10 @@
 
 | 토픽 | 타입 | 발행자 | 구독자 | 설명 |
 |------|------|--------|--------|------|
-| `/camera/front/image_raw` | sensor_msgs/Image | camera_node | marker_detector | 전방 카메라 |
-| `/camera/front/camera_info` | sensor_msgs/CameraInfo | camera_node | marker_detector | 카메라 정보 |
-| `/camera/bottom/image_raw` | sensor_msgs/Image | camera_node | lane_detector | 하단 카메라 |
-| `/imu/data` | sensor_msgs/Imu | arduino_driver | motion_controller | IMU 데이터 |
+| `/cam_front/image_raw` | sensor_msgs/Image | v4l2_camera | marker_detector | 전방 카메라 (마커) |
+| `/cam_bottom/image_raw` | sensor_msgs/Image | v4l2_camera | lane_detector | 하단 카메라 (차선) |
+| `/cam_side/image_raw` | sensor_msgs/Image | v4l2_camera | parking_line_node | 측면 카메라 (주차선) |
+| `/imu/data` | sensor_msgs/Imu | imu_mpu6050_node | motion_controller, safety_manager | IMU (Jetson I2C) |
 
 ### 4.2 인식 토픽 (처리)
 
@@ -323,8 +329,11 @@
 
 | 토픽 | 타입 | 발행자 | 구독자 | 설명 |
 |------|------|--------|--------|------|
-| `/cmd_vel` | geometry_msgs/Twist | motion_controller | wheel_controller | 속도 명령 |
-| `/motor/command` | robot_interfaces/MotorCommand | wheel_controller | arduino_driver | PWM 명령 |
+| `/cmd_vel` | geometry_msgs/Twist | motion_controller | arduino_driver | 속도 명령 (vx, vy, wz) |
+| `/arduino/status` | std_msgs/String | arduino_driver | (모니터링) | Arduino 응답 상태 |
+
+**참고**: 엔코더 미사용으로 `/motor/command`, `/odom/wheel` 토픽은 사용하지 않음.
+Arduino에서 직접 메카넘 역기구학 계산 후 PWM 출력.
 
 ### 4.5 상태/미션 토픽
 
@@ -482,7 +491,7 @@ robot:
   frame_id: "base_link"
 
 # ============================================
-# 카메라 드라이버
+# 카메라 드라이버 (v4l2_camera 사용)
 # ============================================
 camera_front:
   device: "/dev/video0"
@@ -498,14 +507,26 @@ camera_bottom:
   fps: 30
   frame_id: "camera_bottom_link"
 
+camera_side:
+  device: "/dev/video4"
+  width: 320
+  height: 240
+  fps: 30
+  frame_id: "camera_side_link"
+
 # ============================================
-# Arduino 드라이버
+# Arduino 드라이버 (Open-loop 제어)
 # ============================================
 arduino_driver:
   port: "/dev/ttyUSB0"
   baudrate: 115200
-  timeout_sec: 0.1
-  imu_publish_rate: 50.0
+  timeout: 0.1
+  simulate: false           # 시뮬레이션 모드
+  cmd_rate_hz: 20.0         # 명령 전송 주기
+  watchdog_timeout: 0.5     # 명령 없으면 정지
+  max_vx: 0.10              # 최대 전진 속도 (m/s)
+  max_vy: 0.10              # 최대 횡방향 속도 (m/s)
+  max_wz: 1.0               # 최대 회전 속도 (rad/s)
 
 # ============================================
 # 마커 검출
@@ -564,28 +585,18 @@ motion_controller:
   watchdog_timeout: 0.5  # seconds
 
 # ============================================
-# 휠 컨트롤러
+# 휠 컨트롤러 (DEPRECATED - arduino_driver 사용)
 # ============================================
-wheel_controller:
-  # 메카넘 기구학 파라미터
-  wheel_radius: 0.04       # meters
-  wheel_separation_x: 0.10 # meters (lx)
-  wheel_separation_y: 0.12 # meters (ly)
-
-  # PWM 설정
-  pwm_center: 1150
-  pwm_range: 850
-  pwm_min: 300
-  pwm_max: 2000
-
-  # 모터 방향
-  invert_front_left: false
-  invert_front_right: true
-  invert_rear_left: false
-  invert_rear_right: true
-
-  # 속도 제한
-  max_wheel_speed: 10.0  # rad/s
+# 메카넘 역기구학은 Arduino 펌웨어에서 처리
+# Arduino 파라미터 (펌웨어 내장):
+#   WHEEL_RADIUS: 0.040m
+#   WHEEL_BASE_X: 0.075m
+#   WHEEL_BASE_Y: 0.090m
+#   MAX_VEL_LINEAR: 0.10 m/s
+#   MAX_VEL_ANGULAR: 1.0 rad/s
+#   MAX_PWM: 2000
+#   MIN_PWM: 300
+#   WATCHDOG_MS: 300
 
 # ============================================
 # 경로 계획
