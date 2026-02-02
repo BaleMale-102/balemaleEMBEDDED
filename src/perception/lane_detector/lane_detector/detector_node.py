@@ -15,6 +15,7 @@ detector_node.py - 라인 검출 노드
     /perception/debug/lane_image: sensor_msgs/Image (선택)
 """
 
+import cv2
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -52,6 +53,7 @@ class LaneDetectorNode(Node):
         # Parameters
         self.declare_parameter('image_topic', '/camera/front/image_raw')
         self.declare_parameter('publish_debug_image', True)
+        self.declare_parameter('show_debug_window', False)
         self.declare_parameter('roi_top_ratio', 0.5)
         self.declare_parameter('roi_bottom_ratio', 1.0)
         self.declare_parameter('sobel_threshold', 50)
@@ -63,6 +65,7 @@ class LaneDetectorNode(Node):
         # Load parameters
         image_topic = self.get_parameter('image_topic').value
         self.publish_debug = self.get_parameter('publish_debug_image').value
+        self.show_debug_window = self.get_parameter('show_debug_window').value
 
         # Lane detector
         self.detector = LaneDetector(
@@ -133,7 +136,7 @@ class LaneDetectorNode(Node):
         if self._has_interface:
             lane_msg = self._LaneStatus()
             lane_msg.header.stamp = msg.header.stamp
-            lane_msg.header.frame_id = 'camera_bottom_link'
+            lane_msg.header.frame_id = 'camera_front_link'
 
             lane_msg.valid = result.valid
             lane_msg.offset = float(result.offset)
@@ -153,6 +156,11 @@ class LaneDetectorNode(Node):
             except Exception as e:
                 self.get_logger().error(f'Debug image error: {e}')
 
+        # 디버그 창 표시
+        if self.show_debug_window and result.debug_image is not None:
+            cv2.imshow('Lane Detector', result.debug_image)
+            cv2.waitKey(1)
+
 
 def main(args=None):
     rclpy.init(args=args)
@@ -163,6 +171,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 

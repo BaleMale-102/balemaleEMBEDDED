@@ -82,8 +82,8 @@ class LaneDetector:
         # 라인 검출
         offset_px, angle, confidence, n_pixels = self._find_line(binary)
 
-        # 유효성 체크
-        valid = n_pixels >= self.min_line_pixels and confidence > 0.2
+        # 유효성 체크 (더 엄격한 조건)
+        valid = n_pixels >= self.min_line_pixels and confidence > 0.35
 
         # 픽셀 → 실제 단위 변환
         offset_normalized = offset_px / (w / 2) if w > 0 else 0.0
@@ -151,6 +151,7 @@ class LaneDetector:
             n_pixels: 라인 픽셀 수
         """
         h, w = binary.shape
+        total_pixels = h * w
 
         # 라인 픽셀 찾기
         nonzero = binary.nonzero()
@@ -162,8 +163,11 @@ class LaneDetector:
         if n_pixels < self.min_line_pixels:
             return 0.0, 0.0, 0.0, n_pixels
 
-        # 신뢰도 (픽셀 수 기반)
-        confidence = min(1.0, n_pixels / 2000.0)
+        # 픽셀 비율 체크 (너무 많으면 노이즈, 너무 적으면 라인 없음)
+        pixel_ratio = n_pixels / total_pixels
+        if pixel_ratio > 0.4 or pixel_ratio < 0.01:
+            # 40% 이상이면 전체가 검정 또는 노이즈, 1% 미만이면 라인 없음
+            return 0.0, 0.0, 0.0, 0
 
         # 라인 중심 (x 평균)
         line_center_x = np.mean(line_x)
@@ -172,15 +176,34 @@ class LaneDetector:
         # 오프셋 (양수 = 라인이 오른쪽에 있음)
         offset_px = line_center_x - image_center_x
 
-        # 라인 각도 (선형 회귀)
+        # 라인 각도 및 직선성 체크 (선형 회귀)
         angle = 0.0
+        linearity = 0.0
+
         if n_pixels > 200:
             try:
                 # y에 대한 x의 기울기
                 fit = np.polyfit(line_y, line_x, 1)
                 angle = math.atan(fit[0])
+
+                # 직선성 체크: R² 값 (잔차 기반)
+                predicted_x = np.polyval(fit, line_y)
+                ss_res = np.sum((line_x - predicted_x) ** 2)
+                ss_tot = np.sum((line_x - np.mean(line_x)) ** 2)
+                if ss_tot > 0:
+                    r_squared = 1 - (ss_res / ss_tot)
+                    linearity = max(0, r_squared)
             except Exception:
                 pass
+
+        # 신뢰도 계산 (픽셀 수 + 직선성)
+        pixel_confidence = min(1.0, n_pixels / 2000.0)
+        confidence = pixel_confidence * (0.5 + 0.5 * linearity)
+
+        # 직선성이 낮으면 라인이 아닐 가능성 높음
+        if linearity < 0.3 and n_pixels > 500:
+            # 많은 픽셀인데 직선이 아니면 노이즈
+            confidence *= 0.3
 
         return offset_px, angle, confidence, n_pixels
 

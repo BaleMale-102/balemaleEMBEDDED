@@ -63,16 +63,29 @@ class ArucoDetector:
             raise ValueError(f'Unknown dictionary: {dictionary}')
 
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(self.DICT_MAP[dictionary])
-        self.aruco_params = cv2.aruco.DetectorParameters()
 
-        # 검출 파라미터 최적화
-        self.aruco_params.adaptiveThreshConstant = 7
-        self.aruco_params.minMarkerPerimeterRate = 0.03
-        self.aruco_params.maxMarkerPerimeterRate = 4.0
-        self.aruco_params.polygonalApproxAccuracyRate = 0.03
-        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        # OpenCV 버전에 따른 API 분기
+        # 4.7+: DetectorParameters(), ArucoDetector()
+        # 4.6-: DetectorParameters_create(), detectMarkers()
+        self._use_new_api = hasattr(cv2.aruco, 'DetectorParameters')
 
-        self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+        if self._use_new_api:
+            self.aruco_params = cv2.aruco.DetectorParameters()
+            self.aruco_params.adaptiveThreshConstant = 7
+            self.aruco_params.minMarkerPerimeterRate = 0.03
+            self.aruco_params.maxMarkerPerimeterRate = 4.0
+            self.aruco_params.polygonalApproxAccuracyRate = 0.03
+            self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+        else:
+            # 구버전 OpenCV (4.6 이하)
+            self.aruco_params = cv2.aruco.DetectorParameters_create()
+            self.aruco_params.adaptiveThreshConstant = 7
+            self.aruco_params.minMarkerPerimeterRate = 0.03
+            self.aruco_params.maxMarkerPerimeterRate = 4.0
+            self.aruco_params.polygonalApproxAccuracyRate = 0.03
+            self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            self.detector = None
 
         self.marker_size = marker_size
 
@@ -112,8 +125,13 @@ class ArucoDetector:
         else:
             gray = image
 
-        # 마커 검출
-        corners, ids, rejected = self.detector.detectMarkers(gray)
+        # 마커 검출 (OpenCV 버전에 따라 분기)
+        if self._use_new_api:
+            corners, ids, rejected = self.detector.detectMarkers(gray)
+        else:
+            corners, ids, rejected = cv2.aruco.detectMarkers(
+                gray, self.aruco_dict, parameters=self.aruco_params
+            )
 
         markers = []
 

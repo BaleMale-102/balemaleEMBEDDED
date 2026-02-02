@@ -24,8 +24,17 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String, Int32, Bool
+from sensor_msgs.msg import Imu
 
 from .pid_controller import PIDController
+
+
+def quaternion_to_yaw(q) -> float:
+    """Quaternion에서 yaw 추출"""
+    # yaw = atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+    siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 class MotionControllerNode(Node):
@@ -47,6 +56,9 @@ class MotionControllerNode(Node):
         self.declare_parameter('max_vy', 0.05)
         self.declare_parameter('max_wz', 0.5)
 
+        # Parameters - fallback (센서 없을 때)
+        self.declare_parameter('reverse_vx', 0.015)  # 후진 속도 (저속)
+
         # Parameters - lane following
         self.declare_parameter('lane_vx', 0.03)
         self.declare_parameter('lane_vy_kp', 0.03)
@@ -63,9 +75,13 @@ class MotionControllerNode(Node):
         self.declare_parameter('marker_reach_distance', 0.15)
         self.declare_parameter('marker_min_distance', 0.08)
 
-        # Parameters - turn
+        # Parameters - turn (PID + 오버슈팅 보정)
         self.declare_parameter('turn_wz', 0.3)
-        self.declare_parameter('turn_tolerance', 0.05)  # rad
+        self.declare_parameter('turn_wz_min', 0.08)     # 최소 회전 속도 (너무 느리면 안 움직임)
+        self.declare_parameter('turn_tolerance', 0.05)  # rad (~3도)
+        self.declare_parameter('turn_kp', 1.5)          # 비례 게인
+        self.declare_parameter('turn_kd', 0.3)          # 미분 게인 (급정지 방지)
+        self.declare_parameter('turn_decel_zone', 0.5)  # 감속 시작 구간 (rad, ~30도)
 
         # Load parameters
         control_rate = self.get_parameter('control_rate').value
@@ -73,11 +89,16 @@ class MotionControllerNode(Node):
         self.max_vy = self.get_parameter('max_vy').value
         self.max_wz = self.get_parameter('max_wz').value
 
+        self.reverse_vx = self.get_parameter('reverse_vx').value
         self.lane_vx = self.get_parameter('lane_vx').value
         self.marker_reach_dist = self.get_parameter('marker_reach_distance').value
         self.marker_min_dist = self.get_parameter('marker_min_distance').value
         self.turn_wz = self.get_parameter('turn_wz').value
+        self.turn_wz_min = self.get_parameter('turn_wz_min').value
         self.turn_tolerance = self.get_parameter('turn_tolerance').value
+        self.turn_kp = self.get_parameter('turn_kp').value
+        self.turn_kd = self.get_parameter('turn_kd').value
+        self.turn_decel_zone = self.get_parameter('turn_decel_zone').value
 
         # PID controllers for lane following
         self.lane_vy_pid = PIDController(
@@ -103,11 +124,15 @@ class MotionControllerNode(Node):
         self._enable = False
         self._target_marker_id = -1
         self._turn_target_rad = 0.0
+        self._turn_start_yaw = 0.0  # TURN 시작 시 yaw
         self._current_yaw = 0.0
+        self._prev_turn_error = 0.0  # 이전 턴 에러 (미분용)
+        self._turn_done_sent = False  # turn_done 중복 발행 방지
 
         # Perception data
         self._lane_status = None
         self._tracked_marker = None
+        self._imu_data = None
 
         # Import custom interfaces
         try:
@@ -160,6 +185,12 @@ class MotionControllerNode(Node):
                 self._marker_callback, qos_profile_sensor_data
             )
 
+        # IMU subscription (for TURN mode)
+        self.sub_imu = self.create_subscription(
+            Imu, '/imu/data',
+            self._imu_callback, qos_profile_sensor_data
+        )
+
         # Control timer
         self.timer = self.create_timer(1.0 / control_rate, self._control_loop)
 
@@ -168,6 +199,7 @@ class MotionControllerNode(Node):
     def _mission_state_callback(self, msg: String):
         """Handle mission state changes."""
         state = msg.data.upper()
+        prev_mode = self._mode
 
         if state == 'IDLE':
             self._mode = self.MODE_IDLE
@@ -177,6 +209,12 @@ class MotionControllerNode(Node):
             self._mode = self.MODE_MARKER_APPROACH
         elif state in ('TURN', 'TURNING'):
             self._mode = self.MODE_TURN
+            # TURN 모드 진입 시 상태 초기화
+            if prev_mode != self.MODE_TURN:
+                self._turn_start_yaw = self._current_yaw
+                self._prev_turn_error = 0.0
+                self._turn_done_sent = False
+                self.get_logger().info(f'TURN started: start_yaw={math.degrees(self._turn_start_yaw):.1f}deg, target={math.degrees(self._turn_target_rad):.1f}deg')
         elif state in ('STOP', 'PARK', 'FINISH'):
             self._mode = self.MODE_STOP
         else:
@@ -205,6 +243,11 @@ class MotionControllerNode(Node):
     def _marker_callback(self, msg):
         """Handle tracked marker updates."""
         self._tracked_marker = msg
+
+    def _imu_callback(self, msg: Imu):
+        """Handle IMU data updates."""
+        self._imu_data = msg
+        self._current_yaw = quaternion_to_yaw(msg.orientation)
 
     def _control_loop(self):
         """Main control loop."""
@@ -242,18 +285,30 @@ class MotionControllerNode(Node):
         self._publish_cmd(cmd)
         self._publish_state(self._mode, error_x, error_y, error_yaw, detail)
 
+    def _check_no_sensor(self) -> bool:
+        """차선과 마커 둘 다 없는지 확인"""
+        lane_ok = self._lane_status is not None and self._lane_status.valid
+        marker_ok = (self._tracked_marker is not None and
+                     (self._tracked_marker.is_detected or
+                      self._tracked_marker.prediction_confidence > 0.3))
+        return not lane_ok and not marker_ok
+
     def _lane_follow(self):
-        """Lane following control."""
+        """Lane following control (보조 역할 - 마커 기반 주행이 메인)."""
         cmd = Twist()
         error_x = 0.0
         error_y = 0.0
         error_yaw = 0.0
         detail = 'No lane'
 
+        # 차선도 마커도 없으면 후진
+        if self._check_no_sensor():
+            cmd.linear.x = -self.reverse_vx  # 저속 후진
+            return cmd, error_x, error_y, error_yaw, 'No sensor - reverse'
+
         if self._lane_status is None or not self._lane_status.valid:
-            # No lane detected - slow forward
-            cmd.linear.x = self.lane_vx * 0.5
-            return cmd, error_x, error_y, error_yaw, 'Lane lost - slow'
+            # 차선 없지만 마커는 있음 → 정지 (마커 모드로 전환 대기)
+            return cmd, error_x, error_y, error_yaw, 'Lane lost - stop'
 
         # Lane detected
         offset = self._lane_status.offset_normalized  # -1 to +1
@@ -279,6 +334,11 @@ class MotionControllerNode(Node):
         error_y = 0.0
         error_yaw = 0.0
         detail = 'No marker'
+
+        # 차선도 마커도 없으면 후진
+        if self._check_no_sensor():
+            cmd.linear.x = -self.reverse_vx  # 저속 후진
+            return cmd, error_x, error_y, error_yaw, 'No sensor - reverse'
 
         if self._tracked_marker is None:
             return cmd, error_x, error_y, error_yaw, 'No tracked marker'
@@ -325,32 +385,72 @@ class MotionControllerNode(Node):
         return cmd, error_x, error_y, error_yaw, detail
 
     def _turn_control(self):
-        """In-place turn control."""
+        """In-place turn control (상대 회전 + PD 제어 + 오버슈팅 보정)."""
         cmd = Twist()
-        error_yaw = self._turn_target_rad - self._current_yaw
 
-        # Normalize angle to [-pi, pi]
+        # IMU 데이터 없으면 정지
+        if self._imu_data is None:
+            return cmd, 0.0, 0.0, 0.0, 'No IMU data'
+
+        # 상대 회전량 계산: 현재 yaw - 시작 yaw
+        turned = self._current_yaw - self._turn_start_yaw
+
+        # Normalize to [-pi, pi]
+        while turned > math.pi:
+            turned -= 2 * math.pi
+        while turned < -math.pi:
+            turned += 2 * math.pi
+
+        # 목표까지 남은 회전량 (에러)
+        error_yaw = self._turn_target_rad - turned
+
+        # Normalize error to [-pi, pi]
         while error_yaw > math.pi:
             error_yaw -= 2 * math.pi
         while error_yaw < -math.pi:
             error_yaw += 2 * math.pi
 
-        # Check if done
+        # 완료 체크 (중복 발행 방지)
         if abs(error_yaw) < self.turn_tolerance:
-            self._publish_turn_done()
-            detail = f'Turn complete, error={math.degrees(error_yaw):.1f}deg'
+            if not self._turn_done_sent:
+                self._publish_turn_done()
+                self._turn_done_sent = True
+            detail = f'Turn complete, turned={math.degrees(turned):.1f}deg'
             return cmd, 0.0, 0.0, error_yaw, detail
 
-        # Proportional turn
-        wz = self.turn_wz if error_yaw > 0 else -self.turn_wz
+        # ===== PD 제어 + 오버슈팅 방지 =====
 
-        # Reduce speed near target
-        if abs(error_yaw) < 0.3:  # ~17 degrees
-            wz *= 0.5
+        # 미분항: 에러 변화율 (급격한 변화 감쇠)
+        d_error = error_yaw - self._prev_turn_error
+        self._prev_turn_error = error_yaw
+
+        # 비례항
+        p_term = self.turn_kp * error_yaw
+
+        # 미분항 (에러가 줄어드는 방향이면 감속)
+        d_term = self.turn_kd * d_error
+
+        # PD 출력
+        wz = p_term + d_term
+
+        # 감속 구간: 목표 근처에서 속도 제한
+        if abs(error_yaw) < self.turn_decel_zone:
+            # 선형 감속: 에러가 작을수록 최대 속도 감소
+            scale = abs(error_yaw) / self.turn_decel_zone
+            max_wz_now = self.turn_wz_min + (self.turn_wz - self.turn_wz_min) * scale
+        else:
+            max_wz_now = self.turn_wz
+
+        # 속도 제한 (최소/최대)
+        if abs(wz) > max_wz_now:
+            wz = max_wz_now if wz > 0 else -max_wz_now
+        elif abs(wz) < self.turn_wz_min and abs(error_yaw) > self.turn_tolerance:
+            # 너무 느리면 최소 속도 유지
+            wz = self.turn_wz_min if error_yaw > 0 else -self.turn_wz_min
 
         cmd.angular.z = wz
 
-        detail = f'Turning: target={math.degrees(self._turn_target_rad):.1f}, error={math.degrees(error_yaw):.1f}'
+        detail = f'Turn: tgt={math.degrees(self._turn_target_rad):.0f}, turned={math.degrees(turned):.1f}, err={math.degrees(error_yaw):.1f}, wz={wz:.2f}'
 
         return cmd, 0.0, 0.0, error_yaw, detail
 

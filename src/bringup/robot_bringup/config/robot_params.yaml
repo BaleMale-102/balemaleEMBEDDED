@@ -9,8 +9,8 @@ marker_detector:
     dictionary: "DICT_4X4_50"
     marker_size: 0.10                # 10cm markers
     publish_debug_image: true
-    image_topic: "/camera/front/image_raw"
-    camera_info_topic: "/camera/front/camera_info"
+    image_topic: "/cam_front/image_raw"
+    camera_info_topic: "/cam_front/camera_info"
     frame_id: "camera_front_link"
 
 marker_tracker:
@@ -22,12 +22,12 @@ marker_tracker:
 
 lane_detector:
   ros__parameters:
-    image_topic: "/camera/bottom/image_raw"
+    image_topic: "/cam_front/image_raw"  # front_cam 사용 (bottom_cam 비활성화됨)
     publish_debug_image: true
     roi_top_ratio: 0.5
     roi_bottom_ratio: 1.0
     sobel_threshold: 50
-    min_line_pixels: 100
+    min_line_pixels: 500              # 최소 라인 픽셀 수 (노이즈 필터링)
     line_color: "black"
     kalman_q: 0.01
     kalman_r: 0.05
@@ -41,6 +41,8 @@ motion_controller:
     max_vx: 0.05
     max_vy: 0.05
     max_wz: 0.5
+    # Fallback (센서 없을 때)
+    reverse_vx: 0.015             # 후진 속도 (저속)
     # Lane following
     lane_vx: 0.03
     lane_vy_kp: 0.03
@@ -55,9 +57,13 @@ motion_controller:
     marker_wz_kp: 0.3
     marker_reach_distance: 0.15
     marker_min_distance: 0.08
-    # Turn
-    turn_wz: 0.3
-    turn_tolerance: 0.05
+    # Turn (PD 제어 + 오버슈팅 보정)
+    turn_wz: 0.3                # 최대 회전 속도 (rad/s)
+    turn_wz_min: 0.08           # 최소 회전 속도
+    turn_tolerance: 0.05        # 완료 허용 오차 (rad, ~3도)
+    turn_kp: 1.5                # 비례 게인
+    turn_kd: 0.3                # 미분 게인 (급정지 방지)
+    turn_decel_zone: 0.5        # 감속 시작 구간 (rad, ~30도)
 
 wheel_controller:
   ros__parameters:

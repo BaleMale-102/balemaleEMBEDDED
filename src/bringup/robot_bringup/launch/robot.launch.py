@@ -60,6 +60,14 @@ def generate_launch_description():
     config_file = LaunchConfiguration('config_file')
     marker_map = LaunchConfiguration('marker_map')
 
+    # X11 환경변수 (SSH X11 forwarding용)
+    display_env = os.environ.get('DISPLAY', ':0')
+    x11_env = {
+        'DISPLAY': display_env,
+        'LIBGL_ALWAYS_SOFTWARE': '1',
+        'QT_X11_NO_MITSHM': '1',
+    }
+
     # ==========================================
     # Perception Nodes
     # ==========================================
@@ -69,11 +77,12 @@ def generate_launch_description():
             package='marker_detector',
             executable='detector_node',
             name='marker_detector',
-            parameters=[config_file],
+            parameters=[config_file, {'show_debug_window': show_debug}],
             remappings=[
                 ('image_raw', '/cam_front/image_raw'),
                 ('camera_info', '/cam_front/camera_info'),
             ],
+            additional_env=x11_env,
         ),
 
         # Marker Tracker
@@ -84,15 +93,16 @@ def generate_launch_description():
             parameters=[config_file],
         ),
 
-        # Lane Detector (하단 카메라)
+        # Lane Detector (전방 카메라 사용)
         Node(
             package='lane_detector',
             executable='detector_node',
             name='lane_detector',
-            parameters=[config_file],
+            parameters=[config_file, {'show_debug_window': show_debug}],
             remappings=[
-                ('image_raw', '/cam_bottom/image_raw'),
+                ('image_raw', '/cam_front/image_raw'),
             ],
+            additional_env=x11_env,
         ),
     ])
 

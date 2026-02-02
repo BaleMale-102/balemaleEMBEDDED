@@ -16,6 +16,7 @@ detector_node.py - ArUco 마커 검출 노드
     /perception/debug/marker_image: sensor_msgs/Image (선택)
 """
 
+import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -36,6 +37,7 @@ class MarkerDetectorNode(Node):
         self.declare_parameter('dictionary', 'DICT_4X4_50')
         self.declare_parameter('marker_size', 0.10)
         self.declare_parameter('publish_debug_image', True)
+        self.declare_parameter('show_debug_window', False)
         self.declare_parameter('image_topic', '/camera/front/image_raw')
         self.declare_parameter('camera_info_topic', '/camera/front/camera_info')
         self.declare_parameter('frame_id', 'camera_front_link')
@@ -44,6 +46,7 @@ class MarkerDetectorNode(Node):
         dictionary = self.get_parameter('dictionary').value
         marker_size = self.get_parameter('marker_size').value
         self.publish_debug = self.get_parameter('publish_debug_image').value
+        self.show_debug_window = self.get_parameter('show_debug_window').value
         image_topic = self.get_parameter('image_topic').value
         camera_info_topic = self.get_parameter('camera_info_topic').value
         self.frame_id = self.get_parameter('frame_id').value
@@ -126,14 +129,21 @@ class MarkerDetectorNode(Node):
             self._publish_markers(markers, msg.header.stamp)
 
         # 디버그 이미지
-        if self.publish_debug:
+        if self.publish_debug or self.show_debug_window:
             debug_image = self.detector.draw_markers(cv_image, markers)
-            try:
-                debug_msg = self.bridge.cv2_to_imgmsg(debug_image, 'bgr8')
-                debug_msg.header = msg.header
-                self.pub_debug.publish(debug_msg)
-            except Exception as e:
-                self.get_logger().error(f'Debug image error: {e}')
+
+            if self.publish_debug:
+                try:
+                    debug_msg = self.bridge.cv2_to_imgmsg(debug_image, 'bgr8')
+                    debug_msg.header = msg.header
+                    self.pub_debug.publish(debug_msg)
+                except Exception as e:
+                    self.get_logger().error(f'Debug image error: {e}')
+
+            # 디버그 창 표시
+            if self.show_debug_window:
+                cv2.imshow('Marker Detector', debug_image)
+                cv2.waitKey(1)
 
     def _publish_markers(self, markers, stamp):
         """MarkerArray 메시지 퍼블리시"""
@@ -212,6 +222,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        cv2.destroyAllWindows()
         node.destroy_node()
         rclpy.shutdown()
 

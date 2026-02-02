@@ -43,17 +43,18 @@ def generate_launch_description():
         description='Front camera device'
     )
 
-    cam_bottom_dev_arg = DeclareLaunchArgument(
-        'cam_bottom_dev',
-        default_value='/dev/video2',
-        description='Bottom camera device'
-    )
+    # TODO: 나중에 side_cam 사용 시 주석 해제
+    # cam_bottom_dev_arg = DeclareLaunchArgument(
+    #     'cam_bottom_dev',
+    #     default_value='/dev/video2',
+    #     description='Bottom camera device'
+    # )
 
-    cam_side_dev_arg = DeclareLaunchArgument(
-        'cam_side_dev',
-        default_value='/dev/video4',
-        description='Side camera device'
-    )
+    # cam_side_dev_arg = DeclareLaunchArgument(
+    #     'cam_side_dev',
+    #     default_value='/dev/video4',
+    #     description='Side camera device'
+    # )
 
     arduino_port_arg = DeclareLaunchArgument(
         'arduino_port',
@@ -85,39 +86,40 @@ def generate_launch_description():
         output='screen'
     )
 
-    # Bottom camera (lane detection)
-    cam_bottom = Node(
-        package='camera_driver',
-        executable='camera_node',
-        name='cam_bottom',
-        parameters=[{
-            'device': LaunchConfiguration('cam_bottom_dev'),
-            'width': 640,
-            'height': 480,
-            'fps': 30.0,
-            'frame_id': 'camera_bottom',
-            'camera_name': 'cam_bottom',
-            'simulate': simulation,
-        }],
-        output='screen'
-    )
+    # TODO: 나중에 side_cam 사용 시 주석 해제
+    # # Bottom camera (lane detection)
+    # cam_bottom = Node(
+    #     package='camera_driver',
+    #     executable='camera_node',
+    #     name='cam_bottom',
+    #     parameters=[{
+    #         'device': LaunchConfiguration('cam_bottom_dev'),
+    #         'width': 640,
+    #         'height': 480,
+    #         'fps': 30.0,
+    #         'frame_id': 'camera_bottom',
+    #         'camera_name': 'cam_bottom',
+    #         'simulate': simulation,
+    #     }],
+    #     output='screen'
+    # )
 
-    # Side camera (parking)
-    cam_side = Node(
-        package='camera_driver',
-        executable='camera_node',
-        name='cam_side',
-        parameters=[{
-            'device': LaunchConfiguration('cam_side_dev'),
-            'width': 640,
-            'height': 480,
-            'fps': 30.0,
-            'frame_id': 'camera_side',
-            'camera_name': 'cam_side',
-            'simulate': simulation,
-        }],
-        output='screen'
-    )
+    # # Side camera (parking)
+    # cam_side = Node(
+    #     package='camera_driver',
+    #     executable='camera_node',
+    #     name='cam_side',
+    #     parameters=[{
+    #         'device': LaunchConfiguration('cam_side_dev'),
+    #         'width': 640,
+    #         'height': 480,
+    #         'fps': 30.0,
+    #         'frame_id': 'camera_side',
+    #         'camera_name': 'cam_side',
+    #         'simulate': simulation,
+    #     }],
+    #     output='screen'
+    # )
 
     # ==========================================
     # Arduino Driver
@@ -138,6 +140,24 @@ def generate_launch_description():
     )
 
     # ==========================================
+    # IMU Driver (MPU6050 via I2C)
+    # ==========================================
+    imu_node = Node(
+        package='imu_driver',
+        executable='imu_node',
+        name='imu_node',
+        parameters=[{
+            'i2c_bus': 7,           # Jetson Orin Nano: bus 7
+            'i2c_address': 0x68,
+            'publish_rate_hz': 100.0,
+            'calib_samples': 200,
+            'comp_alpha': 0.98,
+            'frame_id': 'imu_link',
+        }],
+        output='screen'
+    )
+
+    # ==========================================
     # Static TF Publishers
     # ==========================================
 
@@ -149,21 +169,22 @@ def generate_launch_description():
         arguments=['0.05', '0', '0.01', '0', '0', '0', 'base_link', 'camera_front']
     )
 
-    # base_link -> camera_bottom (아래 방향, pitch 90도)
-    tf_base_to_cam_bottom = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='tf_base_to_cam_bottom',
-        arguments=['0', '0', '0.02', '0', '1.5708', '0', 'base_link', 'camera_bottom']
-    )
+    # TODO: 나중에 side_cam 사용 시 주석 해제
+    # # base_link -> camera_bottom (아래 방향, pitch 90도)
+    # tf_base_to_cam_bottom = Node(
+    #     package='tf2_ros',
+    #     executable='static_transform_publisher',
+    #     name='tf_base_to_cam_bottom',
+    #     arguments=['0', '0', '0.02', '0', '1.5708', '0', 'base_link', 'camera_bottom']
+    # )
 
-    # base_link -> camera_side (오른쪽, yaw -90도)
-    tf_base_to_cam_side = Node(
-        package='tf2_ros',
-        executable='static_transform_publisher',
-        name='tf_base_to_cam_side',
-        arguments=['0', '-0.05', '0.03', '0', '0', '-1.5708', 'base_link', 'camera_side']
-    )
+    # # base_link -> camera_side (오른쪽, yaw -90도)
+    # tf_base_to_cam_side = Node(
+    #     package='tf2_ros',
+    #     executable='static_transform_publisher',
+    #     name='tf_base_to_cam_side',
+    #     arguments=['0', '-0.05', '0.03', '0', '0', '-1.5708', 'base_link', 'camera_side']
+    # )
 
     # base_link -> imu_link
     tf_base_to_imu = Node(
@@ -185,22 +206,25 @@ def generate_launch_description():
         # Arguments
         simulation_arg,
         cam_front_dev_arg,
-        cam_bottom_dev_arg,
-        cam_side_dev_arg,
+        # cam_bottom_dev_arg,  # TODO: 나중에 side_cam 사용 시 주석 해제
+        # cam_side_dev_arg,
         arduino_port_arg,
 
         # Cameras
         cam_front,
-        cam_bottom,
-        cam_side,
+        # cam_bottom,  # TODO: 나중에 side_cam 사용 시 주석 해제
+        # cam_side,
 
         # Arduino
         arduino_node,
 
+        # IMU
+        imu_node,
+
         # Static TF
         tf_base_to_cam_front,
-        tf_base_to_cam_bottom,
-        tf_base_to_cam_side,
+        # tf_base_to_cam_bottom,  # TODO: 나중에 side_cam 사용 시 주석 해제
+        # tf_base_to_cam_side,
         tf_base_to_imu,
         tf_odom_to_base,
     ])
