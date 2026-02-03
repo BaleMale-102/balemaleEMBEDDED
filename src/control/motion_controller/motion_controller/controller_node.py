@@ -81,7 +81,7 @@ class MotionControllerNode(Node):
         # Parameters - turn (PID + 오버슈팅 보정)
         self.declare_parameter('turn_wz', 0.04)
         self.declare_parameter('turn_wz_min', 0.015)     # 최소 회전 속도 (너무 느리면 안 움직임)
-        self.declare_parameter('turn_tolerance', 0.05)  # rad (~3도)
+        self.declare_parameter('turn_tolerance', 0.10)  # rad (~5.7도) - 진동 방지 위해 여유 있게
         self.declare_parameter('turn_kp', 1.5)          # 비례 게인
         self.declare_parameter('turn_kd', 0.3)          # 미분 게인 (급정지 방지)
         self.declare_parameter('turn_decel_zone', 0.5)  # 감속 시작 구간 (rad, ~30도)
@@ -443,6 +443,10 @@ class MotionControllerNode(Node):
         """In-place turn control (상대 회전 + PD 제어 + 오버슈팅 보정)."""
         cmd = Twist()
 
+        # turn_done 이미 발행했으면 무조건 정지 (진동 방지)
+        if self._turn_done_sent:
+            return cmd, 0.0, 0.0, 0.0, 'Turn done, waiting for state change'
+
         # IMU 데이터 없으면 정지
         if self._imu_data is None:
             return cmd, 0.0, 0.0, 0.0, 'No IMU data'
@@ -465,13 +469,12 @@ class MotionControllerNode(Node):
         while error_yaw < -math.pi:
             error_yaw += 2 * math.pi
 
-        # 완료 체크 (중복 발행 방지)
+        # 완료 체크
         if abs(error_yaw) < self.turn_tolerance:
-            if not self._turn_done_sent:
-                self._publish_turn_done()
-                self._turn_done_sent = True
-            detail = f'Turn complete, turned={math.degrees(turned):.1f}deg'
-            return cmd, 0.0, 0.0, error_yaw, detail
+            self._publish_turn_done()
+            self._turn_done_sent = True
+            self.get_logger().info(f'Turn done! turned={math.degrees(turned):.1f}deg, error={math.degrees(error_yaw):.1f}deg')
+            return cmd, 0.0, 0.0, error_yaw, f'Turn complete, turned={math.degrees(turned):.1f}deg'
 
         # ===== PD 제어 + 오버슈팅 방지 =====
 
