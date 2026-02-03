@@ -115,6 +115,17 @@ class MotionControllerNode(Node):
         self.declare_parameter('park_distance_threshold', 0.02)  # 2cm
         self.declare_parameter('park_target_distance', 0.15)   # 15cm
 
+        # Parameters - stall detection and power boost
+        self.declare_parameter('stall_check_interval', 0.5)
+        self.declare_parameter('stall_boost_increment', 0.002)
+        self.declare_parameter('stall_max_boost', 0.015)
+        self.declare_parameter('stall_threshold_wz', 0.005)  # rad
+        self.declare_parameter('stall_threshold_vy', 0.01)   # rad (marker angle change)
+        self.declare_parameter('stall_pulse_duration', 0.15)
+
+        # Parameters - post-turn marker search
+        self.declare_parameter('post_turn_search_timeout', 3.0)
+
         # Load parameters
         control_rate = self.get_parameter('control_rate').value
         self.max_vx = self.get_parameter('max_vx').value
@@ -149,6 +160,15 @@ class MotionControllerNode(Node):
         self.park_rect_threshold = self.get_parameter('park_rect_threshold').value
         self.park_distance_threshold = self.get_parameter('park_distance_threshold').value
         self.park_target_distance = self.get_parameter('park_target_distance').value
+
+        # Stall detection parameters
+        self._stall_check_interval = self.get_parameter('stall_check_interval').value
+        self._stall_boost_increment = self.get_parameter('stall_boost_increment').value
+        self._stall_max_boost = self.get_parameter('stall_max_boost').value
+        self._stall_threshold_wz = self.get_parameter('stall_threshold_wz').value
+        self._stall_threshold_vy = self.get_parameter('stall_threshold_vy').value
+        self._stall_pulse_duration = self.get_parameter('stall_pulse_duration').value
+        self._post_turn_search_timeout = self.get_parameter('post_turn_search_timeout').value
 
         # PID controllers for lane following
         self.lane_vy_pid = PIDController(
@@ -203,6 +223,36 @@ class MotionControllerNode(Node):
         self._park_align_marker_done_sent = False
         self._park_align_rect_done_sent = False
         self._park_final_done_sent = False
+
+        # ALIGN_TO_MARKER two-phase state (vy → wz)
+        self._align_phase = 'VY'  # 'VY' or 'WZ'
+        self._align_vy_done = False
+
+        # Turn marker tracking (for post-turn search)
+        self._turn_direction = 0  # +1 = CCW, -1 = CW
+        self._marker_seen_during_turn = False
+        self._marker_visible_at_turn_end = False
+        self._post_turn_search_mode = False
+        self._post_turn_search_direction = 0
+        self._post_turn_search_start_time = 0.0
+        self._post_turn_search_timeout = 3.0  # seconds
+
+        # Stall detection and power boost
+        self._stall_detection_enabled = True
+        self._stall_check_interval = 0.5  # Check every 0.5s
+        self._last_stall_check_time = 0.0
+        self._prev_yaw_for_stall = 0.0
+        self._prev_marker_angle_for_stall = 0.0
+        self._stall_vy_boost = 0.0
+        self._stall_wz_boost = 0.0
+        self._stall_boost_increment = 0.002  # Small increment per detection
+        self._stall_max_boost = 0.015  # Maximum boost
+        self._stall_threshold_wz = 0.005  # rad - minimum rotation to not be considered stalled
+        self._stall_threshold_vy = 0.01  # marker angle change threshold
+        self._consecutive_stalls = 0
+        self._stall_pulse_mode = False
+        self._stall_pulse_start_time = 0.0
+        self._stall_pulse_duration = 0.15  # 150ms pulse
 
         # Log output interval
         self._last_log_time = 0.0
@@ -323,9 +373,24 @@ class MotionControllerNode(Node):
                 self._turn_start_yaw = self._current_yaw
                 self._prev_turn_error = 0.0
                 self._turn_done_sent = False
+                # Track turn direction for post-turn search
+                self._turn_direction = 1 if self._turn_target_rad > 0 else -1
+                self._marker_seen_during_turn = False
+                self._marker_visible_at_turn_end = False
+                self._post_turn_search_mode = False
                 self.get_logger().info(f'TURN started: start_yaw={math.degrees(self._turn_start_yaw):.1f}deg, target={math.degrees(self._turn_target_rad):.1f}deg')
         elif state == 'ALIGN_TO_MARKER':
             self._mode = self.MODE_ALIGN
+            if prev_mode != self.MODE_ALIGN:
+                # Reset two-phase alignment state
+                self._align_phase = 'VY'
+                self._align_vy_done = False
+                # Reset stall detection
+                self._stall_vy_boost = 0.0
+                self._stall_wz_boost = 0.0
+                self._consecutive_stalls = 0
+                self._stall_pulse_mode = False
+                self.get_logger().info('ALIGN_TO_MARKER started (VY → WZ phases)')
         elif state in ('STOP', 'FINISH', 'STOP_BUMP'):
             self._mode = self.MODE_STOP
         # Parking states
@@ -377,6 +442,12 @@ class MotionControllerNode(Node):
     def _marker_callback(self, msg):
         """Handle tracked marker updates."""
         self._tracked_marker = msg
+
+        # Track if target marker is seen during turn
+        if self._mode == self.MODE_TURN and not self._turn_done_sent:
+            if (msg.id == self._target_marker_id and
+                (msg.is_detected or msg.prediction_confidence > 0.3)):
+                self._marker_seen_during_turn = True
 
     def _side_markers_callback(self, msg):
         """Handle side camera marker updates for parking."""
@@ -474,11 +545,12 @@ class MotionControllerNode(Node):
             )
 
     def _drive_with_marker_only(self):
-        """Marker-only driving."""
+        """Marker-only driving with stall detection for alignment."""
         cmd = Twist()
         error_x = 0.0
         error_y = 0.0
         error_yaw = 0.0
+        now = self.get_clock().now().nanoseconds / 1e9
 
         marker_ok = (self._tracked_marker is not None and
                      self._tracked_marker.id == self._target_marker_id and
@@ -498,18 +570,65 @@ class MotionControllerNode(Node):
             error_yaw = angle
 
             if distance < self.marker_reach_dist:
+                # Reset stall boost on reaching marker
+                self._stall_vy_boost = 0.0
+                self._consecutive_stalls = 0
                 self._publish_marker_reached(marker.id)
                 return cmd, error_x, error_y, error_yaw, f'Reached marker {marker.id}'
 
             pred = 'pred' if not marker.is_detected else 'det'
 
+            # Stall detection during alignment
             if abs(angle) > self.marker_align_threshold:
+                # Check for stall
+                if now - self._last_stall_check_time >= self._stall_check_interval:
+                    angle_change = abs(angle - self._prev_marker_angle_for_stall)
+                    if angle_change < self._stall_threshold_vy:
+                        self._consecutive_stalls += 1
+                        self._stall_vy_boost = min(
+                            self._stall_vy_boost + self._stall_boost_increment,
+                            self._stall_max_boost
+                        )
+                        # Pulse mode after several stalls
+                        if self._consecutive_stalls >= 3 and not self._stall_pulse_mode:
+                            self._stall_pulse_mode = True
+                            self._stall_pulse_start_time = now
+                            self.get_logger().info(f'DRIVE stall: boost={self._stall_vy_boost:.3f}')
+                    else:
+                        self._consecutive_stalls = max(0, self._consecutive_stalls - 1)
+                        if self._consecutive_stalls == 0:
+                            self._stall_vy_boost = max(0, self._stall_vy_boost - self._stall_boost_increment * 0.5)
+
+                    self._prev_marker_angle_for_stall = angle
+                    self._last_stall_check_time = now
+
+                # Calculate vy with boost
                 vy = -self.marker_vy_kp * angle * 2.0
-                if abs(vy) < 0.01 and abs(angle) > 0.05:
-                    vy = 0.01 if angle < 0 else -0.01
+
+                # Apply stall boost
+                if self._stall_pulse_mode:
+                    pulse_elapsed = now - self._stall_pulse_start_time
+                    if pulse_elapsed < self._stall_pulse_duration:
+                        boost = self._stall_vy_boost * 2.0
+                        vy = vy + (boost if vy > 0 else -boost)
+                    else:
+                        self._stall_pulse_mode = False
+                else:
+                    vy = vy + (self._stall_vy_boost if vy > 0 else -self._stall_vy_boost)
+
+                # Minimum speed with boost
+                min_speed = 0.01 + self._stall_vy_boost
+                if abs(vy) < min_speed and abs(angle) > 0.05:
+                    vy = min_speed if angle < 0 else -min_speed
+
                 cmd.linear.y = vy
-                detail = f'[ALIGN] d={distance:.2f}m, a={math.degrees(angle):.1f}deg [{pred}]'
+                boost_str = f' boost={self._stall_vy_boost:.3f}' if self._stall_vy_boost > 0 else ''
+                detail = f'[ALIGN] d={distance:.2f}m, a={math.degrees(angle):.1f}deg{boost_str} [{pred}]'
             else:
+                # Normal driving - reset stall detection
+                self._stall_vy_boost = max(0, self._stall_vy_boost - self._stall_boost_increment)
+                self._consecutive_stalls = 0
+
                 vx = self.marker_vx_kp * (distance - self.marker_min_dist)
                 vx = max(0.0, vx)
                 vy = -self.marker_vy_kp * angle
@@ -566,37 +685,230 @@ class MotionControllerNode(Node):
         self.get_logger().info('Alignment complete')
 
     def _align_to_marker(self):
-        """Turn 후 마커 정렬."""
+        """
+        Turn 후 마커 정렬 (2단계: VY → WZ → 주행).
+
+        Phase 1 (VY): 좌우 이동으로 마커 중심 정렬
+        Phase 2 (WZ): 회전으로 각도 미세 조정
+
+        추가 기능:
+        - 마커 못 찾으면 turn 방향으로 회전하며 탐색
+        - 스톨 감지 시 파워 부스트
+        """
         cmd = Twist()
         error_x = 0.0
         error_y = 0.0
         error_yaw = 0.0
+        now = self.get_clock().now().nanoseconds / 1e9
 
         marker_ok = (self._tracked_marker is not None and
                      self._tracked_marker.id == self._target_marker_id and
                      (self._tracked_marker.is_detected or
                       self._tracked_marker.prediction_confidence > 0.3))
 
-        if marker_ok:
-            marker = self._tracked_marker
-            angle = marker.angle
-            error_yaw = angle
+        # ========================================
+        # Post-turn marker search mode
+        # ========================================
+        if not marker_ok:
+            # Enter search mode if marker not found
+            if not self._post_turn_search_mode:
+                self._post_turn_search_mode = True
+                self._post_turn_search_start_time = now
 
-            if abs(angle) < self.marker_align_threshold:
+                # Determine search direction
+                if self._marker_seen_during_turn and not self._marker_visible_at_turn_end:
+                    # Marker was seen but now lost - turn opposite direction
+                    self._post_turn_search_direction = -self._turn_direction
+                    self.get_logger().info(f'Marker lost after turn - searching opposite (dir={self._post_turn_search_direction})')
+                else:
+                    # Marker never seen or still not visible - continue in turn direction
+                    self._post_turn_search_direction = self._turn_direction
+                    self.get_logger().info(f'Marker not found - searching in turn direction (dir={self._post_turn_search_direction})')
+
+            # Check timeout
+            search_elapsed = now - self._post_turn_search_start_time
+            if search_elapsed > self._post_turn_search_timeout:
+                # Timeout - give up and let manager handle
+                self._publish_align_done()
+                return cmd, error_x, error_y, error_yaw, f'Search timeout, giving up'
+
+            # Slow rotation to find marker
+            wz = self.turn_wz_min * 0.7 * self._post_turn_search_direction
+            cmd.angular.z = -wz  # Negate for motor direction
+
+            detail = f'[SEARCH] dir={self._post_turn_search_direction}, elapsed={search_elapsed:.1f}s'
+            return cmd, error_x, error_y, error_yaw, detail
+
+        # ========================================
+        # Marker found - exit search mode
+        # ========================================
+        if self._post_turn_search_mode:
+            self._post_turn_search_mode = False
+            self.get_logger().info('Marker found - exiting search mode')
+
+        marker = self._tracked_marker
+        angle = marker.angle
+        error_yaw = angle
+        pred = 'pred' if not marker.is_detected else 'det'
+
+        # ========================================
+        # Stall detection
+        # ========================================
+        if now - self._last_stall_check_time >= self._stall_check_interval:
+            self._check_and_handle_stall(angle)
+            self._last_stall_check_time = now
+
+        # ========================================
+        # Phase 1: VY alignment (좌우 이동)
+        # ========================================
+        if self._align_phase == 'VY':
+            # VY alignment threshold (slightly relaxed for first phase)
+            vy_threshold = self.marker_align_threshold * 1.2
+
+            if abs(angle) < vy_threshold:
+                # VY phase done, move to WZ
+                self._align_phase = 'WZ'
+                self._align_vy_done = True
+                # Reset stall detection for WZ phase
+                self._stall_vy_boost = 0.0
+                self._consecutive_stalls = 0
+                self.get_logger().info(f'VY align done (angle={math.degrees(angle):.1f}deg), starting WZ phase')
+            else:
+                # Apply VY control with stall boost
+                vy = -self.marker_vy_kp * angle * 3.0
+
+                # Apply stall boost
+                if self._stall_pulse_mode:
+                    # Pulse mode: apply higher boost for short duration
+                    pulse_elapsed = now - self._stall_pulse_start_time
+                    if pulse_elapsed < self._stall_pulse_duration:
+                        boost = self._stall_vy_boost * 2.0
+                        vy = vy + (boost if vy > 0 else -boost)
+                    else:
+                        self._stall_pulse_mode = False
+                else:
+                    # Normal boost
+                    vy = vy + (self._stall_vy_boost if vy > 0 else -self._stall_vy_boost)
+
+                # Minimum speed guarantee
+                min_speed = 0.01 + self._stall_vy_boost
+                if abs(vy) < min_speed and abs(angle) > 0.05:
+                    vy = min_speed if angle < 0 else -min_speed
+
+                cmd.linear.y = vy
+
+                detail = f'[ALIGN-VY] a={math.degrees(angle):.1f}deg, vy={vy:.3f}, boost={self._stall_vy_boost:.3f} [{pred}]'
+                return cmd, error_x, error_y, error_yaw, detail
+
+        # ========================================
+        # Phase 2: WZ alignment (회전 미세 조정)
+        # ========================================
+        if self._align_phase == 'WZ':
+            # Final alignment check
+            if abs(angle) < self.marker_align_threshold * 0.7:
                 self._publish_align_done()
                 return cmd, error_x, error_y, error_yaw, f'Aligned to marker {marker.id}'
 
-            vy = -self.marker_vy_kp * angle * 3.0
-            if abs(vy) < 0.01 and abs(angle) > 0.05:
-                vy = 0.01 if angle < 0 else -0.01
-            cmd.linear.y = vy
+            # If angle drifted too much, go back to VY
+            if abs(angle) > self.marker_align_threshold * 1.5:
+                self._align_phase = 'VY'
+                self.get_logger().info(f'Angle drifted ({math.degrees(angle):.1f}deg), back to VY phase')
+                return self._align_to_marker()  # Recursive call for VY
 
-            pred = 'pred' if not marker.is_detected else 'det'
-            detail = f'[ALIGN] a={math.degrees(angle):.1f}deg [{pred}]'
+            # WZ control for fine adjustment
+            wz = self.marker_wz_kp * angle * 2.0
+
+            # Apply stall boost
+            if self._stall_pulse_mode:
+                pulse_elapsed = now - self._stall_pulse_start_time
+                if pulse_elapsed < self._stall_pulse_duration:
+                    boost = self._stall_wz_boost * 2.0
+                    wz = wz + (boost if wz > 0 else -boost)
+                else:
+                    self._stall_pulse_mode = False
+            else:
+                wz = wz + (self._stall_wz_boost if wz > 0 else -self._stall_wz_boost)
+
+            # Minimum speed guarantee
+            min_wz = 0.015 + self._stall_wz_boost
+            if abs(wz) < min_wz and abs(angle) > 0.03:
+                wz = min_wz if angle > 0 else -min_wz
+
+            cmd.angular.z = -wz  # Negate for motor direction
+
+            detail = f'[ALIGN-WZ] a={math.degrees(angle):.1f}deg, wz={-wz:.3f}, boost={self._stall_wz_boost:.3f} [{pred}]'
             return cmd, error_x, error_y, error_yaw, detail
 
         detail = f'No marker {self._target_marker_id}, waiting...'
         return cmd, error_x, error_y, error_yaw, detail
+
+    def _check_and_handle_stall(self, current_angle: float):
+        """
+        스톨 감지 및 파워 부스트 처리.
+
+        - IMU yaw 변화량으로 회전 스톨 감지
+        - 마커 각도 변화량으로 이동 스톨 감지
+        - 연속 스톨 시 점진적 파워 증가 또는 펄스 모드
+        """
+        now = self.get_clock().now().nanoseconds / 1e9
+
+        # Calculate changes
+        yaw_change = abs(self._current_yaw - self._prev_yaw_for_stall)
+        angle_change = abs(current_angle - self._prev_marker_angle_for_stall)
+
+        # Normalize yaw change
+        if yaw_change > math.pi:
+            yaw_change = 2 * math.pi - yaw_change
+
+        # Detect stall based on current phase
+        is_stalled = False
+
+        if self._align_phase == 'WZ':
+            # WZ phase: check rotation (yaw change)
+            if yaw_change < self._stall_threshold_wz:
+                is_stalled = True
+                self.get_logger().debug(f'WZ stall detected: yaw_change={math.degrees(yaw_change):.2f}deg')
+        else:
+            # VY phase: check marker angle change (indicates lateral movement)
+            if angle_change < self._stall_threshold_vy:
+                is_stalled = True
+                self.get_logger().debug(f'VY stall detected: angle_change={math.degrees(angle_change):.2f}deg')
+
+        if is_stalled:
+            self._consecutive_stalls += 1
+
+            # Gradual boost increase
+            if self._align_phase == 'WZ':
+                self._stall_wz_boost = min(
+                    self._stall_wz_boost + self._stall_boost_increment,
+                    self._stall_max_boost
+                )
+            else:
+                self._stall_vy_boost = min(
+                    self._stall_vy_boost + self._stall_boost_increment,
+                    self._stall_max_boost
+                )
+
+            # Enter pulse mode after several consecutive stalls
+            if self._consecutive_stalls >= 3 and not self._stall_pulse_mode:
+                self._stall_pulse_mode = True
+                self._stall_pulse_start_time = now
+                self.get_logger().info(
+                    f'Entering pulse mode: stalls={self._consecutive_stalls}, '
+                    f'vy_boost={self._stall_vy_boost:.3f}, wz_boost={self._stall_wz_boost:.3f}'
+                )
+        else:
+            # Reset consecutive stalls (but keep boost for now)
+            self._consecutive_stalls = max(0, self._consecutive_stalls - 1)
+
+            # Gradually reduce boost when moving normally
+            if self._consecutive_stalls == 0:
+                self._stall_vy_boost = max(0, self._stall_vy_boost - self._stall_boost_increment * 0.5)
+                self._stall_wz_boost = max(0, self._stall_wz_boost - self._stall_boost_increment * 0.5)
+
+        # Update previous values
+        self._prev_yaw_for_stall = self._current_yaw
+        self._prev_marker_angle_for_stall = current_angle
 
     def _turn_control(self):
         """In-place turn control with PD."""
@@ -623,9 +935,19 @@ class MotionControllerNode(Node):
             error_yaw += 2 * math.pi
 
         if abs(error_yaw) < self.turn_tolerance:
+            # Check if marker is visible at turn end
+            marker_ok = (self._tracked_marker is not None and
+                         self._tracked_marker.id == self._target_marker_id and
+                         (self._tracked_marker.is_detected or
+                          self._tracked_marker.prediction_confidence > 0.3))
+            self._marker_visible_at_turn_end = marker_ok
+
             self._publish_turn_done()
             self._turn_done_sent = True
-            self.get_logger().info(f'Turn done! turned={math.degrees(turned):.1f}deg, error={math.degrees(error_yaw):.1f}deg')
+            self.get_logger().info(
+                f'Turn done! turned={math.degrees(turned):.1f}deg, error={math.degrees(error_yaw):.1f}deg, '
+                f'marker_seen={self._marker_seen_during_turn}, marker_visible={marker_ok}'
+            )
             return cmd, 0.0, 0.0, error_yaw, f'Turn complete, turned={math.degrees(turned):.1f}deg'
 
         d_error = error_yaw - self._prev_turn_error

@@ -176,6 +176,15 @@
     park_rect_threshold: 0.015    # 직사각형 정렬 완료 임계값 (m, 1.5cm)
     park_distance_threshold: 0.02 # 최종 거리 완료 임계값 (m, 2cm)
     park_target_distance: 0.15    # 목표 주차 거리 (m, 마커로부터 15cm)
+    # Stall detection and power boost
+    stall_check_interval: 0.5     # 스톨 체크 주기 (초)
+    stall_boost_increment: 0.002  # 스톨 시 파워 증가량
+    stall_max_boost: 0.015        # 최대 부스트 값
+    stall_threshold_wz: 0.005     # 회전 스톨 임계값 (rad)
+    stall_threshold_vy: 0.01      # 이동 스톨 임계값 (마커 각도 변화, rad)
+    stall_pulse_duration: 0.15    # 펄스 모드 지속 시간 (초)
+    # Post-turn marker search
+    post_turn_search_timeout: 3.0 # Turn 후 마커 탐색 타임아웃 (초)
 
 # ============================================
 # Planning Parameters
@@ -191,7 +200,7 @@
     # State timeouts (seconds)
     timeout_stop_at_marker: 2.0     # STOP_AT_MARKER 대기 시간
     timeout_advance_to_center: 2.0  # ADVANCE_TO_CENTER 최대 시간 (advance_time보다 여유있게)
-    timeout_align_to_marker: 5.0    # ALIGN_TO_MARKER 최대 시간
+    timeout_align_to_marker: 10.0   # ALIGN_TO_MARKER 최대 시간 (VY+WZ+탐색 포함)
     timeout_stop_bump: 0.5          # STOP_BUMP 관성 안정화 시간
     timeout_turning: 30.0           # TURNING 최대 시간
     timeout_park: 30.0              # PARK 최대 시간 (legacy)

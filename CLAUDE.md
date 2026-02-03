@@ -429,6 +429,14 @@ string message                # 응답 메시지
   park_rect_threshold: 0.015  # 직사각형 정렬 완료 임계값 (m)
   park_distance_threshold: 0.02 # 최종 거리 완료 임계값 (m)
   park_target_distance: 0.15  # 목표 주차 거리 (m)
+  # Stall detection
+  stall_check_interval: 0.5   # 스톨 체크 주기 (초)
+  stall_boost_increment: 0.002 # 스톨 시 파워 증가량
+  stall_max_boost: 0.015      # 최대 부스트 값
+  stall_threshold_wz: 0.005   # 회전 스톨 임계값 (rad)
+  stall_threshold_vy: 0.01    # 이동 스톨 임계값 (rad)
+  stall_pulse_duration: 0.15  # 펄스 모드 지속 시간 (초)
+  post_turn_search_timeout: 3.0 # Turn 후 마커 탐색 타임아웃 (초)
 ```
 
 ### 계획
@@ -703,12 +711,45 @@ vy = -self.marker_vy_kp * angle  # (원래: +)
 ALIGN_TO_MARKER 모드 → 게인 3배 (Turn 후 빠른 정렬)
 ```
 
-### ALIGN 최소 속도
-vy가 너무 작으면 모터가 반응하지 않음. 최소 속도 보장:
+### ALIGN_TO_MARKER 2단계 정렬
+Turn 후 정렬은 2단계로 진행:
+```
+Phase 1 (VY): 좌우 이동으로 마커 중심 정렬
+Phase 2 (WZ): 회전으로 각도 미세 조정
+→ 완료 후 주행 시작
+```
+
+### Post-Turn 마커 탐색
+Turn 완료 후 마커가 안 보이면 자동 탐색:
 ```python
-# DRIVE 모드 ALIGN, ALIGN_TO_MARKER 모드 모두
-if abs(vy) < 0.01 and abs(angle) > 0.05:
-    vy = 0.01 if angle < 0 else -0.01
+if marker_seen_during_turn and not marker_visible_at_turn_end:
+    # 마커가 보였다가 사라짐 → Turn 반대 방향으로 탐색
+    search_direction = -turn_direction
+else:
+    # 마커를 못 찾음 → Turn 방향으로 계속 탐색
+    search_direction = turn_direction
+```
+
+### 스톨 감지 및 파워 부스트
+모터가 공회전(명령은 가지만 움직이지 않음)하면 자동으로 파워 증가:
+```python
+# 스톨 감지
+if yaw_change < stall_threshold_wz:  # WZ 스톨
+    stall_wz_boost += stall_boost_increment
+if angle_change < stall_threshold_vy:  # VY 스톨
+    stall_vy_boost += stall_boost_increment
+
+# 연속 3회 스톨 → 펄스 모드 (짧은 시간 강한 부스트)
+if consecutive_stalls >= 3:
+    pulse_mode = True
+```
+
+파라미터:
+```yaml
+stall_check_interval: 0.5     # 체크 주기 (초)
+stall_boost_increment: 0.002  # 증가량
+stall_max_boost: 0.015        # 최대 부스트
+stall_pulse_duration: 0.15    # 펄스 지속 시간
 ```
 
 ### Turn 제어 (wz)
