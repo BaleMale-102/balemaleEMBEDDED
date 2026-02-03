@@ -11,8 +11,8 @@ Arguments:
     config_file: Path to parameter file (default: robot_params.yaml)
 
 Nodes:
-    Perception: marker_detector, marker_tracker, lane_detector
-    Control: motion_controller, wheel_controller
+    Perception: marker_detector (front), side_marker_detector, marker_tracker, slot_line_detector
+    Control: motion_controller, loader_driver
     Planning: mission_manager, server_bridge
 """
 
@@ -88,12 +88,50 @@ def generate_launch_description():
             additional_env=x11_env,
         ),
 
+        # Side Marker Detector (측면 카메라 - 주차용)
+        Node(
+            package='marker_detector',
+            executable='detector_node',
+            name='side_marker_detector',
+            parameters=[
+                config_file,
+                {
+                    'show_debug_window': False,  # 측면 카메라는 디버그 창 끄기
+                    'image_topic': '/cam_side/image_raw',
+                    'camera_info_topic': '/cam_side/camera_info',
+                    'output_topic': '/perception/side_markers',
+                    'frame_id': 'camera_side_link',
+                }
+            ],
+            remappings=[
+                ('image_raw', '/cam_side/image_raw'),
+                ('camera_info', '/cam_side/camera_info'),
+                ('/perception/markers', '/perception/side_markers'),
+            ],
+            additional_env=x11_env,
+        ),
+
         # Marker Tracker
         Node(
             package='marker_tracker',
             executable='tracker_node',
             name='marker_tracker',
             parameters=[config_file],
+        ),
+
+        # Slot Line Detector (노란 직사각형 검출 - 주차용)
+        Node(
+            package='slot_line_detector',
+            executable='detector_node',
+            name='slot_line_detector',
+            parameters=[
+                config_file,
+                {
+                    'publish_debug_image': True,
+                    'show_debug_window': False,
+                }
+            ],
+            additional_env=x11_env,
         ),
 
         # Lane Detector (비활성화 - 마커 전용 주행)
@@ -123,6 +161,17 @@ def generate_launch_description():
             executable='controller_node',
             name='motion_controller',
             parameters=[config_file],
+        ),
+
+        # Loader Driver (차량 적재 메커니즘)
+        Node(
+            package='loader_driver',
+            executable='loader_node',
+            name='loader_driver',
+            parameters=[
+                config_file,
+                {'simulate': simulation},
+            ],
         ),
     ])
 

@@ -48,6 +48,15 @@
     comp_alpha: 0.98                  # Complementary filter gyro weight
     frame_id: "imu_link"
 
+/loader_driver:
+  ros__parameters:
+    port: "/dev/ttyUSB1"              # Loader Arduino (separate from motor Arduino)
+    baudrate: 115200
+    timeout: 0.1
+    status_rate_hz: 10.0
+    simulate: false
+    simulate_duration: 3.0            # Simulated operation time (seconds)
+
 # ============================================
 # Perception Parameters
 # ============================================
@@ -60,6 +69,16 @@
     camera_info_topic: "/cam_front/camera_info"
     frame_id: "camera_front_link"
 
+/side_marker_detector:
+  ros__parameters:
+    dictionary: "DICT_4X4_50"
+    marker_size: 0.04                # 4cm markers
+    publish_debug_image: true
+    image_topic: "/cam_side/image_raw"
+    camera_info_topic: "/cam_side/camera_info"
+    output_topic: "/perception/side_markers"
+    frame_id: "camera_side_link"
+
 /marker_tracker:
   ros__parameters:
     process_noise: 0.01
@@ -67,6 +86,27 @@
     prediction_timeout: 2.0
     min_prediction_confidence: 0.3
     camera_offset_x: 0.10             # 카메라→base_link 전방 오프셋 (m)
+
+/slot_line_detector:
+  ros__parameters:
+    image_topic: "/cam_side/image_raw"
+    output_topic: "/perception/slot_rect"
+    publish_debug_image: true
+    show_debug_window: false
+    # HSV thresholds for yellow tape
+    hsv_low_h: 20
+    hsv_low_s: 100
+    hsv_low_v: 100
+    hsv_high_h: 35
+    hsv_high_s: 255
+    hsv_high_v: 255
+    # Detection parameters
+    min_area: 500
+    max_area: 50000
+    min_aspect_ratio: 0.3
+    max_aspect_ratio: 3.0
+    # Pixel to meter conversion (approximate, tune as needed)
+    pixel_to_meter: 0.001             # 1 pixel = 1mm
 
 /lane_detector:  # 비활성화
   ros__parameters:
@@ -124,6 +164,18 @@
     turn_kd: 0.3                  # 미분 게인 (급정지 방지)
     turn_decel_zone: 0.35         # 감속 시작 구간 (rad, ~20도)
     turn_scale: 1.0               # 턴 각도 스케일 (1.0=그대로, 1.1=10% 더 돌기)
+    # Parking parameters
+    park_creep_vx: 0.003          # PARK_DETECT 탐색 속도 (m/s)
+    park_align_kp: 0.02           # 마커 정렬 P 게인
+    park_rect_kp: 0.015           # 직사각형 정렬 P 게인
+    park_final_kp: 0.02           # 최종 거리 조정 P 게인
+    park_max_vx: 0.008            # 주차 시 최대 전후 속도 (m/s)
+    park_max_vy: 0.01             # 주차 시 최대 좌우 속도 (m/s)
+    park_min_speed: 0.003         # 주차 시 최소 속도 (m/s)
+    park_marker_threshold: 0.05   # 마커 정렬 완료 임계값 (rad, ~3도)
+    park_rect_threshold: 0.015    # 직사각형 정렬 완료 임계값 (m, 1.5cm)
+    park_distance_threshold: 0.02 # 최종 거리 완료 임계값 (m, 2cm)
+    park_target_distance: 0.15    # 목표 주차 거리 (m, 마커로부터 15cm)
 
 # ============================================
 # Planning Parameters
@@ -132,13 +184,28 @@
   ros__parameters:
     update_rate: 10.0
     default_turn_angle: 1.57        # 90 degrees
+    # Full mission config
+    home_marker_id: 0               # Home position marker ID
+    auto_start_waiting: true        # Auto-start WAIT_VEHICLE after IDLE
+    car_id: "car_01"                # Vehicle identifier for server
     # State timeouts (seconds)
     timeout_stop_at_marker: 2.0     # STOP_AT_MARKER 대기 시간
     timeout_advance_to_center: 2.0  # ADVANCE_TO_CENTER 최대 시간 (advance_time보다 여유있게)
     timeout_align_to_marker: 5.0    # ALIGN_TO_MARKER 최대 시간
     timeout_stop_bump: 0.5          # STOP_BUMP 관성 안정화 시간
     timeout_turning: 30.0           # TURNING 최대 시간
-    timeout_park: 30.0              # PARK 최대 시간
+    timeout_park: 30.0              # PARK 최대 시간 (legacy)
+    # Full mission timeouts
+    timeout_recognize: 60.0         # RECOGNIZE 인식+서버응답 대기 시간
+    timeout_load: 30.0              # LOAD 적재 완료 대기 시간
+    timeout_unload: 30.0            # UNLOAD 하역 완료 대기 시간
+    timeout_return_home: 120.0      # RETURN_HOME 복귀 최대 시간
+    # Parking sub-state timeouts
+    timeout_park_detect: 10.0       # PARK_DETECT 탐색 시간
+    timeout_park_recovery: 15.0     # PARK_RECOVERY 복구 시간
+    timeout_park_align_marker: 15.0 # PARK_ALIGN_MARKER 정렬 시간
+    timeout_park_align_rect: 10.0   # PARK_ALIGN_RECT 정렬 시간
+    timeout_park_final: 10.0        # PARK_FINAL 최종 조정 시간
     # State transition delays (seconds)
     delay_stop_at_marker: 0.5       # STOP_AT_MARKER 후 다음 상태로 전환 대기
     delay_stop_bump: 0.3            # STOP_BUMP 후 다음 상태로 전환 대기

@@ -8,19 +8,23 @@ MQTT Topics:
   Subscribes:
     server/{car_id}/task_cmd - Task commands from server
     server/{car_id}/emergency - Emergency stop
+    server/{car_id}/plate_response - Plate verification response
   Publishes:
     car/{car_id}/status - Robot status
     car/{car_id}/pose - Robot position
     car/{car_id}/task_status - Task execution status
+    car/{car_id}/plate_query - Plate verification query
 
 ROS2 Topics:
   Subscribes:
     /driving/state: DrivingState
     /server/task_status: MissionStatus
     /localization/pose: PoseStamped
+    /plate/query: PlateQuery
   Publishes:
     /server/task_cmd: MissionCommand
-    /control/drive_cmd_emergency: DriveCmd (emergency stop)
+    /plate/response: PlateResponse
+    /control/drive_cmd_emergency: Twist (emergency stop)
 """
 
 import math
@@ -55,6 +59,7 @@ class ServerBridgeNode(Node):
             password=self.get_parameter('mqtt_password').value,
             client_id=self.get_parameter('car_id').value
         )
+        self.car_id = self.get_parameter('car_id').value
         simulation = self.get_parameter('simulation').value
         status_rate = self.get_parameter('status_rate').value
 
@@ -69,13 +74,17 @@ class ServerBridgeNode(Node):
 
         # Import custom interfaces
         try:
-            from robot_interfaces.msg import MissionCommand, MissionStatus, DrivingState
-            from robot_interfaces.msg import DetectionArray
+            from robot_interfaces.msg import (
+                MissionCommand, MissionStatus, DrivingState,
+                DetectionArray, PlateQuery, PlateResponse
+            )
             self._has_interface = True
             self._MissionCommand = MissionCommand
             self._MissionStatus = MissionStatus
             self._DrivingState = DrivingState
             self._DetectionArray = DetectionArray
+            self._PlateQuery = PlateQuery
+            self._PlateResponse = PlateResponse
         except ImportError:
             self.get_logger().warn('robot_interfaces not found')
             self._has_interface = False
@@ -84,6 +93,9 @@ class ServerBridgeNode(Node):
         if self._has_interface:
             self.pub_task_cmd = self.create_publisher(
                 self._MissionCommand, '/server/task_cmd', 10
+            )
+            self.pub_plate_response = self.create_publisher(
+                self._PlateResponse, '/plate/response', 10
             )
 
         self.pub_emergency = self.create_publisher(
@@ -103,6 +115,10 @@ class ServerBridgeNode(Node):
             self.sub_detections = self.create_subscription(
                 self._DetectionArray, '/perception/anpr/detections',
                 self._detections_callback, 10
+            )
+            self.sub_plate_query = self.create_subscription(
+                self._PlateQuery, '/plate/query',
+                self._plate_query_callback, 10
             )
 
         # ANPR plate (String) - 호환용
@@ -132,6 +148,7 @@ class ServerBridgeNode(Node):
         """Setup MQTT topic subscriptions."""
         self.mqtt.subscribe('task_cmd', self._mqtt_task_cmd_callback)
         self.mqtt.subscribe('emergency', self._mqtt_emergency_callback)
+        self.mqtt.subscribe('plate_response', self._mqtt_plate_response_callback)
 
     def _mqtt_connect_callback(self, connected: bool):
         """Handle MQTT connection status."""
@@ -168,6 +185,34 @@ class ServerBridgeNode(Node):
         msg = Twist()
         self.pub_emergency.publish(msg)
 
+    def _mqtt_plate_response_callback(self, topic: str, payload: dict):
+        """Handle plate verification response from server."""
+        if not self._has_interface:
+            return
+
+        try:
+            msg = self._PlateResponse()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.plate_number = payload.get('plate_number', '')
+            msg.verified = payload.get('verified', False)
+            msg.assigned_slot_id = payload.get('assigned_slot_id', -1)
+            msg.waypoint_ids = payload.get('waypoint_ids', [])
+            msg.message = payload.get('message', '')
+
+            self.pub_plate_response.publish(msg)
+
+            if msg.verified:
+                self.get_logger().info(
+                    f'Plate {msg.plate_number} verified, assigned slot: {msg.assigned_slot_id}'
+                )
+            else:
+                self.get_logger().warn(
+                    f'Plate {msg.plate_number} not verified: {msg.message}'
+                )
+
+        except Exception as e:
+            self.get_logger().error(f'Plate response parse error: {e}')
+
     def _driving_state_callback(self, msg):
         """Handle driving state update."""
         self._last_driving_state = msg
@@ -189,6 +234,18 @@ class ServerBridgeNode(Node):
     def _pose_callback(self, msg: PoseStamped):
         """Handle pose update."""
         self._last_pose = msg
+
+    def _plate_query_callback(self, msg):
+        """Handle plate verification query from mission_manager."""
+        if not self.mqtt.is_connected:
+            self.get_logger().warn('Cannot send plate query: MQTT not connected')
+            return
+
+        self.mqtt.publish('plate_query', {
+            'plate_number': msg.plate_number,
+            'car_id': msg.car_id if msg.car_id else self.car_id,
+        })
+        self.get_logger().info(f'Plate query sent: {msg.plate_number}')
 
     def _detections_callback(self, msg):
         """Handle ANPR detections."""

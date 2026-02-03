@@ -5,8 +5,11 @@
 - **msg 필드 접근 시 아래 정의 확인**
 - **좌표계**: ROS 표준 (X-전방, Y-좌측, Z-상방, 반시계 양수)
 - **단위**: 거리 m, 각도 rad, 속도 m/s
-- **현재 상태**: 라인 인식 비활성화, 마커 전용 주행. DRIVE → STOP_AT_MARKER → ADVANCE_TO_CENTER → TURN → ALIGN_TO_MARKER → DRIVE 사이클
-- **완료된 과제**: IMU 기반 Turn, ALIGN 모드, ANPR+장애물 검출 통합
+- **시스템 유형**: 주차 로봇 (TARGET 차량을 적재/하역하는 로봇)
+- **현재 상태**: 라인 인식 비활성화, 마커 전용 주행
+- **풀 미션 플로우**: WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → PARK → UNLOAD → RETURN_HOME → WAIT_VEHICLE
+- **주차 시스템**: PARK_DETECT → PARK_ALIGN_MARKER → PARK_ALIGN_RECT → PARK_FINAL (side_cam + 노란 직사각형)
+- **완료된 과제**: IMU 기반 Turn, ALIGN 모드, ANPR+장애물 검출 통합, Side Camera 주차 시스템, Loader 드라이버
 - **ANPR 노드**: 별도 conda 환경(anpr_310)에서 실행 - balemaleAI 의존
 ---
 
@@ -31,11 +34,13 @@ balemaleEMBEDDED/
     │       └── robot.launch.py       # 인식/제어/계획 노드
     ├── drivers/
     │   ├── camera_driver/            # USB 카메라 (V4L2)
-    │   ├── arduino_driver/           # Arduino UART 브릿지
+    │   ├── arduino_driver/           # Arduino UART 브릿지 (모터)
+    │   ├── loader_driver/            # Loader Arduino 드라이버 (적재 메커니즘)
     │   └── imu_driver/               # MPU6050 I2C
     ├── perception/
-    │   ├── marker_detector/          # ArUco 마커 검출
+    │   ├── marker_detector/          # ArUco 마커 검출 (front + side)
     │   ├── marker_tracker/           # Kalman 필터 추적
+    │   ├── slot_line_detector/       # 노란 직사각형 검출 (주차용)
     │   ├── anpr_detector/            # 번호판/장애물 검출 (balemaleAI)
     │   └── lane_detector/            # 차선 검출 (비활성화)
     ├── control/
@@ -58,9 +63,12 @@ balemaleEMBEDDED/
 | arduino_driver | arduino_node | arduino_driver | sensors |
 | imu_driver | imu_node | imu_node | sensors |
 | marker_detector | detector_node | marker_detector | robot |
+| marker_detector | detector_node | side_marker_detector | robot |
 | marker_tracker | tracker_node | marker_tracker | robot |
+| slot_line_detector | detector_node | slot_line_detector | robot |
 | anpr_detector | detector_node | anpr_detector | **별도 (conda anpr_310)** |
 | motion_controller | controller_node | motion_controller | robot |
+| loader_driver | loader_node | loader_driver | robot |
 | mission_manager | manager_node | mission_manager | robot |
 | server_bridge | bridge_node | server_bridge | robot |
 
@@ -175,6 +183,61 @@ uint8 num_plates          # 검출된 번호판 수
 uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
 ```
 
+### SlotLineStatus.msg (주차용)
+```
+std_msgs/Header header
+bool valid                    # 검출 유효 여부
+float32 center_offset_x       # 직사각형 중심 X 오프셋 (m)
+float32 center_offset_y       # 직사각형 중심 Y 오프셋 (m)
+float32 angle                 # 직사각형 회전 각도 (rad)
+float32 width                 # 검출된 폭 (픽셀)
+float32 height                # 검출된 높이 (픽셀)
+float32 confidence            # 검출 신뢰도 (0-1)
+```
+
+### ParkingStatus.msg (디버그용)
+```
+std_msgs/Header header
+string sub_state              # 주차 서브상태 (DETECT, ALIGN_MARKER, etc.)
+int32 detected_slot_id        # 검출된 슬롯 마커 ID (-1: 없음)
+int32 target_slot_id          # 목표 슬롯 마커 ID
+bool slot_verified            # 슬롯 그룹 검증 완료
+float32 marker_distance       # 마커까지 거리 (m)
+float32 marker_angle          # 마커 각도 (rad)
+string message                # 상태 메시지
+```
+
+### LoaderCommand.msg (적재 메커니즘)
+```
+std_msgs/Header header
+string command                # 명령: LOAD, UNLOAD, STOP
+```
+
+### LoaderStatus.msg (적재 상태)
+```
+std_msgs/Header header
+string status                 # IDLE, LOADING, UNLOADING, DONE, ERROR, DISCONNECTED
+bool is_loaded                # 차량 적재 여부
+string message                # 상태 메시지
+```
+
+### PlateQuery.msg (서버 조회)
+```
+std_msgs/Header header
+string plate_number           # 조회할 번호판
+string car_id                 # 로봇 ID (선택)
+```
+
+### PlateResponse.msg (서버 응답)
+```
+std_msgs/Header header
+string plate_number           # 번호판
+bool verified                 # 입차 허용 여부
+int32 assigned_slot_id        # 배정된 주차 마커 ID (-1: 미배정)
+int32[] waypoint_ids          # 경유 마커 리스트
+string message                # 응답 메시지
+```
+
 ---
 
 ## 토픽 목록
@@ -200,6 +263,9 @@ uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
 | `/perception/anpr/plate` | String | anpr_detector | (호환용) |
 | `/perception/anpr/sticker` | String | anpr_detector | (호환용) |
 | `/perception/anpr/debug_image` | Image | anpr_detector | (디버그) |
+| `/perception/side_markers` | MarkerArray | side_marker_detector | mission_manager, motion_controller |
+| `/perception/slot_rect` | SlotLineStatus | slot_line_detector | motion_controller |
+| `/slot_line_detector/debug_image` | Image | slot_line_detector | (디버그) |
 
 ### 미션 (Mission)
 | 토픽 | 타입 | 발행자 | 구독자 |
@@ -212,6 +278,11 @@ uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
 | `/mission/turn_done` | Bool | motion_controller | mission_manager |
 | `/mission/align_done` | Bool | - | mission_manager |
 | `/mission/test_cmd` | String | (수동) | mission_manager |
+| `/parking/target_slot` | Int32 | mission_manager | motion_controller |
+| `/parking/status` | ParkingStatus | mission_manager | (디버그) |
+| `/parking/align_marker_done` | Bool | motion_controller | mission_manager |
+| `/parking/align_rect_done` | Bool | motion_controller | mission_manager |
+| `/parking/final_done` | Bool | motion_controller | mission_manager |
 
 ### 제어 (Control)
 | 토픽 | 타입 | 발행자 | 구독자 |
@@ -226,6 +297,14 @@ uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
 | `/server/task_cmd` | MissionCommand | server_bridge | mission_manager |
 | `/server/task_status` | MissionStatus | mission_manager | server_bridge |
 | `/control/drive_cmd_emergency` | Twist | server_bridge | - |
+| `/plate/query` | PlateQuery | mission_manager | server_bridge |
+| `/plate/response` | PlateResponse | server_bridge | mission_manager |
+
+### 적재 (Loader)
+| 토픽 | 타입 | 발행자 | 구독자 |
+|------|------|--------|--------|
+| `/loader/command` | LoaderCommand | mission_manager | loader_driver |
+| `/loader/status` | LoaderStatus | loader_driver | mission_manager |
 
 ---
 
@@ -264,6 +343,14 @@ uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
   calib_samples: 500          # 캘리브레이션 샘플 수 (강화됨)
   comp_alpha: 0.98            # Complementary filter gyro weight
   # DLPF: 21Hz bandwidth (0x04) - 빠른 회전 반응
+
+/loader_driver:
+  port: "/dev/ttyUSB1"        # Loader Arduino (모터 Arduino와 별도)
+  baudrate: 115200
+  timeout: 0.1
+  status_rate_hz: 10.0
+  simulate: false
+  simulate_duration: 3.0      # 시뮬레이션 동작 시간 (초)
 ```
 
 ### 인식
@@ -272,6 +359,14 @@ uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
   dictionary: "DICT_4X4_50"
   marker_size: 0.04           # 4cm
   publish_debug_image: true
+
+/side_marker_detector:
+  dictionary: "DICT_4X4_50"
+  marker_size: 0.04           # 4cm
+  image_topic: "/cam_side/image_raw"
+  camera_info_topic: "/cam_side/camera_info"
+  output_topic: "/perception/side_markers"
+  frame_id: "camera_side_link"
 
 /marker_tracker:
   process_noise: 0.01
@@ -284,6 +379,17 @@ uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
   image_topic: "/cam_front/image_raw"
   publish_debug_image: true
   show_debug_window: false
+
+/slot_line_detector:
+  image_topic: "/cam_side/image_raw"
+  output_topic: "/perception/slot_rect"
+  publish_debug_image: true
+  # HSV thresholds (노란색)
+  hsv_low: [20, 100, 100]
+  hsv_high: [35, 255, 255]
+  min_area: 500
+  max_area: 50000
+  pixel_to_meter: 0.001           # 픽셀→미터 변환
 ```
 
 ### 제어
@@ -311,6 +417,18 @@ uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
   turn_kd: 0.3
   turn_decel_zone: 0.35       # ~20도 (하향됨)
   turn_scale: 1.0             # 턴 각도 스케일 (부족하면 1.1~1.15)
+  # Parking (주차 제어)
+  park_creep_vx: 0.003        # PARK_DETECT 탐색 속도
+  park_align_kp: 0.02         # 마커 정렬 P 게인
+  park_rect_kp: 0.015         # 직사각형 정렬 P 게인
+  park_final_kp: 0.02         # 최종 거리 조정 P 게인
+  park_max_vx: 0.008          # 주차 시 최대 전후 속도
+  park_max_vy: 0.01           # 주차 시 최대 좌우 속도
+  park_min_speed: 0.003       # 주차 시 최소 속도
+  park_marker_threshold: 0.05 # 마커 정렬 완료 임계값 (rad)
+  park_rect_threshold: 0.015  # 직사각형 정렬 완료 임계값 (m)
+  park_distance_threshold: 0.02 # 최종 거리 완료 임계값 (m)
+  park_target_distance: 0.15  # 목표 주차 거리 (m)
 ```
 
 ### 계획
@@ -318,6 +436,10 @@ uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
 /mission_manager:
   update_rate: 10.0
   default_turn_angle: 1.57    # 90도
+  # Full mission config
+  home_marker_id: 0           # 홈 위치 마커 ID
+  auto_start_waiting: true    # 자동으로 WAIT_VEHICLE 시작
+  car_id: "car_01"            # 로봇 식별자
   # State timeouts (초과 시 ERROR)
   timeout_stop_at_marker: 2.0
   timeout_advance_to_center: 2.0
@@ -325,6 +447,17 @@ uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
   timeout_stop_bump: 0.5
   timeout_turning: 30.0
   timeout_park: 30.0
+  # Full mission timeouts
+  timeout_recognize: 60.0     # ANPR + 서버 응답 대기
+  timeout_load: 30.0          # 적재 완료 대기
+  timeout_unload: 30.0        # 하역 완료 대기
+  timeout_return_home: 120.0  # 복귀 최대 시간
+  # Parking sub-state timeouts
+  timeout_park_detect: 10.0   # PARK_DETECT 탐색 시간
+  timeout_park_recovery: 15.0 # PARK_RECOVERY 복구 시간
+  timeout_park_align_marker: 15.0 # PARK_ALIGN_MARKER 정렬 시간
+  timeout_park_align_rect: 10.0   # PARK_ALIGN_RECT 정렬 시간
+  timeout_park_final: 10.0    # PARK_FINAL 최종 조정 시간
   # State transition delays
   delay_stop_at_marker: 0.5
   delay_stop_bump: 0.3
@@ -378,28 +511,94 @@ motorScale[4] = {1.0, 1.1, 1.0, 1.0}  // B 모터 느려서 1.1 보정
 
 ---
 
+## Loader Arduino 프로토콜
+
+적재 메커니즘용 별도 Arduino (모터 Arduino와 다른 보드).
+
+### 시리얼 설정
+- Port: `/dev/ttyUSB1` (모터는 `/dev/ttyUSB0`)
+- Baudrate: 115200
+- 줄바꿈: `\n`
+
+### 명령어
+| 명령 | 설명 |
+|------|------|
+| `L` | Load (적재) - 차량을 로봇 위로 |
+| `U` | Unload (하역) - 차량을 슬롯으로 |
+| `S` | Stop (긴급 정지) |
+| `?` | Status query (상태 조회) |
+
+### 응답
+| 응답 | 설명 |
+|------|------|
+| `IDLE` | 대기 중, 동작 없음 |
+| `LOADING` | 적재 동작 중 |
+| `UNLOADING` | 하역 동작 중 |
+| `DONE` | 동작 완료 |
+| `ERROR` | 동작 실패 |
+
+### 동작 흐름
+```
+mission_manager → LoaderCommand(LOAD) → loader_driver → "L\n" → Arduino
+                                                    ↑
+Arduino → "LOADING\n" → loader_driver → LoaderStatus(LOADING) → mission_manager
+                                                    ↓
+Arduino → "DONE\n" → loader_driver → LoaderStatus(DONE, is_loaded=true) → mission_manager
+```
+
+---
+
 ## 미션 FSM 상태
 
+### 풀 미션 플로우 (자동 주차 로봇)
 ```
-IDLE → DRIVE → STOP_AT_MARKER → ADVANCE_TO_CENTER → STOP_BUMP → TURNING → ALIGN_TO_MARKER → DRIVE → ...
-                                                                              ↓
-                                                                       (마지막 waypoint)
-                                                                              ↓
-                                                                        PARK → FINISH
+       ┌──────────────────────────────────────────────────────────────────┐
+       │                                                                  │
+       ↓                                                                  │
+IDLE → WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → ... → PARK → UNLOAD → RETURN_HOME
+           ↑              │                              │
+           │              │                              ↓
+           └──────────────┴─────────(ERROR)──────────> ERROR
+
+주행 사이클 (DRIVE 내부):
+DRIVE → STOP_AT_MARKER → ADVANCE_TO_CENTER → STOP_BUMP → TURNING → ALIGN_TO_MARKER → DRIVE
+
+주차 사이클 (PARK 내부):
+PARK_DETECT → PARK_ALIGN_MARKER → PARK_ALIGN_RECT → PARK_FINAL
+     ↓ (잘못된 zone)
+ PARK_RECOVERY ──────────────────────────────┘
 ```
 
-| 상태 | 설명 | 타임아웃 | 타임아웃 후 전환 |
-|------|------|----------|------------------|
-| IDLE | 대기 중 | - | - |
-| DRIVE | 마커 추종 주행 | - | - |
-| STOP_AT_MARKER | 마커 앞 정지 | 2.0s | → ADVANCE |
-| ADVANCE_TO_CENTER | 마커 중심으로 전진 | 2.0s | → ERROR |
-| STOP_BUMP | 관성 안정화 | 0.5s | → TURNING |
-| TURNING | 제자리 회전 | 30.0s | → ALIGN_TO_MARKER (ERROR 아님) |
-| ALIGN_TO_MARKER | Turn 후 마커 정렬 | 5.0s | → DRIVE (ERROR 아님) |
-| PARK | 주차 수행 | 30.0s | → ERROR |
+### 풀 미션 상태 (Full Mission States)
+| 상태 | 설명 | 타임아웃 | 다음 상태 |
+|------|------|----------|-----------|
+| IDLE | 대기 중 | - | → WAIT_VEHICLE (auto_start) |
+| WAIT_VEHICLE | 홈에서 차량 대기 (ANPR 감시) | - | → RECOGNIZE (번호판 검출) |
+| RECOGNIZE | 서버에 번호판 조회 | 60s | → LOAD (verified) / ERROR |
+| LOAD | 차량 적재 중 | 30s | → DRIVE (DONE) |
+| UNLOAD | 차량 하역 중 | 30s | → RETURN_HOME (DONE) |
+| RETURN_HOME | 홈으로 복귀 주행 | 120s | → WAIT_VEHICLE |
+
+### 주행 상태 (Driving States)
+| 상태 | 설명 | 타임아웃 | 다음 상태 |
+|------|------|----------|-----------|
+| DRIVE | 마커 추종 주행 | - | → STOP_AT_MARKER (마커 도달) |
+| STOP_AT_MARKER | 마커 앞 정지 | 2.0s | → ADVANCE_TO_CENTER |
+| ADVANCE_TO_CENTER | 마커 중심으로 전진 | 2.0s | → STOP_BUMP / ERROR |
+| STOP_BUMP | 관성 안정화 | 0.5s | → TURNING / PARK |
+| TURNING | 제자리 회전 | 30.0s | → ALIGN_TO_MARKER |
+| ALIGN_TO_MARKER | Turn 후 마커 정렬 | 5.0s | → DRIVE |
 | FINISH | 완료 | - | - |
 | ERROR | 오류 | - | - |
+
+### 주차 서브상태
+| 상태 | 설명 | 타임아웃 | 타임아웃 후 전환 |
+|------|------|----------|------------------|
+| PARK_DETECT | side_cam으로 슬롯 마커 탐색 | 10s | → ERROR |
+| PARK_RECOVERY | 잘못된 zone에서 올바른 zone으로 이동 | 15s | → PARK_DETECT |
+| PARK_ALIGN_MARKER | 마커 angle로 전후 정렬 (vx) | 15s | → PARK_ALIGN_RECT |
+| PARK_ALIGN_RECT | 노란 직사각형 중심으로 좌우 정렬 (vy) | 10s | → PARK_FINAL |
+| PARK_FINAL | 마커 거리로 최종 위치 조정 (vy) | 10s | → FINISH |
 
 ### 턴 각도 계산 (동적)
 ```python
@@ -529,6 +728,51 @@ turn_target_rad = raw_rad * turn_scale
 
 ---
 
+## 주차 시스템 (Side Camera)
+
+### 슬롯 그룹
+```python
+SLOT_GROUPS = {
+    'A': range(16, 20),  # ID 16-19, y=82.5cm
+    'B': range(20, 24),  # ID 20-23, y=136.33cm
+    'C': range(24, 28),  # ID 24-27, y=161.66cm
+}
+```
+
+### Side Camera 좌표 변환
+Side camera는 base_link에서 5cm 우측, yaw=-90° 장착
+```
+Side Camera Frame:        Robot Frame:
+  Z (forward) ─────────→ -Y (왼쪽)
+  X (right)   ─────────→  X (전방)
+  Y (down)    ─────────→ -Z (아래)
+```
+
+### 마커 검출 해석 (side camera)
+- `marker.distance` = 차량과 마커 간 **측면 거리** (좌우)
+- `marker.angle` = **전후방 오프셋** (angle > 0: 차가 마커보다 앞에 있음)
+
+### 제어 매핑
+| 상태 | 센서 | 오차 | 제어 |
+|------|------|------|------|
+| PARK_ALIGN_MARKER | side_marker.angle | 전후 오차 | vx (전진/후진) |
+| PARK_ALIGN_RECT | slot_rect.center_offset_x | 좌우 오차 | vy (횡이동) |
+| PARK_FINAL | side_marker.distance | 거리 오차 | vy (측면 이동) |
+
+### 슬롯 검증 로직
+```python
+def is_same_zone(detected_id, target_id):
+    """같은 그룹(A/B/C)인지 확인"""
+    for zone, ids in SLOT_GROUPS.items():
+        if detected_id in ids and target_id in ids:
+            return True
+    return False
+```
+
+잘못된 zone 검출 시 → PARK_RECOVERY로 전후 이동 후 재탐색
+
+---
+
 ## 빌드 및 실행
 
 ```bash
@@ -590,6 +834,23 @@ ros2 run rqt_image_view rqt_image_view /perception/anpr/debug_image
 # 테스트 미션 (마커 1 → 2)
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'START 1,2'"
 
+# 주차 테스트 (슬롯 17)
+ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'START_PARK 17'"
+
+# 주차 디버그
+ros2 topic echo /parking/status
+ros2 topic echo /perception/side_markers
+ros2 run rqt_image_view rqt_image_view /slot_line_detector/debug_image
+
+# 로더 테스트
+ros2 topic echo /loader/status
+ros2 topic pub --once /loader/command robot_interfaces/LoaderCommand "{command: 'LOAD'}"
+ros2 topic pub --once /loader/command robot_interfaces/LoaderCommand "{command: 'UNLOAD'}"
+
+# 풀 미션 디버그
+ros2 topic echo /plate/query
+ros2 topic echo /plate/response
+
 # 긴급 정지
 ros2 topic pub /control/cmd_vel geometry_msgs/Twist "{}"
 
@@ -632,6 +893,9 @@ python3 teleop.py --port /dev/ttyUSB0
 from robot_interfaces.msg import Marker, MarkerArray, TrackedMarker
 from robot_interfaces.msg import DrivingState, MissionCommand, MissionStatus
 from robot_interfaces.msg import Detection, DetectionArray
+from robot_interfaces.msg import SlotLineStatus, ParkingStatus  # 주차용
+from robot_interfaces.msg import LoaderCommand, LoaderStatus   # 적재용
+from robot_interfaces.msg import PlateQuery, PlateResponse     # 서버 통신
 ```
 
 ### 좌표 변환 (OpenCV → ROS)
