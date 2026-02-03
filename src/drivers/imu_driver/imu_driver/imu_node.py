@@ -203,7 +203,8 @@ class ImuNode(Node):
 
         n = self.calib_samples
         self._gyro_bias = [gx_sum/n, gy_sum/n, gz_sum/n]
-        self._accel_bias = [ax_sum/n, ay_sum/n, az_sum/n - 9.81]  # z는 중력 보정
+        # 중력 보정: 칩 Z가 하방이므로 정지 시 az≈+9.81
+        self._accel_bias = [ax_sum/n, ay_sum/n, az_sum/n - 9.81]
 
         self._calibrated = True
         self.get_logger().info(
@@ -218,19 +219,29 @@ class ImuNode(Node):
         stamp = self.get_clock().now().to_msg()
 
         try:
-            ax, ay, az = self.mpu.read_accel()
-            gx, gy, gz = self.mpu.read_gyro()
+            ax_raw, ay_raw, az_raw = self.mpu.read_accel()
+            gx_raw, gy_raw, gz_raw = self.mpu.read_gyro()
         except Exception as e:
             self.get_logger().warn(f"IMU read error: {e}")
             return
 
-        # Bias 보정
-        ax -= self._accel_bias[0]
-        ay -= self._accel_bias[1]
-        az -= self._accel_bias[2]
-        gx -= self._gyro_bias[0]
-        gy -= self._gyro_bias[1]
-        gz -= self._gyro_bias[2]
+        # Bias 보정 (raw 값에 적용)
+        ax_raw -= self._accel_bias[0]
+        ay_raw -= self._accel_bias[1]
+        az_raw -= self._accel_bias[2]
+        gx_raw -= self._gyro_bias[0]
+        gy_raw -= self._gyro_bias[1]
+        gz_raw -= self._gyro_bias[2]
+
+        # ===== 축 변환 =====
+        # 장착: 칩 Y→전방, 칩 Z→하방
+        # 변환: Robot X = Chip Y, Robot Y = -Chip X, Robot Z = -Chip Z
+        ax = ay_raw
+        ay = -ax_raw
+        az = -az_raw
+        gx = gy_raw
+        gy = -gx_raw
+        gz = -gz_raw
 
         # Raw 메시지
         raw_msg = Imu()
@@ -252,9 +263,9 @@ class ImuNode(Node):
             if dt > 0.5:
                 dt = 0.01  # 너무 긴 dt 방지
 
-            # 가속도 기반 roll/pitch
-            accel_roll = math.atan2(ay, az)
-            accel_pitch = math.atan2(-ax, math.sqrt(ay*ay + az*az))
+            # 가속도 기반 roll/pitch (abs 보정으로 기울어진 상태에서도 안정적)
+            accel_roll = math.atan2(ay, az + abs(ax))
+            accel_pitch = math.atan2(-ax, az + abs(ay))
 
             # Gyro 적분
             gyro_roll = self._roll + gx * dt

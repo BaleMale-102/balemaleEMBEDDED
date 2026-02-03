@@ -2,9 +2,56 @@
 # All units: meters, radians, seconds
 
 # ============================================
+# Sensor Drivers
+# ============================================
+/cam_front:
+  ros__parameters:
+    device: "/dev/video0"
+    width: 640
+    height: 480
+    fps: 30.0
+    frame_id: "camera_front"
+    camera_name: "cam_front"
+    simulate: false
+    calibration_file: "cam_front_calib.yaml"
+
+/cam_side:
+  ros__parameters:
+    device: "/dev/video4"
+    width: 640
+    height: 480
+    fps: 30.0
+    frame_id: "camera_side"
+    camera_name: "cam_side"
+    simulate: false
+    calibration_file: ""
+
+/arduino_driver:
+  ros__parameters:
+    port: "/dev/ttyUSB0"
+    baudrate: 115200
+    timeout: 0.1
+    simulate: false
+    cmd_rate_hz: 20.0
+    watchdog_timeout: 0.15            # Arduino watchdog: 200ms
+    max_vx: 0.01                      # 속도 제한 (m/s)
+    max_vy: 0.01
+    max_wz: 0.1                       # 회전 제한 (rad/s)
+    wz_offset: 0.0                    # 직진 보정 (왼쪽 돌면 음수)
+
+/imu_node:
+  ros__parameters:
+    i2c_bus: 7                        # Jetson Orin Nano: bus 7
+    i2c_address: 0x68
+    publish_rate_hz: 100.0
+    calib_samples: 200
+    comp_alpha: 0.98                  # Complementary filter gyro weight
+    frame_id: "imu_link"
+
+# ============================================
 # Perception Parameters
 # ============================================
-marker_detector:
+/marker_detector:
   ros__parameters:
     dictionary: "DICT_4X4_50"
     marker_size: 0.04                # 4cm markers
@@ -13,7 +60,7 @@ marker_detector:
     camera_info_topic: "/cam_front/camera_info"
     frame_id: "camera_front_link"
 
-marker_tracker:
+/marker_tracker:
   ros__parameters:
     process_noise: 0.01
     measurement_noise: 0.05
@@ -21,14 +68,14 @@ marker_tracker:
     min_prediction_confidence: 0.3
     camera_offset_x: 0.10             # 카메라→base_link 전방 오프셋 (m)
 
-lane_detector:
+/lane_detector:  # 비활성화
   ros__parameters:
-    image_topic: "/cam_front/image_raw"  # front_cam 사용 (bottom_cam 비활성화됨)
+    image_topic: "/cam_front/image_raw"
     publish_debug_image: true
     roi_top_ratio: 0.5
     roi_bottom_ratio: 1.0
     sobel_threshold: 50
-    min_line_pixels: 100              # 최소 라인 픽셀 수 (노이즈 필터링)
+    min_line_pixels: 100
     line_color: "black"
     kalman_q: 0.01
     kalman_r: 0.05
@@ -36,15 +83,15 @@ lane_detector:
 # ============================================
 # Control Parameters
 # ============================================
-motion_controller:
+/motion_controller:
   ros__parameters:
     control_rate: 20.0
     max_vx: 0.008
     max_vy: 0.008
     max_wz: 0.05
     # Fallback (센서 없을 때)
-    reverse_vx: 0.008
-    # Lane following
+    reverse_vx: 0.015
+    # Lane following (비활성화)
     lane_vx: 0.004
     lane_vy_kp: 0.03
     lane_vy_ki: 0.0
@@ -59,41 +106,24 @@ motion_controller:
     marker_reach_distance: 0.25
     marker_min_distance: 0.08
     marker_lost_reach_distance: 0.35
-    advance_vx: 0.5               # ADVANCE_TO_CENTER 전진 속도 (~0.5초에 0.25m)
+    advance_vx: 0.02              # ADVANCE_TO_CENTER 전진 속도 (max_vx로 clamp됨)
     # Turn (PD 제어 + 오버슈팅 보정)
-    turn_wz: 0.04               # 최대 회전 속도 (rad/s)
-    turn_wz_min: 0.015          # 최소 회전 속도
-    turn_tolerance: 0.05        # 완료 허용 오차 (rad, ~3도)
-    turn_kp: 1.5                # 비례 게인
-    turn_kd: 0.3                # 미분 게인 (급정지 방지)
-    turn_decel_zone: 0.5        # 감속 시작 구간 (rad, ~30도)
-
-wheel_controller:
-  ros__parameters:
-    # Kinematics
-    wheel_radius: 0.03              # 30mm
-    wheel_base_x: 0.08              # 80mm
-    wheel_base_y: 0.06              # 60mm
-    max_wheel_speed: 10.0           # rad/s
-    max_pwm: 3000
-    pwm_deadzone: 100
-    # Serial
-    serial_port: "/dev/ttyUSB0"
-    serial_baud: 115200
-    simulation: false
-    # Safety
-    watchdog_timeout: 0.3
-    cmd_rate: 20.0
+    turn_wz: 0.04                 # 최대 회전 속도 (rad/s)
+    turn_wz_min: 0.015            # 최소 회전 속도
+    turn_tolerance: 0.05          # 완료 허용 오차 (rad, ~3도)
+    turn_kp: 1.5                  # 비례 게인
+    turn_kd: 0.3                  # 미분 게인 (급정지 방지)
+    turn_decel_zone: 0.5          # 감속 시작 구간 (rad, ~30도)
 
 # ============================================
 # Planning Parameters
 # ============================================
-mission_manager:
+/mission_manager:
   ros__parameters:
     update_rate: 10.0
     default_turn_angle: 1.57        # 90 degrees
 
-server_bridge:
+/server_bridge:
   ros__parameters:
     mqtt_host: "localhost"
     mqtt_port: 1883
