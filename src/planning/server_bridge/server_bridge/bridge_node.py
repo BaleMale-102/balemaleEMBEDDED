@@ -27,6 +27,7 @@ import math
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, Twist
+from std_msgs.msg import String
 
 from .mqtt_client import MQTTClient, MQTTConfig
 
@@ -69,10 +70,12 @@ class ServerBridgeNode(Node):
         # Import custom interfaces
         try:
             from robot_interfaces.msg import MissionCommand, MissionStatus, DrivingState
+            from robot_interfaces.msg import DetectionArray
             self._has_interface = True
             self._MissionCommand = MissionCommand
             self._MissionStatus = MissionStatus
             self._DrivingState = DrivingState
+            self._DetectionArray = DetectionArray
         except ImportError:
             self.get_logger().warn('robot_interfaces not found')
             self._has_interface = False
@@ -97,6 +100,16 @@ class ServerBridgeNode(Node):
                 self._MissionStatus, '/server/task_status',
                 self._task_status_callback, 10
             )
+            self.sub_detections = self.create_subscription(
+                self._DetectionArray, '/perception/anpr/detections',
+                self._detections_callback, 10
+            )
+
+        # ANPR plate (String) - 호환용
+        self.sub_plate = self.create_subscription(
+            String, '/perception/anpr/plate',
+            self._plate_callback, 10
+        )
 
         self.sub_pose = self.create_subscription(
             PoseStamped, '/localization/pose',
@@ -176,6 +189,43 @@ class ServerBridgeNode(Node):
     def _pose_callback(self, msg: PoseStamped):
         """Handle pose update."""
         self._last_pose = msg
+
+    def _detections_callback(self, msg):
+        """Handle ANPR detections."""
+        if not self.mqtt.is_connected:
+            return
+
+        # 검출 결과를 MQTT로 전송
+        detections_data = []
+        for det in msg.detections:
+            det_dict = {
+                'class_id': det.class_id,
+                'class_name': det.class_name,
+                'confidence': det.confidence,
+                'bbox': [det.x1, det.y1, det.x2, det.y2],
+            }
+            # 번호판인 경우 OCR 결과 추가
+            if det.class_id == 0 and det.text:
+                det_dict['plate_text'] = det.text
+                det_dict['has_sticker'] = det.has_sticker
+            detections_data.append(det_dict)
+
+        self.mqtt.publish('anpr/detections', {
+            'num_plates': msg.num_plates,
+            'num_obstacles': msg.num_obstacles,
+            'detections': detections_data
+        })
+
+    def _plate_callback(self, msg: String):
+        """Handle plate OCR result."""
+        if not self.mqtt.is_connected:
+            return
+
+        if msg.data:
+            self.mqtt.publish('anpr/plate', {
+                'plate': msg.data
+            })
+            self.get_logger().info(f'Plate sent to server: {msg.data}')
 
     def _status_timer_callback(self):
         """Periodic status publish."""

@@ -88,20 +88,39 @@ class MissionContext:
 class StateMachine:
     """Finite State Machine for mission execution."""
 
-    def __init__(self):
+    def __init__(self, timeouts: Dict[str, float] = None, delays: Dict[str, float] = None):
         self._state = MissionState.IDLE
         self._context = MissionContext()
         self._transitions: Dict[MissionState, Callable[[], Optional[MissionState]]] = {}
 
-        # Timeout configuration
-        self._state_timeouts = {
+        # Default timeout configuration
+        default_timeouts = {
             MissionState.STOP_AT_MARKER: 2.0,
-            MissionState.ADVANCE_TO_CENTER: 15.0,  # 마커까지 전진 시간
+            MissionState.ADVANCE_TO_CENTER: 0.5,  # 마커까지 전진 시간
             MissionState.ALIGN_TO_MARKER: 5.0,
             MissionState.STOP_BUMP: 0.5,
             MissionState.TURNING: 30.0,  # 회전 시간
             MissionState.PARK: 30.0,
         }
+
+        # Apply custom timeouts if provided
+        if timeouts:
+            for key, value in timeouts.items():
+                try:
+                    state = MissionState[key]
+                    default_timeouts[state] = value
+                except KeyError:
+                    pass  # Ignore invalid state names
+
+        self._state_timeouts = default_timeouts
+
+        # State transition delays
+        self._delays = {
+            'stop_at_marker': 0.5,  # STOP_AT_MARKER 후 대기 시간
+            'stop_bump': 0.3,       # STOP_BUMP 후 대기 시간
+        }
+        if delays:
+            self._delays.update(delays)
 
         # Callbacks
         self._on_state_change: Optional[Callable[[MissionState, MissionState], None]] = None
@@ -207,6 +226,19 @@ class StateMachine:
 
     def _handle_timeout(self):
         """Handle state timeout."""
+        # TURNING timeout: 마커 정렬 상태로 전환 (ERROR 대신)
+        if self._state == MissionState.TURNING:
+            self._context.turn_complete = True  # 강제 완료 처리
+            self._context.advance_waypoint()
+            self._change_state(MissionState.ALIGN_TO_MARKER)
+            return
+
+        # ALIGN_TO_MARKER timeout: 그냥 DRIVE로 전환
+        if self._state == MissionState.ALIGN_TO_MARKER:
+            self._context.align_complete = True
+            self._change_state(MissionState.DRIVE)
+            return
+
         self._context.error_message = f'Timeout in state {self._state.name}'
         self._change_state(MissionState.ERROR)
 
@@ -222,7 +254,7 @@ class StateMachine:
     def _stop_at_marker_transition(self) -> Optional[MissionState]:
         # Wait briefly then advance
         elapsed = time.time() - self._context.state_enter_time
-        if elapsed > 0.5:
+        if elapsed > self._delays['stop_at_marker']:
             return MissionState.ADVANCE_TO_CENTER
         return None
 
@@ -234,12 +266,12 @@ class StateMachine:
 
     def _align_transition(self) -> Optional[MissionState]:
         if self._context.align_complete:
-            return MissionState.STOP_BUMP
+            return MissionState.DRIVE  # STOP_BUMP 대신 바로 DRIVE
         return None
 
     def _stop_bump_transition(self) -> Optional[MissionState]:
         elapsed = time.time() - self._context.state_enter_time
-        if elapsed > 0.3:
+        if elapsed > self._delays['stop_bump']:
             # Decide next action
             if self._context.is_last_waypoint:
                 # At final goal

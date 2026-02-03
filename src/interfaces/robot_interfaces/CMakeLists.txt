@@ -23,6 +23,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DrivingState.msg"
   "msg/MissionCommand.msg"
   "msg/MissionStatus.msg"
+  "msg/Detection.msg"
+  "msg/DetectionArray.msg"
   # Services
   "srv/SetTargetMarker.srv"
   "srv/GetRobotState.srv"

@@ -107,6 +107,9 @@ def generate_launch_description():
         #     ],
         #     additional_env=x11_env,
         # ),
+
+        # ANPR + 장애물 검출 (별도 터미널에서 실행 - conda anpr_310 환경)
+        # ros2 run anpr_detector detector_node --ros-args -p show_debug_window:=true
     ])
 
     # ==========================================

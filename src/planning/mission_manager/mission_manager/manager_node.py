@@ -50,10 +50,36 @@ class MissionManagerNode(Node):
         self.declare_parameter('default_marker_yaw', 1.5708)  # π/2
         self.declare_parameter('unit_scale', 0.01)  # cm to m
 
+        # State timeout parameters
+        self.declare_parameter('timeout_stop_at_marker', 2.0)
+        self.declare_parameter('timeout_advance_to_center', 0.5)
+        self.declare_parameter('timeout_align_to_marker', 5.0)
+        self.declare_parameter('timeout_stop_bump', 0.5)
+        self.declare_parameter('timeout_turning', 30.0)
+        self.declare_parameter('timeout_park', 30.0)
+
+        # State delay parameters
+        self.declare_parameter('delay_stop_at_marker', 0.5)
+        self.declare_parameter('delay_stop_bump', 0.3)
+
         update_rate = self.get_parameter('update_rate').value
         self.default_turn_angle = self.get_parameter('default_turn_angle').value
         self.default_marker_yaw = self.get_parameter('default_marker_yaw').value
         self.unit_scale = self.get_parameter('unit_scale').value
+
+        # Build timeout/delay configs for state machine
+        timeouts = {
+            'STOP_AT_MARKER': self.get_parameter('timeout_stop_at_marker').value,
+            'ADVANCE_TO_CENTER': self.get_parameter('timeout_advance_to_center').value,
+            'ALIGN_TO_MARKER': self.get_parameter('timeout_align_to_marker').value,
+            'STOP_BUMP': self.get_parameter('timeout_stop_bump').value,
+            'TURNING': self.get_parameter('timeout_turning').value,
+            'PARK': self.get_parameter('timeout_park').value,
+        }
+        delays = {
+            'stop_at_marker': self.get_parameter('delay_stop_at_marker').value,
+            'stop_bump': self.get_parameter('delay_stop_bump').value,
+        }
 
         # Load marker map
         self._marker_positions = {}  # {marker_id: (x, y)}
@@ -61,7 +87,7 @@ class MissionManagerNode(Node):
         self._load_marker_map()
 
         # State machine
-        self.fsm = StateMachine()
+        self.fsm = StateMachine(timeouts=timeouts, delays=delays)
         self.fsm.set_state_change_callback(self._on_state_change)
 
         # Heading tracking

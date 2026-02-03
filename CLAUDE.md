@@ -5,8 +5,9 @@
 - **msg 필드 접근 시 아래 정의 확인**
 - **좌표계**: ROS 표준 (X-전방, Y-좌측, Z-상방, 반시계 양수)
 - **단위**: 거리 m, 각도 rad, 속도 m/s
-- **현재 상태**: 라인 인식 비활성화, 마커 전용 주행으로 node0 에서 시작해 node1 도달 후 Turn 시작까지 성공. 
-- **다음 과제**: imu 기반으로 Turn하고 90도까지 돌고 멈추고 다시 다음 target_marker로 가야되는데 Turn이 안멈춤. next_target_marker 업데이트 되는지도 미지수
+- **현재 상태**: 라인 인식 비활성화, 마커 전용 주행. DRIVE → STOP_AT_MARKER → ADVANCE_TO_CENTER → TURN → ALIGN_TO_MARKER → DRIVE 사이클
+- **완료된 과제**: IMU 기반 Turn, ALIGN 모드, ANPR+장애물 검출 통합
+- **ANPR 노드**: 별도 conda 환경(anpr_310)에서 실행 - balemaleAI 의존
 ---
 
 ## 패키지 구조
@@ -17,6 +18,7 @@ balemaleEMBEDDED/
 │   └── Arduino_MoebiusTech_v2.ino    # 메카넘 휠 펌웨어
 ├── config/
 │   └── cam_front_calib.yaml          # 카메라 캘리브레이션 (원본)
+├── teleop.py                         # 수동 제어 스크립트
 └── src/
     ├── bringup/robot_bringup/        # Launch 및 설정
     │   ├── config/
@@ -34,6 +36,7 @@ balemaleEMBEDDED/
     ├── perception/
     │   ├── marker_detector/          # ArUco 마커 검출
     │   ├── marker_tracker/           # Kalman 필터 추적
+    │   ├── anpr_detector/            # 번호판/장애물 검출 (balemaleAI)
     │   └── lane_detector/            # 차선 검출 (비활성화)
     ├── control/
     │   └── motion_controller/        # 모션 제어
@@ -56,6 +59,7 @@ balemaleEMBEDDED/
 | imu_driver | imu_node | imu_node | sensors |
 | marker_detector | detector_node | marker_detector | robot |
 | marker_tracker | tracker_node | marker_tracker | robot |
+| anpr_detector | detector_node | anpr_detector | **별도 (conda anpr_310)** |
 | motion_controller | controller_node | motion_controller | robot |
 | mission_manager | manager_node | mission_manager | robot |
 | server_bridge | bridge_node | server_bridge | robot |
@@ -146,6 +150,31 @@ int16 rear_left           # 후좌 모터 PWM
 int16 rear_right          # 후우 모터 PWM
 ```
 
+### Detection.msg
+```
+# 클래스 상수
+uint8 CLASS_PLATE=0
+uint8 CLASS_STICKER=1
+uint8 CLASS_PERSON=2
+uint8 CLASS_BOX=3
+uint8 CLASS_CONE=4
+
+uint8 class_id            # 검출된 객체 클래스
+string class_name         # 클래스 이름 ("plate", "sticker", "person", "box", "cone")
+float32 confidence        # 검출 신뢰도 (0~1)
+int32 x1, y1, x2, y2      # Bounding box (픽셀 좌표)
+string text               # OCR 결과 (번호판인 경우)
+bool has_sticker          # 스티커 유무 (번호판인 경우)
+```
+
+### DetectionArray.msg
+```
+std_msgs/Header header
+Detection[] detections    # 검출된 객체 배열
+uint8 num_plates          # 검출된 번호판 수
+uint8 num_obstacles       # 검출된 장애물 수 (person + box + cone)
+```
+
 ---
 
 ## 토픽 목록
@@ -167,6 +196,10 @@ int16 rear_right          # 후우 모터 PWM
 | `/perception/markers` | MarkerArray | marker_detector | marker_tracker |
 | `/perception/tracked_marker` | TrackedMarker | marker_tracker | motion_controller |
 | `/perception/debug/marker_image` | Image | marker_detector | (디버그) |
+| `/perception/anpr/detections` | DetectionArray | anpr_detector | mission_manager |
+| `/perception/anpr/plate` | String | anpr_detector | (호환용) |
+| `/perception/anpr/sticker` | String | anpr_detector | (호환용) |
+| `/perception/anpr/debug_image` | Image | anpr_detector | (디버그) |
 
 ### 미션 (Mission)
 | 토픽 | 타입 | 발행자 | 구독자 |
@@ -220,16 +253,17 @@ int16 rear_right          # 후우 모터 PWM
   baudrate: 115200
   watchdog_timeout: 0.15      # ROS측 (Arduino: 200ms)
   max_vx: 0.01                # 속도 제한 (m/s)
-  max_vy: 0.01
-  max_wz: 0.1                 # 회전 제한 (rad/s)
+  max_vy: 0.015               # 좌우 이동 제한 (상향됨)
+  max_wz: 0.15                # 회전 제한 (rad/s, 상향됨)
   wz_offset: 0.0              # 직진 보정
 
 /imu_node:
   i2c_bus: 7                  # Jetson Orin Nano
   i2c_address: 0x68
   publish_rate_hz: 100.0
-  calib_samples: 200
+  calib_samples: 500          # 캘리브레이션 샘플 수 (강화됨)
   comp_alpha: 0.98            # Complementary filter gyro weight
+  # DLPF: 21Hz bandwidth (0x04) - 빠른 회전 반응
 ```
 
 ### 인식
@@ -244,6 +278,12 @@ int16 rear_right          # 후우 모터 PWM
   measurement_noise: 0.05
   prediction_timeout: 2.0
   camera_offset_x: 0.10       # 카메라→base_link 전방 오프셋
+
+/anpr_detector:
+  config_path: "/home/a102/balemaleAI/config.yaml"
+  image_topic: "/cam_front/image_raw"
+  publish_debug_image: true
+  show_debug_window: false
 ```
 
 ### 제어
@@ -251,22 +291,26 @@ int16 rear_right          # 후우 모터 PWM
 /motion_controller:
   control_rate: 20.0
   max_vx: 0.008
-  max_vy: 0.008
-  max_wz: 0.05
+  max_vy: 0.015               # 좌우 이동 속도 제한
+  max_wz: 0.075               # 회전 속도 제한 (상향됨)
   # Marker approach
   marker_vx_kp: 0.015
-  marker_vy_kp: 0.005
+  marker_vy_kp: 0.01          # 좌우 이동 게인 (상향됨)
   marker_wz_kp: 0.025
   marker_reach_distance: 0.25
   marker_min_distance: 0.08
+  marker_lost_reach_distance: 0.35
+  marker_align_threshold: 0.1   # 좌우 정렬 임계값 (rad, ~6도) - 이 이상이면 정렬 먼저
   advance_vx: 0.02
+  advance_time: 0.7           # ADVANCE_TO_CENTER 고정 전진 시간 (초, 상향됨)
   # Turn (PD 제어)
-  turn_wz: 0.04
-  turn_wz_min: 0.015
-  turn_tolerance: 0.05        # ~3도
+  turn_wz: 0.06               # 최대 회전 속도 (상향됨)
+  turn_wz_min: 0.0225         # 최소 회전 속도 (상향됨)
+  turn_tolerance: 0.07        # ~4도
   turn_kp: 1.5
   turn_kd: 0.3
-  turn_decel_zone: 0.5        # ~30도
+  turn_decel_zone: 0.35       # ~20도 (하향됨)
+  turn_scale: 1.0             # 턴 각도 스케일 (부족하면 1.1~1.15)
 ```
 
 ### 계획
@@ -274,6 +318,16 @@ int16 rear_right          # 후우 모터 PWM
 /mission_manager:
   update_rate: 10.0
   default_turn_angle: 1.57    # 90도
+  # State timeouts (초과 시 ERROR)
+  timeout_stop_at_marker: 2.0
+  timeout_advance_to_center: 2.0
+  timeout_align_to_marker: 5.0
+  timeout_stop_bump: 0.5
+  timeout_turning: 30.0
+  timeout_park: 30.0
+  # State transition delays
+  delay_stop_at_marker: 0.5
+  delay_stop_bump: 0.3
 
 /server_bridge:
   mqtt_host: "localhost"
@@ -327,24 +381,25 @@ motorScale[4] = {1.0, 1.1, 1.0, 1.0}  // B 모터 느려서 1.1 보정
 ## 미션 FSM 상태
 
 ```
-IDLE → DRIVE → STOP_AT_MARKER → ADVANCE_TO_CENTER → STOP_BUMP → TURNING → DRIVE → ...
-                                                                    ↓
-                                                             (마지막 waypoint)
-                                                                    ↓
-                                                              PARK → FINISH
+IDLE → DRIVE → STOP_AT_MARKER → ADVANCE_TO_CENTER → STOP_BUMP → TURNING → ALIGN_TO_MARKER → DRIVE → ...
+                                                                              ↓
+                                                                       (마지막 waypoint)
+                                                                              ↓
+                                                                        PARK → FINISH
 ```
 
-| 상태 | 설명 | 타임아웃 |
-|------|------|----------|
-| IDLE | 대기 중 | - |
-| DRIVE | 마커 추종 주행 | - |
-| STOP_AT_MARKER | 마커 앞 정지 | 2.0s |
-| ADVANCE_TO_CENTER | 마커 중심으로 전진 | 15.0s |
-| STOP_BUMP | 관성 안정화 | 0.5s |
-| TURNING | 제자리 회전 | 30.0s |
-| PARK | 주차 수행 | 30.0s |
-| FINISH | 완료 | - |
-| ERROR | 오류 | - |
+| 상태 | 설명 | 타임아웃 | 타임아웃 후 전환 |
+|------|------|----------|------------------|
+| IDLE | 대기 중 | - | - |
+| DRIVE | 마커 추종 주행 | - | - |
+| STOP_AT_MARKER | 마커 앞 정지 | 2.0s | → ADVANCE |
+| ADVANCE_TO_CENTER | 마커 중심으로 전진 | 2.0s | → ERROR |
+| STOP_BUMP | 관성 안정화 | 0.5s | → TURNING |
+| TURNING | 제자리 회전 | 30.0s | → ALIGN_TO_MARKER (ERROR 아님) |
+| ALIGN_TO_MARKER | Turn 후 마커 정렬 | 5.0s | → DRIVE (ERROR 아님) |
+| PARK | 주차 수행 | 30.0s | → ERROR |
+| FINISH | 완료 | - | - |
+| ERROR | 오류 | - | - |
 
 ### 턴 각도 계산 (동적)
 ```python
@@ -419,25 +474,67 @@ odom (static)
 **장착: 칩 Y→전방, 칩 Z→하방**
 
 ```python
-# Raw → ROS 변환
+# Raw → ROS 변환 (imu_node.py)
 ax = ay_raw       # Robot X = Chip Y
 ay = -ax_raw      # Robot Y = -Chip X
 az = -az_raw      # Robot Z = -Chip Z
 gx = gy_raw
 gy = -gx_raw
-gz = -gz_raw
+gz = gz_raw       # yaw 방향 보정 (반전 제거)
 ```
+
+---
+
+## 모터 방향 보정 (motion_controller)
+
+**중요: 실제 로봇 테스트 결과, vy와 wz 부호가 ROS 표준과 반대**
+
+### 마커 접근 (vy)
+```python
+# 좌우 이동 부호 반전
+vy = -self.marker_vy_kp * angle  # (원래: +)
+```
+- `angle > 0` (마커가 왼쪽) → `vy < 0` → 실제 왼쪽 이동
+
+### 마커 접근 로직
+```
+|angle| > marker_align_threshold → [ALIGN] 좌우 정렬만 (vy, 게인 2배)
+|angle| ≤ marker_align_threshold → [DRIVE] 직진 + 미세 보정 (vx + vy)
+
+ALIGN_TO_MARKER 모드 → 게인 3배 (Turn 후 빠른 정렬)
+```
+
+### ALIGN 최소 속도
+vy가 너무 작으면 모터가 반응하지 않음. 최소 속도 보장:
+```python
+# DRIVE 모드 ALIGN, ALIGN_TO_MARKER 모드 모두
+if abs(vy) < 0.01 and abs(angle) > 0.05:
+    vy = 0.01 if angle < 0 else -0.01
+```
+
+### Turn 제어 (wz)
+```python
+# turned 계산 (부호 반전 - IMU 방향 보정)
+turned = start_yaw - current_yaw  # (원래: current - start)
+
+# wz 출력 (부호 반전 - 모터 방향 보정)
+cmd.angular.z = -wz
+
+# turn_target 스케일 적용
+turn_target_rad = raw_rad * turn_scale
+```
+
+**Turn이 부족하게 도는 경우:**
+- `robot_params.yaml`에서 `turn_scale` 값을 1.1~1.15로 증가
 
 ---
 
 ## 빌드 및 실행
 
 ```bash
-# 빌드
-cd ~/balemaleEMBEDDED
-colcon build --symlink-install
-
-# 환경 설정
+# 빌드 (메인 시스템)
+cd ~/balemaleEMBEDDED_redesign
+colcon build
 source install/setup.bash
 
 # 전체 실행
@@ -447,6 +544,22 @@ ros2 launch robot_bringup system.launch.py
 ros2 launch robot_bringup system.launch.py simulation:=true
 ros2 launch robot_bringup system.launch.py show_debug:=false
 ros2 launch robot_bringup system.launch.py cam_front_dev:=/dev/video1
+```
+
+### ANPR 노드 별도 실행 (conda anpr_310 환경)
+```bash
+# 터미널 2에서 실행
+conda activate anpr_310
+cd ~/balemaleEMBEDDED_redesign
+
+# 빌드 (처음 한번, setuptools 58.2.0 필요)
+pip install setuptools==58.2.0
+colcon build --packages-select anpr_detector
+
+# 실행
+source /opt/ros/humble/setup.bash
+source install/setup.bash
+ros2 run anpr_detector detector_node --ros-args -p show_debug_window:=true
 ```
 
 ### Launch 인자
@@ -466,11 +579,16 @@ ros2 launch robot_bringup system.launch.py cam_front_dev:=/dev/video1
 # 토픽 확인
 ros2 topic list
 ros2 topic echo /perception/tracked_marker
+ros2 topic echo /perception/anpr/detections
+ros2 topic echo /perception/anpr/plate
 ros2 topic echo /driving/state
 ros2 topic echo /mission/state
 
-# 테스트 미션 (마커 1 → 2 → 3)
-ros2 topic pub /mission/test_cmd std_msgs/String "data: 'START 1,2,3'"
+# ANPR 디버그 이미지 확인
+ros2 run rqt_image_view rqt_image_view /perception/anpr/debug_image
+
+# 테스트 미션 (마커 1 → 2)
+ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'START 1,2'"
 
 # 긴급 정지
 ros2 topic pub /control/cmd_vel geometry_msgs/Twist "{}"
@@ -478,6 +596,32 @@ ros2 topic pub /control/cmd_vel geometry_msgs/Twist "{}"
 # Arduino 직접 테스트
 ros2 topic pub /control/cmd_vel geometry_msgs/Twist "{linear: {x: 0.005}}"
 ```
+
+### 수동 제어 (teleop.py)
+```bash
+# Direct 모드 (기본) - ROS 없이 Arduino 직접 제어
+python3 teleop.py
+
+# ROS 모드 - ROS 노드 통해 제어
+python3 teleop.py --ros
+
+# 포트 지정
+python3 teleop.py --port /dev/ttyUSB0
+```
+
+| 키 | 동작 |
+|---|---|
+| W/↑ | 전진 |
+| S/↓ | 후진 |
+| A/← | 좌측 이동 |
+| D/→ | 우측 이동 |
+| Q | 좌회전 |
+| E | 우회전 |
+| Space | 정지 |
+| 1 | Enable drive (ROS only) |
+| 2 | Disable drive (ROS only) |
+| +/- | 속도 조절 |
+| Ctrl+C | 종료 |
 
 ---
 
@@ -487,6 +631,7 @@ ros2 topic pub /control/cmd_vel geometry_msgs/Twist "{linear: {x: 0.005}}"
 ```python
 from robot_interfaces.msg import Marker, MarkerArray, TrackedMarker
 from robot_interfaces.msg import DrivingState, MissionCommand, MissionStatus
+from robot_interfaces.msg import Detection, DetectionArray
 ```
 
 ### 좌표 변환 (OpenCV → ROS)

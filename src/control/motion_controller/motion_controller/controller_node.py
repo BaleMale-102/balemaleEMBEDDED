@@ -46,6 +46,7 @@ class MotionControllerNode(Node):
     MODE_STOP_AT_MARKER = 'STOP_AT_MARKER'
     MODE_ADVANCE_TO_CENTER = 'ADVANCE_TO_CENTER'
     MODE_TURN = 'TURN'
+    MODE_ALIGN = 'ALIGN'  # 마커 정렬 (Turn 후)
     MODE_STOP = 'STOP'
 
     def __init__(self):
@@ -76,7 +77,9 @@ class MotionControllerNode(Node):
         self.declare_parameter('marker_reach_distance', 0.25)  # 마커 사라지기 전 도달 판정
         self.declare_parameter('marker_min_distance', 0.08)
         self.declare_parameter('marker_lost_reach_distance', 0.35)  # 이 거리 이내에서 사라지면 도달로 판정
+        self.declare_parameter('marker_align_threshold', 0.15)  # 좌우 정렬 임계값 (rad, ~8.5도)
         self.declare_parameter('advance_vx', 0.02)  # ADVANCE_TO_CENTER 전진 속도
+        self.declare_parameter('advance_time', 0.5)  # ADVANCE_TO_CENTER 고정 전진 시간 (초)
 
         # Parameters - turn (PID + 오버슈팅 보정)
         self.declare_parameter('turn_wz', 0.04)
@@ -85,6 +88,7 @@ class MotionControllerNode(Node):
         self.declare_parameter('turn_kp', 1.5)          # 비례 게인
         self.declare_parameter('turn_kd', 0.3)          # 미분 게인 (급정지 방지)
         self.declare_parameter('turn_decel_zone', 0.5)  # 감속 시작 구간 (rad, ~30도)
+        self.declare_parameter('turn_scale', 1.0)       # 턴 각도 스케일 (1.0=그대로, 1.1=10% 더)
 
         # Load parameters
         control_rate = self.get_parameter('control_rate').value
@@ -97,13 +101,16 @@ class MotionControllerNode(Node):
         self.marker_reach_dist = self.get_parameter('marker_reach_distance').value
         self.marker_min_dist = self.get_parameter('marker_min_distance').value
         self.marker_lost_reach_dist = self.get_parameter('marker_lost_reach_distance').value
+        self.marker_align_threshold = self.get_parameter('marker_align_threshold').value
         self.advance_vx = self.get_parameter('advance_vx').value
+        self.advance_time = self.get_parameter('advance_time').value
         self.turn_wz = self.get_parameter('turn_wz').value
         self.turn_wz_min = self.get_parameter('turn_wz_min').value
         self.turn_tolerance = self.get_parameter('turn_tolerance').value
         self.turn_kp = self.get_parameter('turn_kp').value
         self.turn_kd = self.get_parameter('turn_kd').value
         self.turn_decel_zone = self.get_parameter('turn_decel_zone').value
+        self.turn_scale = self.get_parameter('turn_scale').value
 
         # PID controllers for lane following
         self.lane_vy_pid = PIDController(
@@ -146,6 +153,7 @@ class MotionControllerNode(Node):
         self._advance_target_distance = 0.0  # 전진할 거리
         self._advance_start_time = 0.0       # 전진 시작 시간
         self._advance_done_sent = False      # 완료 발행 여부
+
 
         # 로그 출력 주기 (1초마다)
         self._last_log_time = 0.0
@@ -240,7 +248,9 @@ class MotionControllerNode(Node):
                 self._prev_turn_error = 0.0
                 self._turn_done_sent = False
                 self.get_logger().info(f'TURN started: start_yaw={math.degrees(self._turn_start_yaw):.1f}deg, target={math.degrees(self._turn_target_rad):.1f}deg')
-        elif state in ('STOP', 'PARK', 'FINISH', 'ALIGN_TO_MARKER', 'STOP_BUMP'):
+        elif state == 'ALIGN_TO_MARKER':
+            self._mode = self.MODE_ALIGN
+        elif state in ('STOP', 'PARK', 'FINISH', 'STOP_BUMP'):
             self._mode = self.MODE_STOP
         else:
             self._mode = self.MODE_IDLE
@@ -258,8 +268,9 @@ class MotionControllerNode(Node):
             self._stop()
 
     def _turn_target_callback(self, msg):
-        """Handle turn target angle (using Int32 as degrees * 100)."""
-        self._turn_target_rad = msg.data / 100.0  # Convert from centidegrees
+        """Handle turn target angle (using Int32 as centiradians)."""
+        raw_rad = msg.data / 100.0  # Convert from centiradians
+        self._turn_target_rad = raw_rad * self.turn_scale  # 스케일 적용
 
     def _marker_callback(self, msg):
         """Handle tracked marker updates."""
@@ -299,6 +310,9 @@ class MotionControllerNode(Node):
 
         elif self._mode == self.MODE_TURN:
             cmd, error_x, error_y, error_yaw, detail = self._turn_control()
+
+        elif self._mode == self.MODE_ALIGN:
+            cmd, error_x, error_y, error_yaw, detail = self._align_to_marker()
 
         elif self._mode == self.MODE_STOP:
             detail = 'Stopped'
@@ -353,18 +367,26 @@ class MotionControllerNode(Node):
                 # 거리는 리셋하지 않음 - STOP_AT_MARKER에서 사용
                 return cmd, error_x, error_y, error_yaw, f'Reached marker {marker.id}'
 
-            # 마커 방향으로 주행
-            vx = self.marker_vx_kp * (distance - self.marker_min_dist)
-            vx = max(0.0, vx)
-            vy = self.marker_vy_kp * angle  # 횡방향 보정 ON
-            wz = 0.0  # 회전 OFF
-
-            cmd.linear.x = vx
-            cmd.linear.y = vy
-            cmd.angular.z = wz
-
             pred = 'pred' if not marker.is_detected else 'det'
-            detail = f'[MARKER] d={distance:.2f}m, a={math.degrees(angle):.1f}deg [{pred}]'
+
+            # 좌우 정렬 먼저, 그 다음 직진
+            if abs(angle) > self.marker_align_threshold:
+                # 좌우 오차가 크면 정렬만 (직진 없음)
+                vy = -self.marker_vy_kp * angle * 2.0  # 게인 2배
+                # 최소 속도 보장 (0.01)
+                if abs(vy) < 0.01 and abs(angle) > 0.05:
+                    vy = 0.01 if angle < 0 else -0.01
+                cmd.linear.y = vy
+                detail = f'[ALIGN] d={distance:.2f}m, a={math.degrees(angle):.1f}deg [{pred}]'
+            else:
+                # 정렬 완료 → 직진 + 미세 보정
+                vx = self.marker_vx_kp * (distance - self.marker_min_dist)
+                vx = max(0.0, vx)
+                vy = -self.marker_vy_kp * angle  # 부호 반전 (모터 방향 보정)
+                cmd.linear.x = vx
+                cmd.linear.y = vy
+                detail = f'[DRIVE] d={distance:.2f}m, a={math.degrees(angle):.1f}deg [{pred}]'
+
             return cmd, error_x, error_y, error_yaw, detail
 
         # 마커 없음 - 가까이 왔다가 사라지면 도달로 판정
@@ -377,9 +399,9 @@ class MotionControllerNode(Node):
             # 거리는 리셋하지 않음 - STOP_AT_MARKER에서 사용
             return cmd, error_x, error_y, error_yaw, f'Marker lost but reached'
 
-        # 마커 없음 → 저속 직진 (마커 찾을 때까지)
-        cmd.linear.x = self.lane_vx  # 저속 전진
-        return cmd, error_x, error_y, error_yaw, 'No marker - slow forward'
+        # 마커 없음 - 정지 대기
+        detail = f'No marker {self._target_marker_id}, waiting...'
+        return cmd, error_x, error_y, error_yaw, detail
 
     def _drive_with_marker_priority(self):
         """마커 우선 주행 (lane 없이 마커만 사용)."""
@@ -395,20 +417,15 @@ class MotionControllerNode(Node):
         return self._drive_with_marker_only()
 
     def _advance_to_center(self):
-        """마커 중심까지 전진 (시간 기반)."""
+        """마커 중심까지 전진 (고정 시간 기반)."""
         cmd = Twist()
         error_x = self._advance_target_distance
         error_y = 0.0
         error_yaw = 0.0
 
-        # 전진 속도 (파라미터 사용)
+        # 전진 속도 및 시간 (파라미터 사용)
         advance_vx = self.advance_vx
-
-        # 거리 / 속도 = 시간
-        if advance_vx > 0:
-            required_time = self._advance_target_distance / advance_vx
-        else:
-            required_time = 3.0  # fallback
+        required_time = self.advance_time  # 고정 시간 사용
 
         # 경과 시간
         now = self.get_clock().now().nanoseconds / 1e9
@@ -437,7 +454,44 @@ class MotionControllerNode(Node):
         if not hasattr(self, 'pub_align_done'):
             self.pub_align_done = self.create_publisher(Bool, '/mission/align_done', 10)
         self.pub_align_done.publish(msg)
-        self.get_logger().info('Advance to center complete')
+        self.get_logger().info('Alignment complete')
+
+    def _align_to_marker(self):
+        """Turn 후 마커 정렬 - 마커 보고 각도 맞추기."""
+        cmd = Twist()
+        error_x = 0.0
+        error_y = 0.0
+        error_yaw = 0.0
+
+        # 마커 확인
+        marker_ok = (self._tracked_marker is not None and
+                     self._tracked_marker.id == self._target_marker_id and
+                     (self._tracked_marker.is_detected or
+                      self._tracked_marker.prediction_confidence > 0.3))
+
+        if marker_ok:
+            marker = self._tracked_marker
+            angle = marker.angle
+            error_yaw = angle
+
+            # 정렬 완료 체크
+            if abs(angle) < self.marker_align_threshold:
+                self._publish_align_done()
+                return cmd, error_x, error_y, error_yaw, f'Aligned to marker {marker.id}'
+
+            # 좌우 정렬 (최소 속도 보장)
+            vy = -self.marker_vy_kp * angle * 3.0  # ALIGN 모드에서 게인 3배
+            if abs(vy) < 0.01 and abs(angle) > 0.05:  # 최소 속도 (0.01)
+                vy = 0.01 if angle < 0 else -0.01
+            cmd.linear.y = vy
+
+            pred = 'pred' if not marker.is_detected else 'det'
+            detail = f'[ALIGN] a={math.degrees(angle):.1f}deg [{pred}]'
+            return cmd, error_x, error_y, error_yaw, detail
+
+        # 마커 없음 - 정지 대기
+        detail = f'No marker {self._target_marker_id}, waiting...'
+        return cmd, error_x, error_y, error_yaw, detail
 
     def _turn_control(self):
         """In-place turn control (상대 회전 + PD 제어 + 오버슈팅 보정)."""
@@ -451,8 +505,8 @@ class MotionControllerNode(Node):
         if self._imu_data is None:
             return cmd, 0.0, 0.0, 0.0, 'No IMU data'
 
-        # 상대 회전량 계산: 현재 yaw - 시작 yaw
-        turned = self._current_yaw - self._turn_start_yaw
+        # 상대 회전량 계산 (부호 반전)
+        turned = -(self._current_yaw - self._turn_start_yaw)
 
         # Normalize to [-pi, pi]
         while turned > math.pi:
@@ -506,9 +560,9 @@ class MotionControllerNode(Node):
             # 너무 느리면 최소 속도 유지
             wz = self.turn_wz_min if error_yaw > 0 else -self.turn_wz_min
 
-        cmd.angular.z = wz
+        cmd.angular.z = -wz  # 모터 방향 보정
 
-        detail = f'Turn: tgt={math.degrees(self._turn_target_rad):.0f}, turned={math.degrees(turned):.1f}, err={math.degrees(error_yaw):.1f}, wz={wz:.2f}'
+        detail = f'Turn: tgt={math.degrees(self._turn_target_rad):.0f}, turned={math.degrees(turned):.1f}, err={math.degrees(error_yaw):.1f}, wz={-wz:.2f}'
 
         return cmd, 0.0, 0.0, error_yaw, detail
 

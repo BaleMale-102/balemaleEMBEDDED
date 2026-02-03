@@ -77,7 +77,7 @@ class MPU6050:
         self.bus.write_byte_data(self.address, self.SMPLRT_DIV, 0x07)  # 125Hz
 
         # DLPF (low pass filter)
-        self.bus.write_byte_data(self.address, self.CONFIG, 0x06)  # 5Hz bandwidth
+        self.bus.write_byte_data(self.address, self.CONFIG, 0x04)  # 21Hz bandwidth
 
         # Gyro config (±250°/s)
         self.bus.write_byte_data(self.address, self.GYRO_CONFIG, 0x00)
@@ -124,7 +124,7 @@ class ImuNode(Node):
         self.declare_parameter('frame_id', 'imu_link')
 
         self.declare_parameter('publish_rate_hz', 100.0)
-        self.declare_parameter('calib_samples', 200)
+        self.declare_parameter('calib_samples', 500)
 
         # Complementary filter
         self.declare_parameter('comp_alpha', 0.98)  # gyro weight
@@ -241,7 +241,7 @@ class ImuNode(Node):
         az = -az_raw
         gx = gy_raw
         gy = -gx_raw
-        gz = -gz_raw
+        gz = gz_raw  # yaw 방향 보정
 
         # Raw 메시지
         raw_msg = Imu()
