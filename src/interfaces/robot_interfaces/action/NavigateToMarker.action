@@ -1,0 +1,15 @@
+# Navigate to a target marker
+# Goal
+int32 target_marker_id
+float32 timeout_sec
+---
+# Result
+bool success
+string message
+float32 total_time
+---
+# Feedback
+string current_state
+int32 current_marker_id
+float32 distance_remaining
+float32 elapsed_time
