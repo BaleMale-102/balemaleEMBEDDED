@@ -230,20 +230,20 @@ class StateMachine:
         self._context = MissionContext()
         self._transitions: Dict[MissionState, Callable[[], Optional[MissionState]]] = {}
 
-        # Default timeout configuration
+        # Default timeout configuration (테스트용 - 타임아웃 비활성화)
         default_timeouts = {
             MissionState.STOP_AT_MARKER: 2.0,
             MissionState.ADVANCE_TO_CENTER: 0.5,
-            MissionState.ALIGN_TO_MARKER: 5.0,
+            # MissionState.ALIGN_TO_MARKER: 5.0,  # 비활성화
             MissionState.STOP_BUMP: 0.5,
-            MissionState.TURNING: 30.0,
-            MissionState.PARK: 30.0,
-            # Parking sub-state timeouts
-            MissionState.PARK_DETECT: 10.0,
-            MissionState.PARK_RECOVERY: 15.0,
-            MissionState.PARK_ALIGN_MARKER: 15.0,
-            MissionState.PARK_ALIGN_RECT: 10.0,
-            MissionState.PARK_FINAL: 10.0,
+            # MissionState.TURNING: 30.0,  # 비활성화
+            # MissionState.PARK: 30.0,  # 비활성화
+            # Parking sub-state timeouts - 비활성화
+            # MissionState.PARK_DETECT: 10.0,
+            # MissionState.PARK_RECOVERY: 15.0,
+            # MissionState.PARK_ALIGN_MARKER: 15.0,
+            # MissionState.PARK_ALIGN_RECT: 10.0,
+            # MissionState.PARK_FINAL: 10.0,
             # Full mission timeouts
             MissionState.RECOGNIZE: 30.0,
             MissionState.LOAD: 30.0,
@@ -330,9 +330,11 @@ class StateMachine:
         self._context.task_id = task_id
         self._context.task_type = task_type
 
-        # If final goal is a parking slot, store it
+        # If final goal is a parking slot, store it and set task_type
         if get_slot_zone(final_goal_id) is not None:
             self._context.parking.target_slot_id = final_goal_id
+            if not task_type:
+                self._context.task_type = 'PARK'
 
         self._change_state(MissionState.DRIVE)
 
@@ -656,7 +658,10 @@ class StateMachine:
     def _turning_transition(self) -> Optional[MissionState]:
         if self._context.turn_complete:
             self._context.advance_waypoint()
-            return MissionState.DRIVE
+            # If next target is a parking slot, go directly to PARK_DETECT
+            if self._context.is_last_waypoint and self._context.task_type in ('PARK', 'DROPOFF'):
+                return MissionState.PARK_DETECT
+            return MissionState.ALIGN_TO_MARKER
         return None
 
     def _park_legacy_transition(self) -> Optional[MissionState]:

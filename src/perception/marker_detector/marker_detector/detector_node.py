@@ -141,9 +141,10 @@ class MarkerDetectorNode(Node):
                 except Exception as e:
                     self.get_logger().error(f'Debug image error: {e}')
 
-            # 디버그 창 표시
+            # 디버그 창 표시 (노드 이름으로 구분)
             if self.show_debug_window:
-                cv2.imshow('Marker Detector', debug_image)
+                window_name = f'Marker Detector - {self.get_name()}'
+                cv2.imshow(window_name, debug_image)
                 cv2.waitKey(1)
 
     def _publish_markers(self, markers, stamp):

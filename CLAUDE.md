@@ -8,7 +8,7 @@
 - **시스템 유형**: 주차 로봇 (TARGET 차량을 적재/하역하는 로봇)
 - **현재 상태**: 라인 인식 비활성화, 마커 전용 주행
 - **풀 미션 플로우**: WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → PARK → UNLOAD → RETURN_HOME → WAIT_VEHICLE
-- **주차 시스템**: PARK_DETECT → PARK_ALIGN_MARKER → PARK_ALIGN_RECT → PARK_FINAL (side_cam + 노란 직사각형)
+- **주차 시스템**: PARK_DETECT → PARK_ALIGN_MARKER → PARK_FINAL (side_cam 마커 전용, slot_line 비활성화)
 - **완료된 과제**: IMU 기반 Turn, ALIGN 모드, ANPR+장애물 검출 통합, Side Camera 주차 시스템, Loader 드라이버
 - **ANPR 노드**: 별도 conda 환경(anpr_310)에서 실행 - balemaleAI 의존
 ---
@@ -20,14 +20,16 @@ balemaleEMBEDDED/
 ├── Arduino/Motor/
 │   └── Arduino_MoebiusTech_v2.ino    # 메카넘 휠 펌웨어
 ├── config/
-│   └── cam_front_calib.yaml          # 카메라 캘리브레이션 (원본)
+│   ├── cam_front_calib.yaml          # 전방 카메라 캘리브레이션 (원본)
+│   └── cam_side_calib.yaml           # 측면 카메라 캘리브레이션 (원본)
 ├── teleop.py                         # 수동 제어 스크립트
 └── src/
     ├── bringup/robot_bringup/        # Launch 및 설정
     │   ├── config/
     │   │   ├── robot_params.yaml     # 전체 파라미터
     │   │   ├── marker_map.yaml       # 마커 맵
-    │   │   └── cam_front_calib.yaml  # 카메라 캘리브레이션
+    │   │   ├── cam_front_calib.yaml  # 전방 카메라 캘리브레이션
+    │   │   └── cam_side_calib.yaml   # 측면 카메라 캘리브레이션
     │   └── launch/
     │       ├── system.launch.py      # 진입점 (sensors + robot)
     │       ├── sensors.launch.py     # 센서 노드
@@ -40,7 +42,7 @@ balemaleEMBEDDED/
     ├── perception/
     │   ├── marker_detector/          # ArUco 마커 검출 (front + side)
     │   ├── marker_tracker/           # Kalman 필터 추적
-    │   ├── slot_line_detector/       # 노란 직사각형 검출 (주차용)
+    │   ├── slot_line_detector/       # 노란 직사각형 검출 (비활성화 - 카메라 거리 문제)
     │   ├── anpr_detector/            # 번호판/장애물 검출 (balemaleAI)
     │   └── lane_detector/            # 차선 검출 (비활성화)
     ├── control/
@@ -65,7 +67,7 @@ balemaleEMBEDDED/
 | marker_detector | detector_node | marker_detector | robot |
 | marker_detector | detector_node | side_marker_detector | robot |
 | marker_tracker | tracker_node | marker_tracker | robot |
-| slot_line_detector | detector_node | slot_line_detector | robot |
+| slot_line_detector | detector_node | slot_line_detector | **비활성화** |
 | anpr_detector | detector_node | anpr_detector | **별도 (conda anpr_310)** |
 | motion_controller | controller_node | motion_controller | robot |
 | loader_driver | loader_node | loader_driver | robot |
@@ -78,9 +80,9 @@ balemaleEMBEDDED/
 
 ### Marker.msg
 ```
+std_msgs/Header header    # 타임스탬프 및 프레임
 int32 id                  # 마커 ID
-geometry_msgs/Point position   # 위치 (카메라 프레임)
-geometry_msgs/Quaternion orientation  # 방향
+geometry_msgs/Pose pose   # 3D 포즈 (카메라 프레임)
 float32 distance          # 거리 (m)
 float32 angle             # 각도 (rad)
 float32 confidence        # 검출 신뢰도 (0~1)
@@ -94,13 +96,14 @@ Marker[] markers          # 검출된 마커 배열
 
 ### TrackedMarker.msg
 ```
-int32 id                  # 마커 ID
-geometry_msgs/Pose pose   # 현재 추정 포즈
+std_msgs/Header header             # 타임스탬프 및 프레임
+int32 id                           # 마커 ID
+geometry_msgs/Pose pose            # 현재 추정 포즈
 geometry_msgs/Pose predicted_pose  # 예측 포즈 (0.5s ahead)
 geometry_msgs/Vector3 velocity     # 속도
-float32 distance          # 거리 (m)
-float32 angle             # 각도 (rad)
-bool is_detected          # 현재 검출 여부
+float32 distance                   # 거리 (m)
+float32 angle                      # 각도 (rad)
+bool is_detected                   # 현재 검출 여부
 float32 prediction_confidence      # 예측 신뢰도
 float32 tracking_duration          # 추적 지속 시간
 float32 time_since_detection       # 마지막 검출 후 경과 시간
@@ -240,6 +243,43 @@ string message                # 응답 메시지
 
 ---
 
+## 커스텀 서비스 (robot_interfaces)
+
+### SetTargetMarker.srv
+```
+# Request
+int32 marker_id               # 추적/내비게이션 대상 마커 ID
+---
+# Response
+bool success                  # 성공 여부
+string message                # 결과 메시지
+```
+
+### GetRobotState.srv
+```
+# Request (empty)
+---
+# Response
+string state                  # 현재 FSM 상태
+int32 current_marker_id       # 현재 마커 ID
+float32 x                     # 추정 X 위치
+float32 y                     # 추정 Y 위치
+float32 yaw                   # 추정 Yaw 각도
+float32 battery_voltage       # 배터리 전압
+```
+
+### SetRoute.srv
+```
+# Request
+int32[] marker_ids            # 마커 ID 시퀀스 (경로)
+---
+# Response
+bool success                  # 성공 여부
+string message                # 결과 메시지
+```
+
+---
+
 ## 토픽 목록
 
 ### 센서 (Sensors)
@@ -291,14 +331,99 @@ string message                # 응답 메시지
 | `/control/cmd_vel` | Twist | motion_controller | arduino_driver |
 | `/driving/state` | DrivingState | motion_controller | server_bridge |
 
-### 서버 통신 (MQTT)
-| 토픽 | 타입 | 발행자 | 구독자 |
-|------|------|--------|--------|
+### 서버 통신 (MQTT - balemale backend)
+| ROS 토픽 | 타입 | 발행자 | 구독자 |
+|----------|------|--------|--------|
 | `/server/task_cmd` | MissionCommand | server_bridge | mission_manager |
 | `/server/task_status` | MissionStatus | mission_manager | server_bridge |
-| `/control/drive_cmd_emergency` | Twist | server_bridge | - |
 | `/plate/query` | PlateQuery | mission_manager | server_bridge |
 | `/plate/response` | PlateResponse | server_bridge | mission_manager |
+
+#### MQTT 토픽 (balemale/robot/{robotId}/...)
+| MQTT 토픽 | 방향 | 설명 |
+|-----------|------|------|
+| `balemale/robot/{id}/cmd` | Subscribe | 서버 명령 (type 1:배차, 2:재경로, 3:출차) |
+| `balemale/robot/{id}/map` | Subscribe | 노드 맵 정보 (type 4) |
+| `balemale/robot/{id}/cmd/ack` | Subscribe | 서버의 요청 수신 확인 |
+| `balemale/robot/{id}/request/dispatch` | Publish | 배차 요청 (번호판 인식 시) |
+| `balemale/robot/{id}/request/reroute` | Publish | 재경로 요청 (장애물 감지 시) |
+| `balemale/robot/{id}/event` | Publish | 로봇 이벤트 (상태 변경) |
+| `balemale/robot/{id}/anomaly` | Publish | 이상 탐지 보고 (사람, 장애물) |
+| `balemale/robot/{id}/ack` | Publish | 서버 명령 수신 확인 |
+| `balemale/robot/{id}/heartbeat` | Publish | 하트비트 |
+
+#### eventType 종류
+| 값 | 설명 |
+|----|------|
+| `LOADING` | 차량 적재/하역 중 |
+| `MOVING` | 이동 중 |
+| `PARKED` | 주차 완료 |
+| `ESTOP` | 긴급 정지 |
+
+#### anomalyType 종류
+| 값 | 설명 |
+|----|------|
+| `HUMAN` | 사람 감지 |
+| `OBSTACLE` | 장애물 감지 |
+| `SYSTEM` | 시스템 오류 |
+
+#### MQTT 페이로드 형식
+**배차 요청 (dispatch request):**
+```json
+{
+  "reqId": "req-001",
+  "plate": "12가3456",
+  "nowNodeId": 0,
+  "targetLocation": "DESTINATION",
+  "ts": "2026-01-27T10:40:00"
+}
+```
+
+**서버 명령 (cmd type 1 - 배차 결과):**
+```json
+{
+  "type": "1",
+  "reqId": "req-001",
+  "cmdId": "400c09d1-d181-4438-b1e8-2f244466000a",
+  "payload": {
+    "vehicleId": 1,
+    "targetNodeId": 17,
+    "path": [0, 1, 5, 17]
+  }
+}
+```
+
+**로봇 이벤트:**
+```json
+{
+  "reqId": "req-001",
+  "vehicleId": 1,
+  "eventType": "LOADING",
+  "ts": "2026-01-27T10:40:00"
+}
+```
+
+**이상 탐지 보고 (anomaly):**
+```json
+{
+  "reqId": "req-001",
+  "vehicleId": 1,
+  "eventType": "ESTOP",
+  "anomalyType": "HUMAN",
+  "edgeId": 1,
+  "nowNodeId": 4,
+  "nextNodeId": 5,
+  "ts": "2026-01-27T10:40:00"
+}
+```
+
+**ACK 송신 (로봇 → 서버):**
+```json
+{
+  "cmdId": "400c09d1-d181-4438-b1e8-2f244466000a",
+  "isAck": true
+}
+```
 
 ### 적재 (Loader)
 | 토픽 | 타입 | 발행자 | 구독자 |
@@ -313,19 +438,22 @@ string message                # 응답 메시지
 ### 센서 드라이버
 ```yaml
 /cam_front:
-  device: "/dev/video0"
+  device: "/dev/video0"       # 환경에 따라 다름 (launch 인자로 변경 가능)
   width: 640
   height: 480
   fps: 30.0
   frame_id: "camera_front"
+  camera_name: "cam_front"
   calibration_file: "cam_front_calib.yaml"
 
 /cam_side:
-  device: "/dev/video4"
+  device: "/dev/video2"       # 환경에 따라 다름 (launch 인자로 변경 가능)
   width: 640
   height: 480
   fps: 30.0
   frame_id: "camera_side"
+  camera_name: "cam_side"
+  calibration_file: "cam_side_calib.yaml"
 
 /arduino_driver:
   port: "/dev/ttyUSB0"
@@ -359,10 +487,14 @@ string message                # 응답 메시지
   dictionary: "DICT_4X4_50"
   marker_size: 0.04           # 4cm
   publish_debug_image: true
+  image_topic: "/cam_front/image_raw"
+  camera_info_topic: "/cam_front/camera_info"
+  frame_id: "camera_front_link"
 
 /side_marker_detector:
   dictionary: "DICT_4X4_50"
   marker_size: 0.04           # 4cm
+  publish_debug_image: true
   image_topic: "/cam_side/image_raw"
   camera_info_topic: "/cam_side/camera_info"
   output_topic: "/perception/side_markers"
@@ -372,6 +504,7 @@ string message                # 응답 메시지
   process_noise: 0.01
   measurement_noise: 0.05
   prediction_timeout: 2.0
+  min_prediction_confidence: 0.3
   camera_offset_x: 0.10       # 카메라→base_link 전방 오프셋
 
 /anpr_detector:
@@ -384,11 +517,18 @@ string message                # 응답 메시지
   image_topic: "/cam_side/image_raw"
   output_topic: "/perception/slot_rect"
   publish_debug_image: true
-  # HSV thresholds (노란색)
-  hsv_low: [20, 100, 100]
-  hsv_high: [35, 255, 255]
+  show_debug_window: false
+  # HSV thresholds (노란색) - 개별 값으로 설정
+  hsv_low_h: 20
+  hsv_low_s: 100
+  hsv_low_v: 100
+  hsv_high_h: 35
+  hsv_high_s: 255
+  hsv_high_v: 255
   min_area: 500
   max_area: 50000
+  min_aspect_ratio: 0.3
+  max_aspect_ratio: 3.0
   pixel_to_meter: 0.001           # 픽셀→미터 변환
 ```
 
@@ -408,7 +548,7 @@ string message                # 응답 메시지
   marker_lost_reach_distance: 0.35
   marker_align_threshold: 0.1   # 좌우 정렬 임계값 (rad, ~6도) - 이 이상이면 정렬 먼저
   advance_vx: 0.02
-  advance_time: 0.7           # ADVANCE_TO_CENTER 고정 전진 시간 (초, 상향됨)
+  advance_time: 0.8           # ADVANCE_TO_CENTER 고정 전진 시간 (초)
   # Turn (PD 제어)
   turn_wz: 0.06               # 최대 회전 속도 (상향됨)
   turn_wz_min: 0.0225         # 최소 회전 속도 (상향됨)
@@ -451,7 +591,7 @@ string message                # 응답 메시지
   # State timeouts (초과 시 ERROR)
   timeout_stop_at_marker: 2.0
   timeout_advance_to_center: 2.0
-  timeout_align_to_marker: 5.0
+  timeout_align_to_marker: 10.0    # VY+WZ+탐색 포함 (상향됨)
   timeout_stop_bump: 0.5
   timeout_turning: 30.0
   timeout_park: 30.0
@@ -471,10 +611,13 @@ string message                # 응답 메시지
   delay_stop_bump: 0.3
 
 /server_bridge:
-  mqtt_host: "localhost"
-  mqtt_port: 1883
-  car_id: "car_01"
-  status_rate: 2.0
+  mqtt_host: "43.202.0.116"         # EC2 서버 호스트 (http:// 없이)
+  mqtt_port: 8000             # balemale backend 포트
+  mqtt_username: ""
+  mqtt_password: ""
+  robot_id: 1                 # MQTT 토픽용 로봇 ID
+  heartbeat_rate: 1.0         # 하트비트 주기 (Hz)
+  status_rate: 2.0            # 상태 전송 주기 (Hz)
 ```
 
 ---
@@ -595,7 +738,7 @@ PARK_DETECT → PARK_ALIGN_MARKER → PARK_ALIGN_RECT → PARK_FINAL
 | ADVANCE_TO_CENTER | 마커 중심으로 전진 | 2.0s | → STOP_BUMP / ERROR |
 | STOP_BUMP | 관성 안정화 | 0.5s | → TURNING / PARK |
 | TURNING | 제자리 회전 | 30.0s | → ALIGN_TO_MARKER |
-| ALIGN_TO_MARKER | Turn 후 마커 정렬 | 5.0s | → DRIVE |
+| ALIGN_TO_MARKER | Turn 후 마커 정렬 | 10.0s | → DRIVE |
 | FINISH | 완료 | - | - |
 | ERROR | 오류 | - | - |
 
@@ -668,9 +811,9 @@ y=187  10------11------12------13------14------15      ← 하단
 
 ```
 odom (static)
-└── base_link
-    ├── camera_front (0.10m 전방, 0.01m 상)
-    ├── camera_side (0.05m 우측, 0.03m 상, yaw -90°)
+└── base_link (IMU 위치)
+    ├── camera_front (0.10m 전방, 0.0005m 우측, 0.04m 상, yaw 0°)
+    ├── camera_side (0.10m 좌측, 0.075m 하, yaw +90°)
     └── imu_link (동일 위치)
 ```
 
@@ -781,24 +924,23 @@ SLOT_GROUPS = {
 ```
 
 ### Side Camera 좌표 변환
-Side camera는 base_link에서 5cm 우측, yaw=-90° 장착
+Side camera는 base_link에서 10cm 좌측, yaw=+90° 장착
 ```
 Side Camera Frame:        Robot Frame:
-  Z (forward) ─────────→ -Y (왼쪽)
-  X (right)   ─────────→  X (전방)
+  Z (forward) ─────────→ +Y (좌측)
+  X (right)   ─────────→ -X (후방)
   Y (down)    ─────────→ -Z (아래)
 ```
 
-### 마커 검출 해석 (side camera)
-- `marker.distance` = 차량과 마커 간 **측면 거리** (좌우)
-- `marker.angle` = **전후방 오프셋** (angle > 0: 차가 마커보다 앞에 있음)
+### 마커 검출 해석 (side camera, 좌측 장착)
+- `marker.distance` = 차량과 마커 간 **측면 거리** (좌측)
+- `marker.angle` = **전후방 오프셋** (angle > 0: 차가 마커보다 **뒤에** 있음 → 전진 필요)
 
-### 제어 매핑
+### 제어 매핑 (좌측 카메라)
 | 상태 | 센서 | 오차 | 제어 |
 |------|------|------|------|
-| PARK_ALIGN_MARKER | side_marker.angle | 전후 오차 | vx (전진/후진) |
-| PARK_ALIGN_RECT | slot_rect.center_offset_x | 좌우 오차 | vy (횡이동) |
-| PARK_FINAL | side_marker.distance | 거리 오차 | vy (측면 이동) |
+| PARK_ALIGN_MARKER | side_marker.angle | 전후 오차 | vx = +kp * angle (전진/후진) |
+| PARK_FINAL | side_marker.distance | 거리 오차 | vy = -kp * error (좌측으로 이동) |
 
 ### 슬롯 검증 로직
 ```python
@@ -818,7 +960,7 @@ def is_same_zone(detected_id, target_id):
 
 ```bash
 # 빌드 (메인 시스템)
-cd ~/balemaleEMBEDDED_redesign
+cd ~/balemaleEMBEDDED
 colcon build
 source install/setup.bash
 
@@ -835,7 +977,7 @@ ros2 launch robot_bringup system.launch.py cam_front_dev:=/dev/video1
 ```bash
 # 터미널 2에서 실행
 conda activate anpr_310
-cd ~/balemaleEMBEDDED_redesign
+cd ~/balemaleEMBEDDED
 
 # 빌드 (처음 한번, setuptools 58.2.0 필요)
 pip install setuptools==58.2.0
@@ -852,9 +994,10 @@ ros2 run anpr_detector detector_node --ros-args -p show_debug_window:=true
 |------|--------|------|
 | simulation | false | 시뮬레이션 모드 |
 | show_debug | true | 디버그 창 표시 |
-| cam_front_dev | /dev/video0 | 전방 카메라 |
-| cam_side_dev | /dev/video4 | 측면 카메라 |
-| arduino_port | /dev/ttyUSB0 | Arduino 포트 |
+| cam_front_dev | /dev/video0 | 전방 카메라 (C920) |
+| cam_side_dev | /dev/video2 | 측면 카메라 (Brio 100) |
+| arduino_port | /dev/ttyUSB0 | 모터 Arduino 포트 |
+| loader_port | /dev/ttyUSB1 | Loader Arduino 포트 |
 
 ---
 
@@ -937,6 +1080,9 @@ from robot_interfaces.msg import Detection, DetectionArray
 from robot_interfaces.msg import SlotLineStatus, ParkingStatus  # 주차용
 from robot_interfaces.msg import LoaderCommand, LoaderStatus   # 적재용
 from robot_interfaces.msg import PlateQuery, PlateResponse     # 서버 통신
+
+# 서비스 import
+from robot_interfaces.srv import SetTargetMarker, GetRobotState, SetRoute
 ```
 
 ### 좌표 변환 (OpenCV → ROS)

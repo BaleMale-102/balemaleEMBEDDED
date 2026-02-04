@@ -725,18 +725,19 @@ class MotionControllerNode(Node):
                     self._post_turn_search_direction = self._turn_direction
                     self.get_logger().info(f'Marker not found - searching in turn direction (dir={self._post_turn_search_direction})')
 
-            # Check timeout
+            # Track elapsed time (no timeout - keep searching)
             search_elapsed = now - self._post_turn_search_start_time
-            if search_elapsed > self._post_turn_search_timeout:
-                # Timeout - give up and let manager handle
-                self._publish_align_done()
-                return cmd, error_x, error_y, error_yaw, f'Search timeout, giving up'
 
-            # Slow rotation to find marker
-            wz = self.turn_wz_min * 0.7 * self._post_turn_search_direction
+            # Progressive rotation speed - starts slow, increases over time
+            # Base: turn_wz_min, ramps up to turn_wz over 5 seconds
+            base_wz = self.turn_wz_min
+            max_wz = self.turn_wz
+            ramp_time = 5.0  # seconds to reach max speed
+            ramp_factor = min(1.0, search_elapsed / ramp_time)
+            wz = (base_wz + (max_wz - base_wz) * ramp_factor) * self._post_turn_search_direction
             cmd.angular.z = -wz  # Negate for motor direction
 
-            detail = f'[SEARCH] dir={self._post_turn_search_direction}, elapsed={search_elapsed:.1f}s'
+            detail = f'[SEARCH] dir={self._post_turn_search_direction}, wz={abs(wz):.3f}, elapsed={search_elapsed:.1f}s'
             return cmd, error_x, error_y, error_yaw, detail
 
         # ========================================
@@ -759,13 +760,17 @@ class MotionControllerNode(Node):
             self._last_stall_check_time = now
 
         # ========================================
+        # Alignment thresholds (strict)
+        # ========================================
+        vy_threshold = self.marker_align_threshold  # ~6deg for VY phase
+        wz_threshold = self.marker_align_threshold * 0.5  # ~3deg for final check
+        switch_threshold = self.marker_align_threshold * 0.8  # threshold to switch phases
+
+        # ========================================
         # Phase 1: VY alignment (좌우 이동)
         # ========================================
         if self._align_phase == 'VY':
-            # VY alignment threshold (slightly relaxed for first phase)
-            vy_threshold = self.marker_align_threshold * 1.2
-
-            if abs(angle) < vy_threshold:
+            if abs(angle) < switch_threshold:
                 # VY phase done, move to WZ
                 self._align_phase = 'WZ'
                 self._align_vy_done = True
@@ -804,14 +809,25 @@ class MotionControllerNode(Node):
         # Phase 2: WZ alignment (회전 미세 조정)
         # ========================================
         if self._align_phase == 'WZ':
-            # Final alignment check
-            if abs(angle) < self.marker_align_threshold * 0.7:
-                self._publish_align_done()
-                return cmd, error_x, error_y, error_yaw, f'Aligned to marker {marker.id}'
+            # Final alignment check - both VY and WZ must be aligned
+            if abs(angle) < wz_threshold:
+                # Check if stable for a short time
+                if not hasattr(self, '_align_stable_start'):
+                    self._align_stable_start = now
+                elif now - self._align_stable_start > 0.3:  # Stable for 0.3s
+                    self._publish_align_done()
+                    delattr(self, '_align_stable_start')
+                    return cmd, error_x, error_y, error_yaw, f'Aligned to marker {marker.id}'
+            else:
+                # Reset stable timer if not aligned
+                if hasattr(self, '_align_stable_start'):
+                    delattr(self, '_align_stable_start')
 
-            # If angle drifted too much, go back to VY
-            if abs(angle) > self.marker_align_threshold * 1.5:
+            # If angle drifted, go back to VY
+            if abs(angle) > vy_threshold:
                 self._align_phase = 'VY'
+                self._stall_wz_boost = 0.0
+                self._consecutive_stalls = 0
                 self.get_logger().info(f'Angle drifted ({math.degrees(angle):.1f}deg), back to VY phase')
                 return self._align_to_marker()  # Recursive call for VY
 
@@ -1053,15 +1069,15 @@ class MotionControllerNode(Node):
             detail = f'Marker aligned, angle={math.degrees(angle):.1f}deg'
             return cmd, error_x, error_y, error_yaw, detail
 
-        # Control: angle -> vx
-        # Negative angle = car behind marker = need forward
-        # Positive angle = car ahead of marker = need backward
-        vx = -self.park_align_kp * angle
+        # Control: angle -> vx (좌측 카메라, yaw=+90°)
+        # Positive angle = car behind marker = need forward
+        # Negative angle = car ahead of marker = need backward
+        vx = self.park_align_kp * angle
         vx = self._clamp(vx, -self.park_max_vx, self.park_max_vx)
 
         # Minimum speed
         if abs(vx) < self.park_min_speed and abs(angle) > self.park_marker_threshold * 0.5:
-            vx = self.park_min_speed if angle < 0 else -self.park_min_speed
+            vx = self.park_min_speed if angle > 0 else -self.park_min_speed
 
         cmd.linear.x = vx
 
@@ -1149,15 +1165,15 @@ class MotionControllerNode(Node):
             detail = f'Final complete, dist={distance*100:.1f}cm'
             return cmd, error_x, error_y, error_yaw, detail
 
-        # Control: distance error -> vy
-        # error > 0 = too far from marker = need to move right (toward marker, +vy)
-        # error < 0 = too close to marker = need to move left (away, -vy)
-        vy = self.park_final_kp * error
+        # Control: distance error -> vy (좌측 카메라, 마커가 왼쪽에 있음)
+        # error > 0 = too far from marker = need to move left (toward marker, -vy)
+        # error < 0 = too close to marker = need to move right (away, +vy)
+        vy = -self.park_final_kp * error
         vy = self._clamp(vy, -self.park_max_vy, self.park_max_vy)
 
         # Minimum speed
         if abs(vy) < self.park_min_speed and abs(error) > self.park_distance_threshold * 0.5:
-            vy = self.park_min_speed if error > 0 else -self.park_min_speed
+            vy = -self.park_min_speed if error > 0 else self.park_min_speed
 
         cmd.linear.y = vy
 

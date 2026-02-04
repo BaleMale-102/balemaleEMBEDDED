@@ -96,18 +96,19 @@ class MissionManagerNode(Node):
         auto_start_waiting = self.get_parameter('auto_start_waiting').value
 
         # Build timeout/delay configs for state machine
+        # 테스트용: 주행/주차 관련 타임아웃 비활성화 (0 = 무제한)
         timeouts = {
             'STOP_AT_MARKER': self.get_parameter('timeout_stop_at_marker').value,
             'ADVANCE_TO_CENTER': self.get_parameter('timeout_advance_to_center').value,
-            'ALIGN_TO_MARKER': self.get_parameter('timeout_align_to_marker').value,
+            'ALIGN_TO_MARKER': 0,  # 비활성화
             'STOP_BUMP': self.get_parameter('timeout_stop_bump').value,
-            'TURNING': self.get_parameter('timeout_turning').value,
-            'PARK': self.get_parameter('timeout_park').value,
-            'PARK_DETECT': self.get_parameter('timeout_park_detect').value,
-            'PARK_RECOVERY': self.get_parameter('timeout_park_recovery').value,
-            'PARK_ALIGN_MARKER': self.get_parameter('timeout_park_align_marker').value,
-            'PARK_ALIGN_RECT': self.get_parameter('timeout_park_align_rect').value,
-            'PARK_FINAL': self.get_parameter('timeout_park_final').value,
+            'TURNING': 0,  # 비활성화
+            'PARK': 0,  # 비활성화
+            'PARK_DETECT': 0,  # 비활성화
+            'PARK_RECOVERY': 0,  # 비활성화
+            'PARK_ALIGN_MARKER': 0,  # 비활성화
+            'PARK_ALIGN_RECT': 0,  # 비활성화
+            'PARK_FINAL': 0,  # 비활성화
             'RECOGNIZE': self.get_parameter('timeout_recognize').value,
             'LOAD': self.get_parameter('timeout_load').value,
             'UNLOAD': self.get_parameter('timeout_unload').value,
@@ -437,6 +438,14 @@ class MissionManagerNode(Node):
             # Start waiting for vehicle
             self.fsm.start_waiting()
             self.get_logger().info('Started waiting for vehicle')
+        elif cmd.startswith('START_FULL'):
+            # START_FULL 1,3,9 17 - waypoints then slot
+            parts = cmd.split()
+            if len(parts) >= 3:
+                waypoints = [int(x) for x in parts[1].split(',')]
+                slot_id = int(parts[2])
+                self.fsm.start_mission(waypoints, slot_id, 'test_full', 'PARK')
+                self.get_logger().info(f'Full mission started: {waypoints} -> slot {slot_id}')
         elif cmd.startswith('START_PARK'):
             parts = cmd.split()
             if len(parts) > 1:
@@ -450,7 +459,7 @@ class MissionManagerNode(Node):
                 if len(ids) >= 1:
                     waypoints = ids[:-1]
                     goal = ids[-1]
-                    self.fsm.start_mission(waypoints, goal, 'test', 'TEST')
+                    self.fsm.start_mission(waypoints, goal, 'test', '')
                     self.get_logger().info(f'Test mission started: {waypoints} -> {goal}')
         elif cmd == 'STOP':
             self.fsm.cancel_mission()

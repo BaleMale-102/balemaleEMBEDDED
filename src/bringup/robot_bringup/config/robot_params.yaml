@@ -17,14 +17,14 @@
 
 /cam_side:
   ros__parameters:
-    device: "/dev/video4"
+    device: "/dev/video2"
     width: 640
     height: 480
     fps: 30.0
     frame_id: "camera_side"
     camera_name: "cam_side"
     simulate: false
-    calibration_file: ""
+    calibration_file: "cam_side_calib.yaml"
 
 /arduino_driver:
   ros__parameters:
@@ -155,7 +155,7 @@
     marker_lost_reach_distance: 0.35
     marker_align_threshold: 0.1  # 좌우 정렬 임계값 (rad, ~8.5도) - 이 이상이면 정렬 먼저
     advance_vx: 0.02              # ADVANCE_TO_CENTER 전진 속도 (max_vx로 clamp됨)
-    advance_time: 0.7             # ADVANCE_TO_CENTER 고정 전진 시간 (초)
+    advance_time: 0.2             # ADVANCE_TO_CENTER 고정 전진 시간 (초)
     # Turn (PD 제어 + 오버슈팅 보정)
     turn_wz: 0.06                 # 최대 회전 속도 (rad/s)
     turn_wz_min: 0.0225           # 최소 회전 속도
@@ -221,10 +221,14 @@
 
 /server_bridge:
   ros__parameters:
-    mqtt_host: "localhost"
-    mqtt_port: 1883
+    # MQTT broker (EC2 server)
+    mqtt_host: "43.202.0.116"
+    mqtt_port: 8000                 # balemale backend port
     mqtt_username: ""
     mqtt_password: ""
-    car_id: "car_01"
+    # Robot identification
+    robot_id: 1                     # Robot ID for MQTT topics (balemale/robot/{robot_id}/...)
     simulation: false
-    status_rate: 2.0
+    # Publish rates
+    heartbeat_rate: 1.0             # Heartbeat frequency (Hz)
+    status_rate: 2.0                # Status update frequency (Hz)
