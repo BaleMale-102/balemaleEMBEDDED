@@ -240,6 +240,11 @@ class MissionManagerNode(Node):
             String, '/mission/test_cmd', self._test_cmd_callback, 10
         )
 
+        # Map update subscriber (from server_bridge)
+        self.sub_map_updated = self.create_subscription(
+            Bool, '/server/map_updated', self._map_updated_callback, 10
+        )
+
         # Update timer
         self.timer = self.create_timer(1.0 / update_rate, self._update_callback)
 
@@ -699,6 +704,16 @@ class MissionManagerNode(Node):
 
         except Exception as e:
             self.get_logger().error(f'Failed to load marker map: {e}')
+
+    def _map_updated_callback(self, msg: Bool):
+        """Handle map update notification from server_bridge."""
+        if msg.data:
+            self.get_logger().info('Map update received, reloading marker map...')
+            # Clear existing map
+            self._marker_positions.clear()
+            self._marker_yaw.clear()
+            # Reload from file
+            self._load_marker_map()
 
     def _update_heading_from_path(self, from_marker: int, to_marker: int):
         """Update current heading based on travel direction between markers."""

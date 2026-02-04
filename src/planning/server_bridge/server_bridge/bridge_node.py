@@ -11,37 +11,39 @@ MQTT Topics (balemale format):
     balemale/robot/{robotId}/map - Map/node info (type 4)
     balemale/robot/{robotId}/cmd/ack - Server ACK for our requests
   Publishes:
-    balemale/robot/{robotId}/request/dispatch - Dispatch request (plate query)
-    balemale/robot/{robotId}/request/reroute - Reroute request (obstacle)
-    balemale/robot/{robotId}/event - Robot events (status updates)
-    balemale/robot/{robotId}/anomaly - Anomaly detection
-    balemale/robot/{robotId}/ack - ACK for server commands
-    balemale/robot/{robotId}/heartbeat - Heartbeat
+    balemale/robot/{robotId}/request/dispatch - Dispatch request (plate query)  // plate num
+    balemale/robot/{robotId}/request/reroute - Reroute request (obstacle)       // 
+    balemale/robot/{robotId}/event - Robot events (status updates)              // status 바뀔때마다 발행
+    balemale/robot/{robotId}/anomaly - Anomaly detection                        // 아직 구현안됨
+    balemale/robot/{robotId}/ack - ACK for server commands                      // 백엔드에서 ack처리안한다고함
+    balemale/robot/{robotId}/heartbeat - Heartbeat                              //
 
 ROS2 Topics:
   Subscribes:
-    /server/task_status: MissionStatus - Task status to forward as event
-    /plate/query: PlateQuery - Plate query to forward as dispatch request
-    /mission/state: String - Mission state changes
+    /server/task_status: MissionStatus - Task status to forward as event    // msg 존재함
+    /plate/query: PlateQuery - Plate query to forward as dispatch request   // plate 인식 결과
+    /mission/state: String - Mission state changes                          // fsm state(controller에서 쓰임)
   Publishes:
-    /server/task_cmd: MissionCommand - Task command from server
-    /plate/response: PlateResponse - Plate verification result
+    /server/task_cmd: MissionCommand - Task command from server             //  경로 + goal slot
+    /plate/response: PlateResponse - Plate verification result              //  
 """
 
 import json
+import os
 import time
 import uuid
 import threading
 from datetime import datetime
 from typing import Any, Dict, Optional, Callable
 
+import yaml
 import rclpy
 from rclpy.node import Node
 
 import paho.mqtt.client as mqtt
 
 # Standard ROS msgs
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 
 # robot_interfaces - DO NOT CHANGE (used by other nodes)
 from robot_interfaces.msg import (
@@ -120,6 +122,17 @@ class MqttRosBridge(Node):
         self.declare_parameter("log_throttle_sec", 1.0)
 
         # ====================================================================
+        # ROS Parameters - Map file
+        # ====================================================================
+        # Default path: config/marker_map.yaml in robot_bringup package
+        default_map_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+            "bringup", "robot_bringup", "config", "marker_map.yaml"
+        )
+        self.declare_parameter("map_file_path", default_map_path)
+        self.declare_parameter("ros.pub.map_updated", "/server/map_updated")
+
+        # ====================================================================
         # Load Parameters
         # ====================================================================
         self.mqtt_host = self.get_parameter("mqtt.host").value
@@ -155,6 +168,10 @@ class MqttRosBridge(Node):
         self.ros_sub_plate_query = self.get_parameter("ros.sub.plate_query").value
         self.ros_sub_mission_state = self.get_parameter("ros.sub.mission_state").value
 
+        # Map file
+        self.map_file_path = self.get_parameter("map_file_path").value
+        self.ros_pub_map_updated = self.get_parameter("ros.pub.map_updated").value
+
         # ====================================================================
         # State Tracking
         # ====================================================================
@@ -174,6 +191,9 @@ class MqttRosBridge(Node):
         )
         self.pub_plate_response = self.create_publisher(
             PlateResponse, self.ros_pub_plate_response, 10
+        )
+        self.pub_map_updated = self.create_publisher(
+            Bool, self.ros_pub_map_updated, 10
         )
 
         # ====================================================================
@@ -481,7 +501,23 @@ class MqttRosBridge(Node):
         self.get_logger().info(f"Exit command published: drive to {target_node_id}")
 
     def _handle_server_map(self, p: Dict[str, Any]):
-        """Handle map data from MQTT (type 4)."""
+        """
+        Handle map data from MQTT (type 4).
+        Saves received map to marker_map.yaml file.
+
+        Server format:
+        {
+            "type": "4",
+            "cmdId": "...",
+            "payload": {
+                "node": [
+                    {"nodeId": 1, "nodeCode": "A1", "x": 60.0, "y": 18.0,
+                     "nodeType": "ROAD|SLOT", "nodeStatus": "NORMAL"},
+                    ...
+                ]
+            }
+        }
+        """
         try:
             cmd_id = p.get("cmdId", "")
             inner = p.get("payload", {})
@@ -489,18 +525,84 @@ class MqttRosBridge(Node):
                 return
 
             nodes = inner.get("node", [])
-            if not isinstance(nodes, list):
+            if not isinstance(nodes, list) or len(nodes) == 0:
                 return
 
             # Send ACK
             if cmd_id:
                 self._publish_ack(cmd_id, True)
 
-            self.get_logger().info(f"Received map with {len(nodes)} nodes")
-            # TODO: Publish to /server/map_nodes if needed
+            # Convert to marker_map.yaml format
+            road_markers = {}
+            parking_markers = {}
+
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+
+                node_id = node.get("nodeId", -1)
+                if node_id < 0:
+                    continue
+
+                x = float(node.get("x", 0.0))
+                y = float(node.get("y", 0.0))
+                node_type = str(node.get("nodeType", "ROAD")).upper()
+                node_code = str(node.get("nodeCode", ""))
+
+                marker_data = {
+                    "position": [x, y],
+                    "yaw": 1.5708,  # Default: π/2
+                }
+
+                if node_type == "SLOT":
+                    marker_data["slot_id"] = node_code if node_code else f"S{node_id}"
+                    parking_markers[node_id] = marker_data
+                else:
+                    marker_data["description"] = node_code if node_code else f"Node {node_id}"
+                    road_markers[node_id] = marker_data
+
+            # Build yaml structure
+            map_data = {
+                "unit_scale": 0.01,
+                "default_marker_yaw": 1.5708,
+                "road_markers": road_markers,
+                "parking_markers": parking_markers,
+                "turn_map": [],  # Will be calculated dynamically
+            }
+
+            # Save to file
+            self._save_map_yaml(map_data)
+
+            self.get_logger().info(
+                f"Map updated: {len(road_markers)} road + {len(parking_markers)} parking markers"
+            )
+
+            # Notify other nodes
+            msg = Bool()
+            msg.data = True
+            self.pub_map_updated.publish(msg)
 
         except Exception as e:
             self.get_logger().error(f"Map parse error: {e}")
+
+    def _save_map_yaml(self, map_data: Dict[str, Any]):
+        """Save map data to yaml file."""
+        try:
+            # Add header comment
+            header = """# Marker Map Configuration
+# Auto-generated from server map data
+# Unit scale: 0.01 = centimeters to meters
+# yaw: marker image "up" direction on map (rad)
+
+"""
+            with open(self.map_file_path, 'w', encoding='utf-8') as f:
+                f.write(header)
+                yaml.dump(map_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+            self.get_logger().info(f"Map saved to: {self.map_file_path}")
+
+        except Exception as e:
+            self.get_logger().error(f"Failed to save map: {e}")
 
     def _handle_server_ack(self, p: Dict[str, Any]):
         """Handle ACK from server."""
