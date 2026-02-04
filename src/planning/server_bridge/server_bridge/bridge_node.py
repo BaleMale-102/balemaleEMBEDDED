@@ -82,6 +82,7 @@ class ServerBridgeNode(Node):
         self._current_node_id = 0
         self._next_node_id = -1
         self._last_mission_state = ""
+        self._last_event_type = ""  # For deduplication
 
         # MQTT client
         self.mqtt = MQTTClient(config, simulation, logger=self.get_logger())
@@ -230,7 +231,7 @@ class ServerBridgeNode(Node):
         resp.plate_number = ""  # Server doesn't echo back plate
         resp.verified = (target_node_id >= 0)
         resp.assigned_slot_id = target_node_id
-        resp.waypoint_ids = path[:-1] if len(path) > 1 else []  # All except final
+        resp.waypoint_ids = list(path)  # Use full path as waypoints
         resp.message = f"Dispatch assigned: slot {target_node_id}" if resp.verified else "Dispatch failed"
 
         self.pub_plate_response.publish(resp)
@@ -240,7 +241,7 @@ class ServerBridgeNode(Node):
             cmd = MissionCommand()
             cmd.header.stamp = self.get_clock().now().to_msg()
             cmd.command = "START"
-            cmd.waypoint_ids = path[:-1] if len(path) > 1 else []
+            cmd.waypoint_ids = list(path)  # Use full path as waypoints
             cmd.final_goal_id = target_node_id
             cmd.task_type = "PARK"
             cmd.task_id = req_id
@@ -254,7 +255,7 @@ class ServerBridgeNode(Node):
         cmd = MissionCommand()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.command = "REROUTE"
-        cmd.waypoint_ids = path[:-1] if len(path) > 1 else []
+        cmd.waypoint_ids = list(path)  # Use full path as waypoints
         cmd.final_goal_id = target_node_id
         cmd.task_type = "REROUTE"
         cmd.task_id = req_id
@@ -271,7 +272,7 @@ class ServerBridgeNode(Node):
         cmd = MissionCommand()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.command = "START"
-        cmd.waypoint_ids = path[:-1] if len(path) > 1 else []
+        cmd.waypoint_ids = list(path)  # Use full path as waypoints
         cmd.final_goal_id = target_node_id
         cmd.task_type = "EXIT"
         cmd.task_id = req_id
@@ -318,7 +319,7 @@ class ServerBridgeNode(Node):
     def _task_status_callback(self, msg):
         """
         Handle task status update from mission_manager.
-        Forward as event to MQTT.
+        Forward as event to MQTT only when event type changes.
         """
         if not self.mqtt.is_connected:
             return
@@ -330,36 +331,59 @@ class ServerBridgeNode(Node):
         # Map MissionStatus to event type
         event_type = self._map_status_to_event(msg.status, msg.current_state)
 
-        # Only send event if we have valid req_id and vehicle_id (from server response)
-        if event_type and self._current_req_id and self._current_vehicle_id >= 0:
-            self.mqtt.publish_event(
-                req_id=self._current_req_id,
-                vehicle_id=self._current_vehicle_id,
-                event_type=event_type
-            )
+        # Only send event if changed and we have valid req_id and vehicle_id
+        if event_type and event_type != self._last_event_type:
+            if self._current_req_id and self._current_vehicle_id >= 0:
+                self.mqtt.publish_event(
+                    req_id=self._current_req_id,
+                    vehicle_id=self._current_vehicle_id,
+                    event_type=event_type
+                )
+                self.get_logger().info(f'Event changed: {self._last_event_type} -> {event_type}')
+            self._last_event_type = event_type
 
     def _map_status_to_event(self, status: str, state: str) -> str:
-        """Map MissionStatus to event type for server."""
+        """
+        Map MissionStatus to event type for server.
+
+        Backend agreed event types:
+        - WAITING: 대기 중 (로봇 대기 공간에서)
+        - LOADING: 적재 중
+        - DRIVING_DESTINATION: 목적지로 이동 중
+        - DRIVING_HOME: 집으로 이동 중
+        - ESTOP: 멈춤
+        - PARKING: 주차중
+        - FAILED: 실패
+        """
         # Status-based events
         if status == "COMPLETED":
-            return "PARKED"  # Mission completed = parked
+            return "WAITING"  # Mission completed, back to waiting
         elif status == "FAILED":
-            return "ESTOP"
+            return "FAILED"
 
-        # State-based events (match server protocol)
+        # State-based events (match backend protocol)
         state_event_map = {
+            # 대기
+            "IDLE": "WAITING",
+            "WAIT_VEHICLE": "WAITING",
+            # 적재/하역
             "LOAD": "LOADING",
-            "UNLOAD": "LOADING",  # Unload is also a loading operation
-            "DRIVE": "MOVING",
-            "TURNING": "MOVING",
-            "ALIGN_TO_MARKER": "MOVING",
-            "ADVANCE_TO_CENTER": "MOVING",
-            "PARK": "MOVING",
-            "PARK_DETECT": "MOVING",
-            "PARK_ALIGN_MARKER": "MOVING",
-            "PARK_FINAL": "PARKED",
-            "RETURN_HOME": "MOVING",
-            "WAIT_VEHICLE": "PARKED",  # Waiting at home = parked state
+            "UNLOAD": "LOADING",
+            # 목적지 이동 (주차 포함)
+            "DRIVE": "DRIVING_DESTINATION",
+            "TURNING": "DRIVING_DESTINATION",
+            "ALIGN_TO_MARKER": "DRIVING_DESTINATION",
+            "ADVANCE_TO_CENTER": "DRIVING_DESTINATION",
+            "STOP_AT_MARKER": "DRIVING_DESTINATION",
+            "STOP_BUMP": "DRIVING_DESTINATION",
+            # 주차
+            "PARK": "PARKING",
+            "PARK_DETECT": "PARKING",
+            "PARK_ALIGN_MARKER": "PARKING",
+            "PARK_FINAL": "PARKING",
+            # 복귀
+            "RETURN_HOME": "DRIVING_HOME",
+            # 에러
             "ERROR": "ESTOP",
         }
 

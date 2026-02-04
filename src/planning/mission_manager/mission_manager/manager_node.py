@@ -488,6 +488,11 @@ class MissionManagerNode(Node):
                     waypoints = [int(x) for x in parts[2].split(',')]
                 self.fsm.notify_plate_response(True, slot_id, waypoints)
                 self.get_logger().info(f'Simulated verify: slot={slot_id}, waypoints={waypoints}')
+        elif cmd == 'HOME' or cmd == 'RETURN_HOME':
+            # Start return to home (marker 0)
+            self.fsm.start_return_home()
+            self._enable_drive()
+            self.get_logger().info('Returning home (marker 0)')
 
     def _update_callback(self):
         """Periodic FSM update."""

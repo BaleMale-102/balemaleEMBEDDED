@@ -35,6 +35,9 @@ class CameraNode(Node):
         self.declare_parameter('camera_name', 'camera')
         self.declare_parameter('simulate', False)
         self.declare_parameter('calibration_file', '')
+        # Focus control
+        self.declare_parameter('autofocus', False)  # 오토포커스 비활성화 (기본)
+        self.declare_parameter('focus', 40)  # 고정 포커스 값 (0=무한대, 250=최근거리, 40≈30cm)
 
         # Load parameters
         self.device = self.get_parameter('device').value
@@ -45,6 +48,8 @@ class CameraNode(Node):
         self.camera_name = self.get_parameter('camera_name').value
         self.simulate = self.get_parameter('simulate').value
         self.calib_file = self.get_parameter('calibration_file').value
+        self.autofocus = self.get_parameter('autofocus').value
+        self.focus = self.get_parameter('focus').value
 
         # CV Bridge
         self.bridge = CvBridge()
@@ -117,9 +122,57 @@ class CameraNode(Node):
                 f'Camera opened: {actual_w}x{actual_h} @ {actual_fps:.1f}fps'
             )
 
+            # Configure focus (v4l2-ctl for reliable control)
+            self._configure_focus()
+
         except Exception as e:
             self.get_logger().error(f'Camera init error: {e}')
             self.simulate = True
+
+    def _configure_focus(self):
+        """Configure camera focus settings via v4l2-ctl"""
+        import subprocess
+
+        try:
+            # First, try OpenCV method
+            if not self.autofocus:
+                # Disable autofocus
+                self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+                # Set fixed focus
+                self.cap.set(cv2.CAP_PROP_FOCUS, self.focus)
+
+            # Fallback to v4l2-ctl for more reliable control
+            if not self.autofocus:
+                # Disable autofocus
+                subprocess.run(
+                    ['v4l2-ctl', '-d', self.device,
+                     '-c', 'focus_automatic_continuous=0'],
+                    capture_output=True, timeout=2
+                )
+                # Set fixed focus value
+                subprocess.run(
+                    ['v4l2-ctl', '-d', self.device,
+                     '-c', f'focus_absolute={self.focus}'],
+                    capture_output=True, timeout=2
+                )
+                self.get_logger().info(
+                    f'Focus: autofocus=OFF, fixed={self.focus}'
+                )
+            else:
+                # Enable autofocus
+                subprocess.run(
+                    ['v4l2-ctl', '-d', self.device,
+                     '-c', 'focus_automatic_continuous=1'],
+                    capture_output=True, timeout=2
+                )
+                self.get_logger().info('Focus: autofocus=ON')
+
+        except subprocess.TimeoutExpired:
+            self.get_logger().warn('v4l2-ctl timeout - focus may not be set')
+        except FileNotFoundError:
+            self.get_logger().warn('v4l2-ctl not found - using OpenCV only')
+        except Exception as e:
+            self.get_logger().warn(f'Focus config failed: {e}')
 
     def _load_camera_info(self) -> CameraInfo:
         """Load camera info from calibration file or use defaults"""

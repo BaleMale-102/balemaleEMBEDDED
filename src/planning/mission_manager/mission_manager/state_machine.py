@@ -351,6 +351,12 @@ class StateMachine:
         # Move to LOAD state
         self._change_state(MissionState.LOAD)
 
+    def start_return_home(self):
+        """Start return to home mission (marker 0)."""
+        self._context.reset()
+        self._context.is_full_mission = False
+        self._change_state(MissionState.RETURN_HOME)
+
     def cancel_mission(self):
         """Cancel current mission."""
         self._context.error_message = 'Mission cancelled'

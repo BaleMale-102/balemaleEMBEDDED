@@ -14,6 +14,9 @@
     camera_name: "cam_front"
     simulate: false
     calibration_file: "cam_front_calib.yaml"
+    # Focus control (C920)
+    autofocus: false                  # 오토포커스 비활성화 (Turn 시 흐려짐 방지)
+    focus: 40                         # 고정 포커스 (0=무한대, 250=최근거리, 40≈30cm)
 
 /cam_side:
   ros__parameters:
@@ -25,6 +28,9 @@
     camera_name: "cam_side"
     simulate: false
     calibration_file: "cam_side_calib.yaml"
+    # Focus control (Brio 100 - fixed focus, no control needed)
+    autofocus: false
+    focus: 0
 
 /arduino_driver:
   ros__parameters:
