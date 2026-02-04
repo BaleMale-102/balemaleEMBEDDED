@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(v4l2-ctl:*)",
+      "Bash(colcon build:*)",
+      "Bash(find:*)"
+    ]
+  }
+}

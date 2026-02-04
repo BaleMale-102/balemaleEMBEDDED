@@ -2,14 +2,18 @@
 """
 manager_node.py - Mission Manager Node
 
-Orchestrates mission execution using FSM.
-Includes dynamic heading estimation and turn angle calculation.
+Orchestrates full mission execution using FSM.
+Handles: vehicle waiting, ANPR recognition, loading, navigation, parking, unloading, return.
 
 Subscribes:
     /server/task_cmd: MissionCommand
     /mission/marker_reached: Int32
     /mission/turn_done: Bool
     /mission/align_done: Bool
+    /perception/side_markers: MarkerArray (for parking)
+    /perception/anpr/detections: DetectionArray (for plate recognition)
+    /plate/response: PlateResponse (from server)
+    /loader/status: LoaderStatus
 
 Publishes:
     /mission/state: String
@@ -17,15 +21,23 @@ Publishes:
     /mission/turn_target_rad: Int32 (centiradians)
     /control/enable_drive: Bool
     /server/task_status: MissionStatus
+    /parking/target_slot: Int32
+    /parking/status: ParkingStatus
+    /plate/query: PlateQuery
+    /loader/command: LoaderCommand
 """
 
 import math
 import yaml
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from std_msgs.msg import String, Int32, Bool, Float32
 
-from .state_machine import StateMachine, MissionState, MissionContext
+from .state_machine import (
+    StateMachine, MissionState, HOME_MARKER_ID,
+    get_slot_zone, is_same_zone, get_slot_direction
+)
 
 
 def wrap_angle(angle: float) -> float:
@@ -38,17 +50,19 @@ def wrap_angle(angle: float) -> float:
 
 
 class MissionManagerNode(Node):
-    """Mission manager with FSM and dynamic heading-based turn calculation."""
+    """Mission manager with FSM for full autonomous parking robot operation."""
 
     def __init__(self):
         super().__init__('mission_manager_node')
 
         # Parameters
         self.declare_parameter('update_rate', 10.0)
-        self.declare_parameter('default_turn_angle', 1.57)  # 90 degrees
+        self.declare_parameter('default_turn_angle', 1.57)
         self.declare_parameter('marker_map_yaml', '')
-        self.declare_parameter('default_marker_yaw', 1.5708)  # π/2
-        self.declare_parameter('unit_scale', 0.01)  # cm to m
+        self.declare_parameter('default_marker_yaw', 1.5708)
+        self.declare_parameter('unit_scale', 0.01)
+        self.declare_parameter('car_id', 'car_01')
+        self.declare_parameter('auto_start_waiting', False)  # Auto-start in WAIT_VEHICLE mode
 
         # State timeout parameters
         self.declare_parameter('timeout_stop_at_marker', 2.0)
@@ -58,6 +72,18 @@ class MissionManagerNode(Node):
         self.declare_parameter('timeout_turning', 30.0)
         self.declare_parameter('timeout_park', 30.0)
 
+        # Parking timeout parameters
+        self.declare_parameter('timeout_park_detect', 10.0)
+        self.declare_parameter('timeout_park_recovery', 15.0)
+        self.declare_parameter('timeout_park_align_marker', 15.0)
+        self.declare_parameter('timeout_park_align_rect', 10.0)
+        self.declare_parameter('timeout_park_final', 10.0)
+
+        # Full mission timeout parameters
+        self.declare_parameter('timeout_recognize', 30.0)
+        self.declare_parameter('timeout_load', 30.0)
+        self.declare_parameter('timeout_unload', 30.0)
+
         # State delay parameters
         self.declare_parameter('delay_stop_at_marker', 0.5)
         self.declare_parameter('delay_stop_bump', 0.3)
@@ -66,15 +92,26 @@ class MissionManagerNode(Node):
         self.default_turn_angle = self.get_parameter('default_turn_angle').value
         self.default_marker_yaw = self.get_parameter('default_marker_yaw').value
         self.unit_scale = self.get_parameter('unit_scale').value
+        self.car_id = self.get_parameter('car_id').value
+        auto_start_waiting = self.get_parameter('auto_start_waiting').value
 
         # Build timeout/delay configs for state machine
+        # 테스트용: 주행/주차 관련 타임아웃 비활성화 (0 = 무제한)
         timeouts = {
             'STOP_AT_MARKER': self.get_parameter('timeout_stop_at_marker').value,
             'ADVANCE_TO_CENTER': self.get_parameter('timeout_advance_to_center').value,
-            'ALIGN_TO_MARKER': self.get_parameter('timeout_align_to_marker').value,
+            'ALIGN_TO_MARKER': 0,  # 비활성화
             'STOP_BUMP': self.get_parameter('timeout_stop_bump').value,
-            'TURNING': self.get_parameter('timeout_turning').value,
-            'PARK': self.get_parameter('timeout_park').value,
+            'TURNING': 0,  # 비활성화
+            'PARK': 0,  # 비활성화
+            'PARK_DETECT': 0,  # 비활성화
+            'PARK_RECOVERY': 0,  # 비활성화
+            'PARK_ALIGN_MARKER': 0,  # 비활성화
+            'PARK_ALIGN_RECT': 0,  # 비활성화
+            'PARK_FINAL': 0,  # 비활성화
+            'RECOGNIZE': self.get_parameter('timeout_recognize').value,
+            'LOAD': self.get_parameter('timeout_load').value,
+            'UNLOAD': self.get_parameter('timeout_unload').value,
         }
         delays = {
             'stop_at_marker': self.get_parameter('delay_stop_at_marker').value,
@@ -82,8 +119,8 @@ class MissionManagerNode(Node):
         }
 
         # Load marker map
-        self._marker_positions = {}  # {marker_id: (x, y)}
-        self._marker_yaw = {}  # {marker_id: yaw}
+        self._marker_positions = {}
+        self._marker_yaw = {}
         self._load_marker_map()
 
         # State machine
@@ -92,14 +129,38 @@ class MissionManagerNode(Node):
 
         # Heading tracking
         self._previous_marker_id = -1
-        self._current_heading = math.pi / 2  # 초기값: +Y 방향 (아래쪽)
+        self._current_heading = math.pi / 2
+
+        # Side camera marker tracking (for parking)
+        self._side_marker = None
+        self._side_marker_time = 0.0
+
+        # Loader status tracking
+        self._loader_status = None
+        self._loader_is_loaded = False
+
+        # ANPR detection tracking
+        self._last_plate_number = ''
+        self._plate_query_pending = False
 
         # Import custom interfaces
         try:
-            from robot_interfaces.msg import MissionCommand, MissionStatus
+            from robot_interfaces.msg import (
+                MissionCommand, MissionStatus,
+                MarkerArray, ParkingStatus,
+                DetectionArray, PlateQuery, PlateResponse,
+                LoaderCommand, LoaderStatus
+            )
             self._has_interface = True
             self._MissionCommand = MissionCommand
             self._MissionStatus = MissionStatus
+            self._MarkerArray = MarkerArray
+            self._ParkingStatus = ParkingStatus
+            self._DetectionArray = DetectionArray
+            self._PlateQuery = PlateQuery
+            self._PlateResponse = PlateResponse
+            self._LoaderCommand = LoaderCommand
+            self._LoaderStatus = LoaderStatus
         except ImportError:
             self.get_logger().warn('robot_interfaces not found')
             self._has_interface = False
@@ -110,10 +171,20 @@ class MissionManagerNode(Node):
         self.pub_turn_target = self.create_publisher(Int32, '/mission/turn_target_rad', 10)
         self.pub_enable_drive = self.create_publisher(Bool, '/control/enable_drive', 10)
         self.pub_heading = self.create_publisher(Float32, '/mission/current_heading', 10)
+        self.pub_parking_target = self.create_publisher(Int32, '/parking/target_slot', 10)
 
         if self._has_interface:
             self.pub_task_status = self.create_publisher(
                 self._MissionStatus, '/server/task_status', 10
+            )
+            self.pub_parking_status = self.create_publisher(
+                self._ParkingStatus, '/parking/status', 10
+            )
+            self.pub_plate_query = self.create_publisher(
+                self._PlateQuery, '/plate/query', 10
+            )
+            self.pub_loader_cmd = self.create_publisher(
+                self._LoaderCommand, '/loader/command', 10
             )
 
         # Subscribers
@@ -121,6 +192,26 @@ class MissionManagerNode(Node):
             self.sub_task_cmd = self.create_subscription(
                 self._MissionCommand, '/server/task_cmd',
                 self._task_cmd_callback, 10
+            )
+            # Side marker subscription for parking
+            self.sub_side_markers = self.create_subscription(
+                self._MarkerArray, '/perception/side_markers',
+                self._side_markers_callback, qos_profile_sensor_data
+            )
+            # ANPR detections
+            self.sub_anpr_detections = self.create_subscription(
+                self._DetectionArray, '/perception/anpr/detections',
+                self._anpr_detections_callback, qos_profile_sensor_data
+            )
+            # Plate response from server
+            self.sub_plate_response = self.create_subscription(
+                self._PlateResponse, '/plate/response',
+                self._plate_response_callback, 10
+            )
+            # Loader status
+            self.sub_loader_status = self.create_subscription(
+                self._LoaderStatus, '/loader/status',
+                self._loader_status_callback, 10
             )
 
         self.sub_marker_reached = self.create_subscription(
@@ -133,7 +224,18 @@ class MissionManagerNode(Node):
             Bool, '/mission/align_done', self._align_done_callback, 10
         )
 
-        # Test command subscriber (for debugging)
+        # Parking event subscribers
+        self.sub_park_align_marker_done = self.create_subscription(
+            Bool, '/parking/align_marker_done', self._park_align_marker_done_callback, 10
+        )
+        self.sub_park_align_rect_done = self.create_subscription(
+            Bool, '/parking/align_rect_done', self._park_align_rect_done_callback, 10
+        )
+        self.sub_park_final_done = self.create_subscription(
+            Bool, '/parking/final_done', self._park_final_done_callback, 10
+        )
+
+        # Test command subscriber
         self.sub_test_cmd = self.create_subscription(
             String, '/mission/test_cmd', self._test_cmd_callback, 10
         )
@@ -141,7 +243,12 @@ class MissionManagerNode(Node):
         # Update timer
         self.timer = self.create_timer(1.0 / update_rate, self._update_callback)
 
-        self.get_logger().info('MissionManagerNode started')
+        # Auto-start in waiting mode if configured
+        if auto_start_waiting:
+            self.get_logger().info('Auto-starting in WAIT_VEHICLE mode')
+            self.fsm.start_waiting()
+
+        self.get_logger().info('MissionManagerNode started (full mission support)')
 
     def _task_cmd_callback(self, msg):
         """Handle mission command from server."""
@@ -158,13 +265,16 @@ class MissionManagerNode(Node):
         elif msg.command.upper() == 'STOP':
             self.fsm.cancel_mission()
             self._disable_drive()
+            self._send_loader_command('STOP')
+        elif msg.command.upper() == 'WAIT':
+            # Start waiting mode
+            self.fsm.start_waiting()
 
     def _marker_reached_callback(self, msg: Int32):
         """Handle marker reached notification."""
         marker_id = msg.data
         self.get_logger().info(f'Marker {marker_id} reached')
 
-        # Update heading based on path (previous marker -> current marker)
         prev_id = self.fsm.context.current_marker_id
         if prev_id >= 0 and prev_id in self._marker_positions and marker_id in self._marker_positions:
             self._update_heading_from_path(prev_id, marker_id)
@@ -175,7 +285,6 @@ class MissionManagerNode(Node):
     def _turn_done_callback(self, msg: Bool):
         """Handle turn complete notification."""
         if msg.data:
-            # Update heading after turn
             turn_angle = self.fsm.context.turn_target_rad
             self._current_heading = wrap_angle(self._current_heading + turn_angle)
 
@@ -183,7 +292,6 @@ class MissionManagerNode(Node):
                 f'Turn complete, new heading={math.degrees(self._current_heading):.1f}deg'
             )
 
-            # Publish updated heading
             heading_msg = Float32()
             heading_msg.data = self._current_heading
             self.pub_heading.publish(heading_msg)
@@ -196,30 +304,202 @@ class MissionManagerNode(Node):
             self.get_logger().info('Alignment complete')
             self.fsm.notify_align_complete()
 
+    def _side_markers_callback(self, msg):
+        """Handle side camera marker detections for parking."""
+        if self.fsm.state not in (
+            MissionState.PARK_DETECT,
+            MissionState.PARK_ALIGN_MARKER,
+            MissionState.PARK_FINAL
+        ):
+            return
+
+        if not msg.markers:
+            return
+
+        target_slot = self.fsm.context.parking.target_slot_id
+        if target_slot < 0:
+            return
+
+        best_marker = None
+        best_score = -1
+
+        for marker in msg.markers:
+            if marker.id < 16 or marker.id > 27:
+                continue
+
+            score = 0
+            if marker.id == target_slot:
+                score = 100
+            elif is_same_zone(marker.id, target_slot):
+                score = 50
+            else:
+                score = 10
+
+            score += max(0, 10 - marker.distance * 10)
+
+            if score > best_score:
+                best_score = score
+                best_marker = marker
+
+        if best_marker:
+            self._side_marker = best_marker
+            self._side_marker_time = self.get_clock().now().nanoseconds / 1e9
+
+            if self.fsm.state == MissionState.PARK_DETECT:
+                self.fsm.notify_park_detect_done(
+                    best_marker.id,
+                    best_marker.distance,
+                    best_marker.angle
+                )
+                self.get_logger().info(
+                    f'Side marker detected: id={best_marker.id}, '
+                    f'd={best_marker.distance:.2f}m, a={math.degrees(best_marker.angle):.1f}deg'
+                )
+
+    def _anpr_detections_callback(self, msg):
+        """Handle ANPR detections for plate recognition."""
+        # Only process in WAIT_VEHICLE state
+        if self.fsm.state != MissionState.WAIT_VEHICLE:
+            return
+
+        # Find plate detection
+        for det in msg.detections:
+            if det.class_id == 0 and det.text:  # Plate class
+                plate = det.text.strip()
+                if plate and plate != self._last_plate_number:
+                    self._last_plate_number = plate
+                    self.get_logger().info(f'Plate detected: {plate}')
+                    self.fsm.notify_plate_detected(plate)
+                break
+
+    def _plate_response_callback(self, msg):
+        """Handle plate verification response from server."""
+        if self.fsm.state != MissionState.RECOGNIZE:
+            return
+
+        self.get_logger().info(
+            f'Plate response: verified={msg.verified}, slot={msg.assigned_slot_id}'
+        )
+
+        self.fsm.notify_plate_response(
+            verified=msg.verified,
+            slot_id=msg.assigned_slot_id,
+            waypoints=list(msg.waypoint_ids),
+            message=msg.message
+        )
+
+        self._plate_query_pending = False
+
+    def _loader_status_callback(self, msg):
+        """Handle loader status updates."""
+        self._loader_status = msg.status
+        self._loader_is_loaded = msg.is_loaded
+
+        # Check for completion in relevant states
+        if self.fsm.state == MissionState.LOAD:
+            if msg.status == 'DONE' and msg.is_loaded:
+                self.get_logger().info('Load complete')
+                self.fsm.notify_load_complete()
+            elif msg.status == 'ERROR':
+                self.get_logger().error(f'Loader error: {msg.message}')
+                self.fsm.notify_loader_error()
+
+        elif self.fsm.state == MissionState.UNLOAD:
+            if msg.status == 'DONE' and not msg.is_loaded:
+                self.get_logger().info('Unload complete')
+                self.fsm.notify_unload_complete()
+            elif msg.status == 'ERROR':
+                self.get_logger().error(f'Loader error: {msg.message}')
+                self.fsm.notify_loader_error()
+
+    def _park_align_marker_done_callback(self, msg: Bool):
+        """Handle parking marker alignment complete."""
+        if msg.data:
+            self.get_logger().info('Parking marker alignment complete')
+            self.fsm.notify_park_align_marker_done()
+
+    def _park_align_rect_done_callback(self, msg: Bool):
+        """Handle parking rectangle alignment complete."""
+        if msg.data:
+            self.get_logger().info('Parking rectangle alignment complete')
+            self.fsm.notify_park_align_rect_done()
+
+    def _park_final_done_callback(self, msg: Bool):
+        """Handle parking final positioning complete."""
+        if msg.data:
+            self.get_logger().info('Parking final positioning complete')
+            self.fsm.notify_park_final_done()
+
     def _test_cmd_callback(self, msg: String):
         """Handle test commands for debugging."""
         cmd = msg.data.strip().upper()
 
-        if cmd.startswith('START'):
-            # Parse: START 1,2,3 -> waypoints [1,2], goal 3
+        if cmd == 'WAIT':
+            # Start waiting for vehicle
+            self.fsm.start_waiting()
+            self.get_logger().info('Started waiting for vehicle')
+        elif cmd.startswith('START_FULL'):
+            # START_FULL 1,3,9 17 - waypoints then slot
+            parts = cmd.split()
+            if len(parts) >= 3:
+                waypoints = [int(x) for x in parts[1].split(',')]
+                slot_id = int(parts[2])
+                self.fsm.start_mission(waypoints, slot_id, 'test_full', 'PARK')
+                self.get_logger().info(f'Full mission started: {waypoints} -> slot {slot_id}')
+        elif cmd.startswith('START_PARK'):
+            parts = cmd.split()
+            if len(parts) > 1:
+                slot_id = int(parts[1])
+                self.fsm.start_mission([], slot_id, 'test_park', 'PARK')
+                self.get_logger().info(f'Test parking mission started: slot {slot_id}')
+        elif cmd.startswith('START'):
             parts = cmd.split()
             if len(parts) > 1:
                 ids = [int(x) for x in parts[1].split(',')]
                 if len(ids) >= 1:
                     waypoints = ids[:-1]
                     goal = ids[-1]
-                    self.fsm.start_mission(waypoints, goal, 'test', 'TEST')
+                    self.fsm.start_mission(waypoints, goal, 'test', '')
                     self.get_logger().info(f'Test mission started: {waypoints} -> {goal}')
         elif cmd == 'STOP':
             self.fsm.cancel_mission()
             self._disable_drive()
+            self._send_loader_command('STOP')
         elif cmd == 'REACHED':
-            # Simulate marker reached
             self.fsm.notify_marker_reached(self.fsm.context.current_target_marker)
+        elif cmd == 'LOAD':
+            self._send_loader_command('LOAD')
+        elif cmd == 'UNLOAD':
+            self._send_loader_command('UNLOAD')
+        elif cmd.startswith('PLATE'):
+            # Simulate plate detection: PLATE ABC123
+            parts = cmd.split()
+            if len(parts) > 1:
+                plate = parts[1]
+                self.fsm.notify_plate_detected(plate)
+                self.get_logger().info(f'Simulated plate: {plate}')
+        elif cmd.startswith('VERIFY'):
+            # Simulate server response: VERIFY 17 or VERIFY 17 1,5,6
+            parts = cmd.split()
+            if len(parts) >= 2:
+                slot_id = int(parts[1])
+                waypoints = []
+                if len(parts) > 2:
+                    waypoints = [int(x) for x in parts[2].split(',')]
+                self.fsm.notify_plate_response(True, slot_id, waypoints)
+                self.get_logger().info(f'Simulated verify: slot={slot_id}, waypoints={waypoints}')
+        elif cmd == 'HOME' or cmd == 'RETURN_HOME':
+            # Start return to home (marker 0)
+            self.fsm.start_return_home()
+            self._enable_drive()
+            self.get_logger().info('Returning home (marker 0)')
 
     def _update_callback(self):
         """Periodic FSM update."""
         self.fsm.update()
+
+        # Handle state-specific actions
+        self._handle_state_actions()
 
         # Publish current state
         state_msg = String()
@@ -231,8 +511,32 @@ class MissionManagerNode(Node):
         target_msg.data = self.fsm.context.current_target_marker
         self.pub_target_marker.publish(target_msg)
 
+        # Publish parking target slot
+        parking_target_msg = Int32()
+        parking_target_msg.data = self.fsm.context.parking.target_slot_id
+        self.pub_parking_target.publish(parking_target_msg)
+
         # Publish mission status
         self._publish_task_status()
+
+        # Publish parking status
+        self._publish_parking_status()
+
+    def _handle_state_actions(self):
+        """Handle state-specific actions that need periodic execution."""
+        state = self.fsm.state
+
+        # RECOGNIZE: Send plate query if not sent yet
+        if state == MissionState.RECOGNIZE:
+            if not self.fsm.context.recognition.query_sent:
+                self._send_plate_query()
+                self.fsm.notify_plate_query_sent()
+
+        # LOAD: Send load command on state entry
+        # (Handled in _on_state_change)
+
+        # UNLOAD: Send unload command on state entry
+        # (Handled in _on_state_change)
 
     def _on_state_change(self, old_state: MissionState, new_state: MissionState):
         """Handle state transitions."""
@@ -245,6 +549,12 @@ class MissionManagerNode(Node):
             MissionState.ALIGN_TO_MARKER,
             MissionState.TURNING,
             MissionState.PARK,
+            MissionState.PARK_DETECT,
+            MissionState.PARK_RECOVERY,
+            MissionState.PARK_ALIGN_MARKER,
+            MissionState.PARK_ALIGN_RECT,
+            MissionState.PARK_FINAL,
+            MissionState.RETURN_HOME,
         }
 
         if new_state in drive_states:
@@ -255,31 +565,81 @@ class MissionManagerNode(Node):
         # Handle specific state entries
         if new_state == MissionState.TURNING:
             self._setup_turn()
+        elif new_state == MissionState.WAIT_VEHICLE:
+            self._last_plate_number = ''
+            self.get_logger().info('Waiting for vehicle at home position')
+        elif new_state == MissionState.RECOGNIZE:
+            self.get_logger().info(
+                f'Recognizing plate: {self.fsm.context.recognition.plate_number}'
+            )
+        elif new_state == MissionState.LOAD:
+            self.get_logger().info('Starting load operation')
+            self._send_loader_command('LOAD')
+        elif new_state == MissionState.UNLOAD:
+            self.get_logger().info('Starting unload operation')
+            self._send_loader_command('UNLOAD')
+        elif new_state == MissionState.RETURN_HOME:
+            self.get_logger().info('Returning to home position')
+        elif new_state == MissionState.PARK_DETECT:
+            self.get_logger().info(
+                f'Starting parking detection for slot {self.fsm.context.parking.target_slot_id}'
+            )
+        elif new_state == MissionState.PARK_RECOVERY:
+            ctx = self.fsm.context.parking
+            self.get_logger().info(
+                f'Parking recovery: {ctx.recovery_direction} {ctx.recovery_distance:.2f}m'
+            )
         elif new_state == MissionState.FINISH:
             self.get_logger().info('Mission complete!')
         elif new_state == MissionState.ERROR:
             self.get_logger().error(f'Mission error: {self.fsm.context.error_message}')
 
+    def _send_plate_query(self):
+        """Send plate verification query to server."""
+        if not self._has_interface:
+            return
+
+        plate = self.fsm.context.recognition.plate_number
+        if not plate:
+            return
+
+        msg = self._PlateQuery()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.plate_number = plate
+        msg.car_id = self.car_id
+
+        self.pub_plate_query.publish(msg)
+        self._plate_query_pending = True
+        self.get_logger().info(f'Plate query sent: {plate}')
+
+    def _send_loader_command(self, command: str):
+        """Send command to loader."""
+        if not self._has_interface:
+            return
+
+        msg = self._LoaderCommand()
+        msg.command = command
+
+        self.pub_loader_cmd.publish(msg)
+        self.get_logger().info(f'Loader command sent: {command}')
+
     def _setup_turn(self):
-        """Setup turn target for the next waypoint using dynamic heading calculation."""
+        """Setup turn target for the next waypoint."""
         ctx = self.fsm.context
         current_marker = ctx.current_marker_id
 
-        # TURNING 상태에서는 다음 타겟을 봐야 함 (advance_waypoint 전이므로)
         next_idx = ctx.current_waypoint_idx + 1
         if next_idx < len(ctx.waypoint_ids):
             target_marker = ctx.waypoint_ids[next_idx]
         else:
             target_marker = ctx.final_goal_id
 
-        # Calculate turn angle dynamically
         turn_angle = self._calculate_turn_angle(current_marker, target_marker)
 
         self.fsm.set_turn_target(turn_angle)
 
-        # Publish turn target (as centiradians for Int32)
         turn_msg = Int32()
-        turn_msg.data = int(turn_angle * 100)  # radians * 100
+        turn_msg.data = int(turn_angle * 100)
         self.pub_turn_target.publish(turn_msg)
 
         self.get_logger().info(
@@ -300,11 +660,9 @@ class MissionManagerNode(Node):
             with open(yaml_path, 'r') as f:
                 data = yaml.safe_load(f)
 
-            # Get unit scale from file or parameter
             unit_scale = data.get('unit_scale', self.unit_scale)
             default_yaw = data.get('default_marker_yaw', self.default_marker_yaw)
 
-            # Load road markers
             road_markers = data.get('road_markers', {})
             for marker_id, info in road_markers.items():
                 pos = info.get('position', [0, 0])
@@ -315,7 +673,6 @@ class MissionManagerNode(Node):
                 )
                 self._marker_yaw[int(marker_id)] = yaw
 
-            # Load parking markers
             parking_markers = data.get('parking_markers', {})
             for marker_id, info in parking_markers.items():
                 pos = info.get('position', [0, 0])
@@ -326,7 +683,6 @@ class MissionManagerNode(Node):
                 )
                 self._marker_yaw[int(marker_id)] = yaw
 
-            # Also support simple list format (config/marker_map.yaml)
             markers_list = data.get('markers', [])
             for marker in markers_list:
                 marker_id = marker.get('id')
@@ -355,20 +711,19 @@ class MissionManagerNode(Node):
         dx = to_pos[0] - from_pos[0]
         dy = to_pos[1] - from_pos[1]
 
-        if abs(dx) > 0.001 or abs(dy) > 0.001:  # Avoid division by zero
+        if abs(dx) > 0.001 or abs(dy) > 0.001:
             self._current_heading = math.atan2(dy, dx)
             self.get_logger().debug(
                 f'Heading updated: {math.degrees(self._current_heading):.1f}deg '
                 f'(from marker {from_marker} to {to_marker})'
             )
 
-            # Publish current heading
             heading_msg = Float32()
             heading_msg.data = self._current_heading
             self.pub_heading.publish(heading_msg)
 
     def _calculate_turn_angle(self, current_marker: int, target_marker: int) -> float:
-        """Calculate turn angle to face target marker from current position and heading."""
+        """Calculate turn angle to face target marker."""
         if current_marker not in self._marker_positions:
             self.get_logger().warn(f'Current marker {current_marker} not in map')
             return self.default_turn_angle
@@ -387,10 +742,7 @@ class MissionManagerNode(Node):
             self.get_logger().warn('Target marker at same position as current')
             return 0.0
 
-        # Target direction (absolute angle in map frame)
         target_direction = math.atan2(dy, dx)
-
-        # Turn angle = target direction - current heading
         turn_angle = wrap_angle(target_direction - self._current_heading)
 
         self.get_logger().debug(
@@ -425,12 +777,11 @@ class MissionManagerNode(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.task_id = ctx.task_id
 
-        # Map FSM state to status
         if state == MissionState.FINISH:
             msg.status = 'COMPLETED'
         elif state == MissionState.ERROR:
             msg.status = 'FAILED'
-        elif state == MissionState.IDLE:
+        elif state in (MissionState.IDLE, MissionState.WAIT_VEHICLE):
             msg.status = 'IDLE'
         else:
             msg.status = 'RUNNING'
@@ -442,6 +793,55 @@ class MissionManagerNode(Node):
         msg.message = ctx.error_message if ctx.error_message else f'At {state.name}'
 
         self.pub_task_status.publish(msg)
+
+    def _publish_parking_status(self):
+        """Publish parking status for debugging."""
+        if not self._has_interface:
+            return
+
+        # Publish during parking and related states
+        if self.fsm.state not in (
+            MissionState.PARK_DETECT,
+            MissionState.PARK_RECOVERY,
+            MissionState.PARK_ALIGN_MARKER,
+            MissionState.PARK_ALIGN_RECT,
+            MissionState.PARK_FINAL,
+            MissionState.LOAD,
+            MissionState.UNLOAD,
+        ):
+            return
+
+        ctx = self.fsm.context.parking
+
+        msg = self._ParkingStatus()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.sub_state = self.fsm.state.name
+        msg.detected_slot_id = ctx.detected_slot_id
+        msg.target_slot_id = ctx.target_slot_id
+        msg.slot_verified = ctx.slot_verified
+        msg.marker_distance = ctx.marker_distance
+        msg.marker_angle = ctx.marker_angle
+
+        # Build message
+        if self.fsm.state == MissionState.PARK_DETECT:
+            if ctx.detected_slot_id < 0:
+                msg.message = 'Searching for slot marker...'
+            else:
+                msg.message = f'Detected slot {ctx.detected_slot_id}'
+        elif self.fsm.state == MissionState.PARK_RECOVERY:
+            msg.message = f'Recovery: {ctx.recovery_direction} {ctx.recovery_distance:.2f}m'
+        elif self.fsm.state == MissionState.PARK_ALIGN_MARKER:
+            msg.message = f'Aligning marker, angle={math.degrees(ctx.marker_angle):.1f}deg'
+        elif self.fsm.state == MissionState.PARK_ALIGN_RECT:
+            msg.message = 'Aligning to rectangle'
+        elif self.fsm.state == MissionState.PARK_FINAL:
+            msg.message = f'Final positioning, dist={ctx.marker_distance:.2f}m'
+        elif self.fsm.state == MissionState.LOAD:
+            msg.message = f'Loading vehicle, loader={self._loader_status}'
+        elif self.fsm.state == MissionState.UNLOAD:
+            msg.message = f'Unloading vehicle, loader={self._loader_status}'
+
+        self.pub_parking_status.publish(msg)
 
 
 def main(args=None):

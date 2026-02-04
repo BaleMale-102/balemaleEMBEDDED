@@ -28,6 +28,7 @@ def generate_launch_description():
     bringup_dir = get_package_share_directory('robot_bringup')
     config_file = os.path.join(bringup_dir, 'config', 'robot_params.yaml')
     cam_front_calib = os.path.join(bringup_dir, 'config', 'cam_front_calib.yaml')
+    cam_side_calib = os.path.join(bringup_dir, 'config', 'cam_side_calib.yaml')
 
     # ==========================================
     # Launch Arguments
@@ -41,13 +42,13 @@ def generate_launch_description():
     cam_front_dev_arg = DeclareLaunchArgument(
         'cam_front_dev',
         default_value='/dev/video0',
-        description='Front camera device'
+        description='Front camera device (C920)'
     )
 
     cam_side_dev_arg = DeclareLaunchArgument(
         'cam_side_dev',
-        default_value='/dev/video4',
-        description='Side camera device'
+        default_value='/dev/video2',
+        description='Side camera device (Brio 100)'
     )
 
     arduino_port_arg = DeclareLaunchArgument(
@@ -74,6 +75,7 @@ def generate_launch_description():
                 'device': LaunchConfiguration('cam_front_dev'),
                 'simulate': simulation,
                 'calibration_file': cam_front_calib,
+                'camera_name': 'cam_front',
             }
         ],
         output='screen'
@@ -89,6 +91,8 @@ def generate_launch_description():
             {
                 'device': LaunchConfiguration('cam_side_dev'),
                 'simulate': simulation,
+                'calibration_file': cam_side_calib,
+                'camera_name': 'cam_side',
             }
         ],
         output='screen'
@@ -126,20 +130,20 @@ def generate_launch_description():
     # Static TF Publishers
     # ==========================================
 
-    # base_link -> camera_front (10cm forward, 1cm up)
+    # base_link -> camera_front (10cm 전방, 0.5mm 우측, 4cm 위)
     tf_base_to_cam_front = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='tf_base_to_cam_front',
-        arguments=['0.10', '0', '0.01', '0', '0', '0', 'base_link', 'camera_front']
+        arguments=['0.10', '-0.0005', '0.04', '0', '0', '0', 'base_link', 'camera_front']
     )
 
-    # base_link -> camera_side (오른쪽, yaw -90도)
+    # base_link -> camera_side (10cm 좌측, 7.5cm 아래, yaw +90도)
     tf_base_to_cam_side = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         name='tf_base_to_cam_side',
-        arguments=['0', '-0.05', '0.03', '0', '0', '-1.5708', 'base_link', 'camera_side']
+        arguments=['0', '0.1', '-0.075', '0', '0', '1.5708', 'base_link', 'camera_side']
     )
 
     # base_link -> imu_link

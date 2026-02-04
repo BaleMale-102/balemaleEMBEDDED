@@ -11,8 +11,8 @@ Arguments:
     config_file: Path to parameter file (default: robot_params.yaml)
 
 Nodes:
-    Perception: marker_detector, marker_tracker, lane_detector
-    Control: motion_controller, wheel_controller
+    Perception: marker_detector (front), side_marker_detector, marker_tracker, slot_line_detector
+    Control: motion_controller, loader_driver
     Planning: mission_manager, server_bridge
 """
 
@@ -21,7 +21,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node, PushRosNamespace
 
 
@@ -54,11 +54,18 @@ def generate_launch_description():
         description='Path to marker map file'
     )
 
+    loader_simulate_arg = DeclareLaunchArgument(
+        'loader_simulate',
+        default_value='true',
+        description='Simulate loader (no hardware)'
+    )
+
     # Get launch configurations
     simulation = LaunchConfiguration('simulation')
     show_debug = LaunchConfiguration('show_debug')
     config_file = LaunchConfiguration('config_file')
     marker_map = LaunchConfiguration('marker_map')
+    loader_simulate = LaunchConfiguration('loader_simulate')
 
     # Marker map parameter dict for nodes that need it
     marker_map_param = {'marker_map_yaml': marker_map}
@@ -80,10 +87,35 @@ def generate_launch_description():
             package='marker_detector',
             executable='detector_node',
             name='marker_detector',
-            parameters=[config_file, {'show_debug_window': show_debug}],
+            parameters=[
+                config_file,
+                {
+                    'show_debug_window': True,  # 디버그 창 표시
+                    'image_topic': '/cam_front/image_raw',
+                    'camera_info_topic': '/cam_front/camera_info',
+                    'frame_id': 'camera_front_link',
+                }
+            ],
+            additional_env=x11_env,
+        ),
+
+        # Side Marker Detector (측면 카메라 - 주차용)
+        Node(
+            package='marker_detector',
+            executable='detector_node',
+            name='side_marker_detector',
+            parameters=[
+                config_file,
+                {
+                    'show_debug_window': True,  # 디버그 창 표시
+                    'image_topic': '/cam_side/image_raw',
+                    'camera_info_topic': '/cam_side/camera_info',
+                    'output_topic': '/perception/side_markers',
+                    'frame_id': 'camera_side_link',
+                }
+            ],
             remappings=[
-                ('image_raw', '/cam_front/image_raw'),
-                ('camera_info', '/cam_front/camera_info'),
+                ('/perception/markers', '/perception/side_markers'),
             ],
             additional_env=x11_env,
         ),
@@ -95,6 +127,22 @@ def generate_launch_description():
             name='marker_tracker',
             parameters=[config_file],
         ),
+
+        # Slot Line Detector (비활성화 - 카메라 거리 문제)
+        # Node(
+        #     package='slot_line_detector',
+        #     executable='detector_node',
+        #     name='slot_line_detector',
+        #     parameters=[
+        #         config_file,
+        #         {
+        #             'image_topic': '/cam_side/image_raw',
+        #             'publish_debug_image': True,
+        #             'show_debug_window': True,
+        #         }
+        #     ],
+        #     additional_env=x11_env,
+        # ),
 
         # Lane Detector (비활성화 - 마커 전용 주행)
         # Node(
@@ -123,6 +171,17 @@ def generate_launch_description():
             executable='controller_node',
             name='motion_controller',
             parameters=[config_file],
+        ),
+
+        # Loader Driver (차량 적재 메커니즘)
+        Node(
+            package='loader_driver',
+            executable='loader_node',
+            name='loader_driver',
+            parameters=[
+                config_file,
+                {'simulate': loader_simulate},
+            ],
         ),
     ])
 
@@ -156,6 +215,7 @@ def generate_launch_description():
         show_debug_arg,
         config_file_arg,
         marker_map_arg,
+        loader_simulate_arg,
 
         # Node groups
         perception_group,
