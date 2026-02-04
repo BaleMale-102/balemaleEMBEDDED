@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-bridge_node.py - Server Bridge Node
+bridge_node.py - MQTT-ROS2 Bridge for balemale backend
 
-Bridges MQTT communication with ROS2 topics using balemale backend format.
+Bridges MQTT communication with ROS2 topics.
+Communication developer can modify MQTT logic independently.
 
 MQTT Topics (balemale format):
   Subscribes:
@@ -15,6 +16,7 @@ MQTT Topics (balemale format):
     balemale/robot/{robotId}/event - Robot events (status updates)
     balemale/robot/{robotId}/anomaly - Anomaly detection
     balemale/robot/{robotId}/ack - ACK for server commands
+    balemale/robot/{robotId}/heartbeat - Heartbeat
 
 ROS2 Topics:
   Subscribes:
@@ -26,129 +28,329 @@ ROS2 Topics:
     /plate/response: PlateResponse - Plate verification result
 """
 
+import json
+import time
 import uuid
+import threading
+from datetime import datetime
+from typing import Any, Dict, Optional, Callable
+
 import rclpy
 from rclpy.node import Node
+
+import paho.mqtt.client as mqtt
+
+# Standard ROS msgs
 from std_msgs.msg import String
 
+# robot_interfaces - DO NOT CHANGE (used by other nodes)
 from robot_interfaces.msg import (
-    MissionCommand, MissionStatus,
-    PlateQuery, PlateResponse
+    MissionCommand,
+    MissionStatus,
+    PlateQuery,
+    PlateResponse,
 )
 
-from .mqtt_client import MQTTClient, MQTTConfig
+
+# ============================================================================
+# Helper functions
+# ============================================================================
+
+def now_iso() -> str:
+    """Get current timestamp in ISO 8601 format."""
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
-class ServerBridgeNode(Node):
+def now_unix() -> int:
+    """Get current Unix timestamp."""
+    return int(time.time())
+
+
+# ============================================================================
+# Main Bridge Node
+# ============================================================================
+
+class MqttRosBridge(Node):
     """ROS2 to MQTT bridge for balemale backend."""
 
     def __init__(self):
-        super().__init__('server_bridge_node')
+        super().__init__("server_bridge")
 
-        # Parameters
-        self.declare_parameter('mqtt_host', 'localhost')
-        self.declare_parameter('mqtt_port', 8000)
-        self.declare_parameter('mqtt_username', '')
-        self.declare_parameter('mqtt_password', '')
-        self.declare_parameter('robot_id', 1)
-        self.declare_parameter('simulation', False)
-        self.declare_parameter('heartbeat_rate', 1.0)
-        self.declare_parameter('status_rate', 2.0)
+        # ====================================================================
+        # ROS Parameters - MQTT Connection
+        # ====================================================================
+        self.declare_parameter("mqtt.host", "43.202.0.116")
+        self.declare_parameter("mqtt.port", 8000)
+        self.declare_parameter("mqtt.username", "")
+        self.declare_parameter("mqtt.password", "")
+        self.declare_parameter("mqtt.client_id", "rc-robot-bridge")
+        self.declare_parameter("mqtt.keepalive", 60)
+        self.declare_parameter("robot_id", 1)
+        self.declare_parameter("simulation", False)
 
-        # Load parameters
-        mqtt_host = self.get_parameter('mqtt_host').value
-        mqtt_port = self.get_parameter('mqtt_port').value
-        mqtt_username = self.get_parameter('mqtt_username').value
-        mqtt_password = self.get_parameter('mqtt_password').value
-        robot_id = self.get_parameter('robot_id').value
-        simulation = self.get_parameter('simulation').value
-        heartbeat_rate = self.get_parameter('heartbeat_rate').value
+        # ====================================================================
+        # ROS Parameters - MQTT Topics (balemale format)
+        # ====================================================================
+        # Subscribe topics
+        self.declare_parameter("mqtt.sub.server_cmd", "balemale/robot/{robotId}/cmd")
+        self.declare_parameter("mqtt.sub.server_map", "balemale/robot/{robotId}/map")
+        self.declare_parameter("mqtt.sub.server_ack", "balemale/robot/{robotId}/cmd/ack")
 
-        # MQTT configuration
-        config = MQTTConfig(
-            host=mqtt_host,
-            port=mqtt_port,
-            username=mqtt_username,
-            password=mqtt_password,
-            robot_id=robot_id
-        )
+        # Publish topics
+        self.declare_parameter("mqtt.pub.dispatch_request", "balemale/robot/{robotId}/request/dispatch")
+        self.declare_parameter("mqtt.pub.reroute_request", "balemale/robot/{robotId}/request/reroute")
+        self.declare_parameter("mqtt.pub.event", "balemale/robot/{robotId}/event")
+        self.declare_parameter("mqtt.pub.anomaly", "balemale/robot/{robotId}/anomaly")
+        self.declare_parameter("mqtt.pub.ack", "balemale/robot/{robotId}/ack")
+        self.declare_parameter("mqtt.pub.heartbeat", "balemale/robot/{robotId}/heartbeat")
 
-        self.robot_id = robot_id
+        # ====================================================================
+        # ROS Parameters - ROS Topics (DO NOT CHANGE - used by other nodes)
+        # ====================================================================
+        self.declare_parameter("ros.pub.task_cmd", "/server/task_cmd")
+        self.declare_parameter("ros.pub.plate_response", "/plate/response")
+        self.declare_parameter("ros.sub.task_status", "/server/task_status")
+        self.declare_parameter("ros.sub.plate_query", "/plate/query")
+        self.declare_parameter("ros.sub.mission_state", "/mission/state")
 
-        # State tracking
+        # ====================================================================
+        # ROS Parameters - Behavior
+        # ====================================================================
+        self.declare_parameter("heartbeat_hz", 1.0)
+        self.declare_parameter("log_throttle_sec", 1.0)
+
+        # ====================================================================
+        # Load Parameters
+        # ====================================================================
+        self.mqtt_host = self.get_parameter("mqtt.host").value
+        self.mqtt_port = int(self.get_parameter("mqtt.port").value)
+        self.mqtt_user = self.get_parameter("mqtt.username").value
+        self.mqtt_pass = self.get_parameter("mqtt.password").value
+        self.client_id = self.get_parameter("mqtt.client_id").value
+        self.keepalive = int(self.get_parameter("mqtt.keepalive").value)
+        self.robot_id = str(int(self.get_parameter("robot_id").value))
+        self.simulation = bool(self.get_parameter("simulation").value)
+
+        self.hb_hz = float(self.get_parameter("heartbeat_hz").value)
+        self.log_thr = float(self.get_parameter("log_throttle_sec").value)
+
+        if self.hb_hz <= 0:
+            self.hb_hz = 1.0
+
+        # Format MQTT topics with robot_id
+        self.t_sub_server_cmd = self._fmt_topic("mqtt.sub.server_cmd")
+        self.t_sub_server_map = self._fmt_topic("mqtt.sub.server_map")
+        self.t_sub_server_ack = self._fmt_topic("mqtt.sub.server_ack")
+        self.t_pub_dispatch = self._fmt_topic("mqtt.pub.dispatch_request")
+        self.t_pub_reroute = self._fmt_topic("mqtt.pub.reroute_request")
+        self.t_pub_event = self._fmt_topic("mqtt.pub.event")
+        self.t_pub_anomaly = self._fmt_topic("mqtt.pub.anomaly")
+        self.t_pub_ack = self._fmt_topic("mqtt.pub.ack")
+        self.t_pub_heartbeat = self._fmt_topic("mqtt.pub.heartbeat")
+
+        # ROS topics
+        self.ros_pub_task_cmd = self.get_parameter("ros.pub.task_cmd").value
+        self.ros_pub_plate_response = self.get_parameter("ros.pub.plate_response").value
+        self.ros_sub_task_status = self.get_parameter("ros.sub.task_status").value
+        self.ros_sub_plate_query = self.get_parameter("ros.sub.plate_query").value
+        self.ros_sub_mission_state = self.get_parameter("ros.sub.mission_state").value
+
+        # ====================================================================
+        # State Tracking
+        # ====================================================================
         self._current_req_id = ""
         self._current_cmd_id = ""
         self._current_vehicle_id = -1
         self._current_node_id = 0
-        self._next_node_id = -1
         self._last_mission_state = ""
-        self._last_event_type = ""  # For deduplication
+        self._last_event_type = ""
+        self._last_log_t = 0.0
 
-        # MQTT client
-        self.mqtt = MQTTClient(config, simulation, logger=self.get_logger())
-        self.mqtt.set_connect_callback(self._mqtt_connect_callback)
-        self.mqtt.set_server_cmd_callback(self._mqtt_server_cmd_callback)
-        self.mqtt.set_map_callback(self._mqtt_map_callback)
-        self.mqtt.set_ack_callback(self._mqtt_ack_callback)
-
-        # Publishers
+        # ====================================================================
+        # ROS Publishers - DO NOT CHANGE TYPES (used by other nodes)
+        # ====================================================================
         self.pub_task_cmd = self.create_publisher(
-            MissionCommand, '/server/task_cmd', 10
+            MissionCommand, self.ros_pub_task_cmd, 10
         )
         self.pub_plate_response = self.create_publisher(
-            PlateResponse, '/plate/response', 10
+            PlateResponse, self.ros_pub_plate_response, 10
         )
 
-        # Subscribers
+        # ====================================================================
+        # ROS Subscribers - DO NOT CHANGE TYPES (used by other nodes)
+        # ====================================================================
         self.sub_task_status = self.create_subscription(
-            MissionStatus, '/server/task_status',
-            self._task_status_callback, 10
+            MissionStatus, self.ros_sub_task_status,
+            self._cb_task_status, 10
         )
         self.sub_plate_query = self.create_subscription(
-            PlateQuery, '/plate/query',
-            self._plate_query_callback, 10
+            PlateQuery, self.ros_sub_plate_query,
+            self._cb_plate_query, 10
         )
-
         self.sub_mission_state = self.create_subscription(
-            String, '/mission/state',
-            self._mission_state_callback, 10
+            String, self.ros_sub_mission_state,
+            self._cb_mission_state, 10
         )
 
-        # Timers
-        if heartbeat_rate > 0:
-            self.heartbeat_timer = self.create_timer(
-                1.0 / heartbeat_rate, self._heartbeat_callback
-            )
+        # ====================================================================
+        # MQTT Client Setup
+        # ====================================================================
+        self._mqtt: Optional[mqtt.Client] = None
+        self._mqtt_lock = threading.Lock()
+        self._connected = False
 
-        # Connect to MQTT
-        if self.mqtt.connect():
-            self.get_logger().info(
-                f'Connecting to MQTT broker at {mqtt_host}:{mqtt_port}'
-            )
+        if not self.simulation:
+            self._setup_mqtt()
+            # Start MQTT loop thread
+            self._mqtt_thread = threading.Thread(target=self._mqtt_loop, daemon=True)
+            self._mqtt_thread.start()
         else:
-            self.get_logger().error('MQTT connection failed')
+            self._connected = True
+            self.get_logger().info("[SIMULATION] MQTT client not connecting")
 
+        # ====================================================================
+        # Heartbeat Timer
+        # ====================================================================
+        self.timer_hb = self.create_timer(1.0 / self.hb_hz, self._tick_heartbeat)
+
+        # ====================================================================
+        # Startup Log
+        # ====================================================================
         self.get_logger().info(
-            f'ServerBridgeNode started (robot_id={robot_id})'
+            f"MqttRosBridge started. robot_id={self.robot_id} "
+            f"mqtt={self.mqtt_host}:{self.mqtt_port} "
+            f"simulation={self.simulation}"
+        )
+        self.get_logger().info(
+            f"MQTT sub=[{self.t_sub_server_cmd}, {self.t_sub_server_map}] "
+            f"pub=[{self.t_pub_dispatch}, {self.t_pub_event}]"
         )
 
-    def _mqtt_connect_callback(self, connected: bool):
-        """Handle MQTT connection status."""
-        if connected:
-            self.get_logger().info('MQTT connected')
+    # ========================================================================
+    # Helper Methods
+    # ========================================================================
+
+    def _fmt_topic(self, param_name: str) -> str:
+        """Format MQTT topic template with robot_id."""
+        tmpl = self.get_parameter(param_name).value
+        return tmpl.replace("{robotId}", self.robot_id)
+
+    def _throttle_log(self, msg: str):
+        """Log with throttling."""
+        t = time.time()
+        if t - self._last_log_t >= self.log_thr:
+            self._last_log_t = t
+            self.get_logger().info(msg)
+
+    def _mqtt_publish(self, topic: str, payload: Dict[str, Any],
+                      qos: int = 0, retain: bool = False):
+        """Publish to MQTT (thread-safe)."""
+        if self.simulation:
+            self.get_logger().info(f"[SIM] MQTT publish {topic}: {payload}")
+            return
+
+        s = json.dumps(payload, ensure_ascii=False)
+        with self._mqtt_lock:
+            if self._connected and self._mqtt:
+                try:
+                    self._mqtt.publish(topic, s, qos=qos, retain=retain)
+                except Exception as e:
+                    self.get_logger().error(f"MQTT publish error: {e}")
+
+    # ========================================================================
+    # MQTT Setup and Callbacks
+    # ========================================================================
+
+    def _setup_mqtt(self):
+        """Initialize MQTT client."""
+        try:
+            # paho-mqtt 2.x API
+            self._mqtt = mqtt.Client(
+                callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+                client_id=self.client_id,
+                clean_session=True
+            )
+        except TypeError:
+            # paho-mqtt 1.x fallback
+            self._mqtt = mqtt.Client(
+                client_id=self.client_id,
+                clean_session=True
+            )
+
+        if self.mqtt_user:
+            self._mqtt.username_pw_set(self.mqtt_user, self.mqtt_pass)
+
+        # Last will (robot offline)
+        self._mqtt.will_set(
+            self.t_pub_heartbeat,
+            payload=json.dumps({
+                "alive": False,
+                "ts": now_iso(),
+                "robotId": self.robot_id
+            }),
+            qos=1,
+            retain=True,
+        )
+
+        self._mqtt.on_connect = self._on_mqtt_connect
+        self._mqtt.on_disconnect = self._on_mqtt_disconnect
+        self._mqtt.on_message = self._on_mqtt_message
+
+    def _mqtt_loop(self):
+        """MQTT network loop with auto-reconnect."""
+        while rclpy.ok():
+            try:
+                self._mqtt.connect(self.mqtt_host, self.mqtt_port, keepalive=self.keepalive)
+                self._mqtt.loop_forever(retry_first_connection=True)
+            except Exception as e:
+                self.get_logger().error(f"MQTT loop error: {e}")
+                time.sleep(5.0)
+
+    def _on_mqtt_connect(self, client, userdata, flags, rc):
+        """MQTT connect callback."""
+        self._connected = (rc == 0)
+        if self._connected:
+            self.get_logger().info(f"MQTT connected rc={rc}")
+            # Subscribe
+            client.subscribe(self.t_sub_server_cmd, qos=1)
+            client.subscribe(self.t_sub_server_map, qos=1)
+            client.subscribe(self.t_sub_server_ack, qos=1)
+            # Online heartbeat
+            self._mqtt_publish(
+                self.t_pub_heartbeat,
+                {"alive": True, "ts": now_iso(), "robotId": self.robot_id},
+                qos=1, retain=True
+            )
         else:
-            self.get_logger().warn('MQTT disconnected')
+            self.get_logger().error(f"MQTT connect failed rc={rc}")
 
-    def _mqtt_ack_callback(self, payload: dict):
-        """Handle ACK from server for our requests."""
-        req_id = payload.get("reqId", "")
-        is_ack = payload.get("isAck", False)
-        if is_ack:
-            self.get_logger().info(f'Server acknowledged request: {req_id}')
+    def _on_mqtt_disconnect(self, client, userdata, rc):
+        """MQTT disconnect callback."""
+        self._connected = False
+        self.get_logger().warn(f"MQTT disconnected rc={rc}")
 
-    def _mqtt_server_cmd_callback(self, payload: dict):
+    def _on_mqtt_message(self, client, userdata, msg):
+        """MQTT message callback - route to handlers."""
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+        except Exception as e:
+            self.get_logger().error(f"MQTT RX invalid JSON on {msg.topic}: {e}")
+            return
+
+        if msg.topic == self.t_sub_server_cmd:
+            self._handle_server_cmd(payload)
+        elif msg.topic == self.t_sub_server_map:
+            self._handle_server_map(payload)
+        elif msg.topic == self.t_sub_server_ack:
+            self._handle_server_ack(payload)
+
+    # ========================================================================
+    # MQTT -> ROS Handlers (Modify these for communication changes)
+    # ========================================================================
+
+    def _handle_server_cmd(self, p: Dict[str, Any]):
         """
-        Handle server command from MQTT.
+        Handle server command from MQTT (type 1, 2, 3).
 
         Server cmd format:
         {
@@ -163,10 +365,10 @@ class ServerBridgeNode(Node):
         }
         """
         try:
-            cmd_type = str(payload.get("type", ""))
-            req_id = str(payload.get("reqId", ""))
-            cmd_id = str(payload.get("cmdId", ""))
-            inner = payload.get("payload", {})
+            cmd_type = str(p.get("type", ""))
+            req_id = str(p.get("reqId", ""))
+            cmd_id = str(p.get("cmdId", ""))
+            inner = p.get("payload", {})
 
             if not isinstance(inner, dict):
                 inner = {}
@@ -175,12 +377,12 @@ class ServerBridgeNode(Node):
             target_node_id = int(inner.get("targetNodeId", -1))
             path = inner.get("path", [])
 
-            # Clean path to integers
+            # Clean path
             clean_path = []
             if isinstance(path, list):
-                for p in path:
+                for x in path:
                     try:
-                        clean_path.append(int(p))
+                        clean_path.append(int(x))
                     except (ValueError, TypeError):
                         pass
 
@@ -189,38 +391,36 @@ class ServerBridgeNode(Node):
             self._current_cmd_id = cmd_id
             self._current_vehicle_id = vehicle_id
 
-            # Send ACK for the command
+            # Send ACK
             if cmd_id:
-                self.mqtt.publish_ack(cmd_id, True)
+                self._publish_ack(cmd_id, True)
 
+            # Route by type
             if cmd_type == "1":
-                # Dispatch result - respond to plate query
                 self.get_logger().info(
-                    f'[DISPATCH] req={req_id} vehicle={vehicle_id} '
-                    f'target={target_node_id} path={clean_path}'
+                    f"[DISPATCH] req={req_id} vehicle={vehicle_id} "
+                    f"target={target_node_id} path={clean_path}"
                 )
                 self._handle_dispatch_result(req_id, vehicle_id, target_node_id, clean_path)
 
             elif cmd_type == "2":
-                # Reroute result
                 self.get_logger().info(
-                    f'[REROUTE] req={req_id} vehicle={vehicle_id} '
-                    f'target={target_node_id} path={clean_path}'
+                    f"[REROUTE] req={req_id} vehicle={vehicle_id} "
+                    f"target={target_node_id} path={clean_path}"
                 )
                 self._handle_reroute_result(req_id, vehicle_id, target_node_id, clean_path)
 
             elif cmd_type == "3":
-                # Exit result (출차)
                 self.get_logger().info(
-                    f'[EXIT] vehicle={vehicle_id} target={target_node_id} path={clean_path}'
+                    f"[EXIT] vehicle={vehicle_id} target={target_node_id} path={clean_path}"
                 )
                 self._handle_exit_result(vehicle_id, target_node_id, clean_path)
 
             else:
-                self.get_logger().warn(f'Unknown server cmd type: {cmd_type}')
+                self.get_logger().warn(f"Unknown server cmd type: {cmd_type}")
 
         except Exception as e:
-            self.get_logger().error(f'Server cmd parse error: {e}')
+            self.get_logger().error(f"Server cmd parse error: {e}")
 
     def _handle_dispatch_result(self, req_id: str, vehicle_id: int,
                                  target_node_id: int, path: list):
@@ -228,26 +428,26 @@ class ServerBridgeNode(Node):
         # Publish PlateResponse
         resp = PlateResponse()
         resp.header.stamp = self.get_clock().now().to_msg()
-        resp.plate_number = ""  # Server doesn't echo back plate
+        resp.plate_number = ""
         resp.verified = (target_node_id >= 0)
         resp.assigned_slot_id = target_node_id
-        resp.waypoint_ids = list(path)  # Use full path as waypoints
+        resp.waypoint_ids = list(path)
         resp.message = f"Dispatch assigned: slot {target_node_id}" if resp.verified else "Dispatch failed"
 
         self.pub_plate_response.publish(resp)
 
-        # Publish MissionCommand to start driving
+        # Publish MissionCommand
         if resp.verified:
             cmd = MissionCommand()
             cmd.header.stamp = self.get_clock().now().to_msg()
             cmd.command = "START"
-            cmd.waypoint_ids = list(path)  # Use full path as waypoints
+            cmd.waypoint_ids = list(path)
             cmd.final_goal_id = target_node_id
             cmd.task_type = "PARK"
             cmd.task_id = req_id
 
             self.pub_task_cmd.publish(cmd)
-            self.get_logger().info(f'Task command published: PARK to {target_node_id}')
+            self.get_logger().info(f"Task command published: PARK to {target_node_id}")
 
     def _handle_reroute_result(self, req_id: str, vehicle_id: int,
                                 target_node_id: int, path: list):
@@ -255,16 +455,16 @@ class ServerBridgeNode(Node):
         cmd = MissionCommand()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.command = "REROUTE"
-        cmd.waypoint_ids = list(path)  # Use full path as waypoints
+        cmd.waypoint_ids = list(path)
         cmd.final_goal_id = target_node_id
         cmd.task_type = "REROUTE"
         cmd.task_id = req_id
 
         self.pub_task_cmd.publish(cmd)
-        self.get_logger().info(f'Reroute command published: new path to {target_node_id}')
+        self.get_logger().info(f"Reroute command published: new path to {target_node_id}")
 
     def _handle_exit_result(self, vehicle_id: int, target_node_id: int, path: list):
-        """Handle exit (출차) result."""
+        """Handle exit result."""
         req_id = str(uuid.uuid4())[:8]
         self._current_req_id = req_id
         self._current_vehicle_id = vehicle_id
@@ -272,33 +472,19 @@ class ServerBridgeNode(Node):
         cmd = MissionCommand()
         cmd.header.stamp = self.get_clock().now().to_msg()
         cmd.command = "START"
-        cmd.waypoint_ids = list(path)  # Use full path as waypoints
+        cmd.waypoint_ids = list(path)
         cmd.final_goal_id = target_node_id
         cmd.task_type = "EXIT"
         cmd.task_id = req_id
 
         self.pub_task_cmd.publish(cmd)
-        self.get_logger().info(f'Exit command published: drive to {target_node_id}')
+        self.get_logger().info(f"Exit command published: drive to {target_node_id}")
 
-    def _mqtt_map_callback(self, payload: dict):
-        """
-        Handle map data from MQTT (type 4).
-
-        Format:
-        {
-            "type": "4",
-            "cmdId": "...",
-            "payload": {
-                "node": [
-                    {"nodeId": 1, "nodeCode": "A1", "x": 0.5, "y": 0.5, "nodeType": "SLOT", "nodeStatus": "NORMAL"},
-                    ...
-                ]
-            }
-        }
-        """
+    def _handle_server_map(self, p: Dict[str, Any]):
+        """Handle map data from MQTT (type 4)."""
         try:
-            cmd_id = payload.get("cmdId", "")
-            inner = payload.get("payload", {})
+            cmd_id = p.get("cmdId", "")
+            inner = p.get("payload", {})
             if not isinstance(inner, dict):
                 return
 
@@ -308,46 +494,57 @@ class ServerBridgeNode(Node):
 
             # Send ACK
             if cmd_id:
-                self.mqtt.publish_ack(cmd_id, True)
+                self._publish_ack(cmd_id, True)
 
-            self.get_logger().info(f'Received map with {len(nodes)} nodes')
+            self.get_logger().info(f"Received map with {len(nodes)} nodes")
             # TODO: Publish to /server/map_nodes if needed
 
         except Exception as e:
-            self.get_logger().error(f'Map parse error: {e}')
+            self.get_logger().error(f"Map parse error: {e}")
 
-    def _task_status_callback(self, msg):
+    def _handle_server_ack(self, p: Dict[str, Any]):
+        """Handle ACK from server."""
+        req_id = p.get("reqId", "")
+        is_ack = p.get("isAck", False)
+        if is_ack:
+            self.get_logger().info(f"Server acknowledged request: {req_id}")
+
+    # ========================================================================
+    # ROS -> MQTT Callbacks (Modify these for communication changes)
+    # ========================================================================
+
+    def _cb_task_status(self, msg: MissionStatus):
         """
         Handle task status update from mission_manager.
         Forward as event to MQTT only when event type changes.
         """
-        if not self.mqtt.is_connected:
+        if not self._connected:
             return
 
-        # Update current node tracking (only if valid, keep previous value if -1)
+        # Update current node tracking
         if msg.current_marker_id >= 0:
             self._current_node_id = msg.current_marker_id
 
-        # Map MissionStatus to event type
+        # Map to event type
         event_type = self._map_status_to_event(msg.status, msg.current_state)
 
-        # Only send event if changed and we have valid req_id and vehicle_id
+        # Only send if changed
         if event_type and event_type != self._last_event_type:
             if self._current_req_id and self._current_vehicle_id >= 0:
-                self.mqtt.publish_event(
+                self._publish_event(
                     req_id=self._current_req_id,
                     vehicle_id=self._current_vehicle_id,
                     event_type=event_type
                 )
-                self.get_logger().info(f'Event changed: {self._last_event_type} -> {event_type}')
+                self.get_logger().info(f"Event changed: {self._last_event_type} -> {event_type}")
             self._last_event_type = event_type
 
     def _map_status_to_event(self, status: str, state: str) -> str:
         """
         Map MissionStatus to event type for server.
 
-        Backend agreed event types:
-        - WAITING: 대기 중 (로봇 대기 공간에서)
+        Event types:
+        - WAITING: 대기 중
         - LOADING: 적재 중
         - DRIVING_DESTINATION: 목적지로 이동 중
         - DRIVING_HOME: 집으로 이동 중
@@ -355,115 +552,176 @@ class ServerBridgeNode(Node):
         - PARKING: 주차중
         - FAILED: 실패
         """
-        # Status-based events
         if status == "COMPLETED":
-            return "WAITING"  # Mission completed, back to waiting
+            return "WAITING"
         elif status == "FAILED":
             return "FAILED"
 
-        # State-based events (match backend protocol)
         state_event_map = {
-            # 대기
             "IDLE": "WAITING",
             "WAIT_VEHICLE": "WAITING",
-            # 적재/하역
             "LOAD": "LOADING",
             "UNLOAD": "LOADING",
-            # 목적지 이동 (주차 포함)
             "DRIVE": "DRIVING_DESTINATION",
             "TURNING": "DRIVING_DESTINATION",
             "ALIGN_TO_MARKER": "DRIVING_DESTINATION",
             "ADVANCE_TO_CENTER": "DRIVING_DESTINATION",
             "STOP_AT_MARKER": "DRIVING_DESTINATION",
             "STOP_BUMP": "DRIVING_DESTINATION",
-            # 주차
             "PARK": "PARKING",
             "PARK_DETECT": "PARKING",
             "PARK_ALIGN_MARKER": "PARKING",
             "PARK_FINAL": "PARKING",
-            # 복귀
             "RETURN_HOME": "DRIVING_HOME",
-            # 에러
             "ERROR": "ESTOP",
         }
 
         return state_event_map.get(state, "")
 
-    def _plate_query_callback(self, msg):
+    def _cb_plate_query(self, msg: PlateQuery):
         """
         Handle plate query from mission_manager.
         Forward as dispatch request to MQTT.
         """
-        if not self.mqtt.is_connected:
-            self.get_logger().warn('Cannot send dispatch request: MQTT not connected')
+        if not self._connected:
+            self.get_logger().warn("Cannot send dispatch request: MQTT not connected")
             return
 
-        # Generate request ID if not provided
         req_id = str(uuid.uuid4())[:8]
         self._current_req_id = req_id
 
-        self.mqtt.publish_dispatch_request(
+        self._publish_dispatch_request(
             req_id=req_id,
             plate=msg.plate_number,
             now_node_id=self._current_node_id,
             target_location="DESTINATION"
         )
 
-        self.get_logger().info(f'Dispatch request sent: plate={msg.plate_number}')
+        self.get_logger().info(f"Dispatch request sent: plate={msg.plate_number}")
 
-    def _mission_state_callback(self, msg: String):
+    def _cb_mission_state(self, msg: String):
         """Handle mission state change."""
         if msg.data != self._last_mission_state:
             self._last_mission_state = msg.data
-            # Could publish state change event if needed
 
-    def _heartbeat_callback(self):
+    # ========================================================================
+    # MQTT Publish Methods (Modify payloads here for protocol changes)
+    # ========================================================================
+
+    def _publish_dispatch_request(self, req_id: str, plate: str,
+                                   now_node_id: int, target_location: str):
+        """Publish dispatch request to server."""
+        payload = {
+            "reqId": req_id,
+            "plate": plate,
+            "nowNodeId": now_node_id,
+            "targetLocation": target_location,
+            "ts": now_iso()
+        }
+        self._mqtt_publish(self.t_pub_dispatch, payload, qos=1)
+
+    def _publish_reroute_request(self, req_id: str, vehicle_id: int, now_node_id: int):
+        """Publish reroute request to server."""
+        payload = {
+            "reqId": req_id,
+            "vehicleId": vehicle_id,
+            "nowNodeId": now_node_id,
+            "ts": now_iso()
+        }
+        self._mqtt_publish(self.t_pub_reroute, payload, qos=1)
+
+    def _publish_event(self, req_id: str, vehicle_id: int, event_type: str):
+        """Publish robot event to server."""
+        payload = {
+            "reqId": req_id,
+            "vehicleId": vehicle_id,
+            "eventType": event_type,
+            "ts": now_iso()
+        }
+        self._mqtt_publish(self.t_pub_event, payload, qos=1)
+
+    def _publish_anomaly(self, req_id: str, vehicle_id: int, event_type: str,
+                         anomaly_type: str, edge_id: int, now_node_id: int, next_node_id: int):
+        """Publish anomaly detection to server."""
+        payload = {
+            "reqId": req_id,
+            "vehicleId": vehicle_id,
+            "eventType": event_type,
+            "anomalyType": anomaly_type,
+            "edgeId": edge_id,
+            "nowNodeId": now_node_id,
+            "nextNodeId": next_node_id,
+            "ts": now_iso()
+        }
+        self._mqtt_publish(self.t_pub_anomaly, payload, qos=1)
+
+    def _publish_ack(self, cmd_id: str, is_ack: bool = True):
+        """Publish ACK for server command."""
+        payload = {
+            "cmdId": cmd_id,
+            "isAck": is_ack
+        }
+        self._mqtt_publish(self.t_pub_ack, payload, qos=1)
+
+    def _tick_heartbeat(self):
         """Periodic heartbeat."""
-        if self.mqtt.is_connected:
-            self.mqtt.publish_heartbeat()
+        if self._connected:
+            self._mqtt_publish(
+                self.t_pub_heartbeat,
+                {"alive": True, "ts": now_iso(), "robotId": self.robot_id},
+                qos=0, retain=False
+            )
 
-    # Public methods for anomaly reporting (can be called from other nodes via service)
+    # ========================================================================
+    # Public Methods for External Calls
+    # ========================================================================
+
     def report_anomaly(self, anomaly_type: str, next_node_id: int = -1):
-        """
-        Report anomaly to server.
-
-        Args:
-            anomaly_type: HUMAN, OBSTACLE, SYSTEM
-            next_node_id: Next node ID if known
-        """
-        if not self.mqtt.is_connected:
+        """Report anomaly to server (HUMAN, OBSTACLE, SYSTEM)."""
+        if not self._connected:
             return
 
-        self.mqtt.publish_anomaly(
+        self._publish_anomaly(
             req_id=self._current_req_id,
             vehicle_id=self._current_vehicle_id,
             event_type="ESTOP",
             anomaly_type=anomaly_type,
-            edge_id=0,  # TODO: Calculate from current/next node
+            edge_id=0,
             now_node_id=self._current_node_id,
             next_node_id=next_node_id if next_node_id >= 0 else self._current_node_id
         )
 
     def request_reroute(self):
         """Request new route from server due to obstacle."""
-        if not self.mqtt.is_connected:
+        if not self._connected:
             return
 
-        self.mqtt.publish_reroute_request(
+        self._publish_reroute_request(
             req_id=self._current_req_id,
             vehicle_id=self._current_vehicle_id,
             now_node_id=self._current_node_id
         )
 
+    # ========================================================================
+    # Cleanup
+    # ========================================================================
+
     def destroy_node(self):
         """Clean up on shutdown."""
-        self.mqtt.disconnect()
+        if self._mqtt is not None:
+            self._mqtt.loop_stop()
+            self._mqtt.disconnect()
+            self._mqtt = None
         super().destroy_node()
 
 
+# ============================================================================
+# Main Entry Point
+# ============================================================================
+
 def main(args=None):
     rclpy.init(args=args)
-    node = ServerBridgeNode()
+    node = MqttRosBridge()
 
     try:
         rclpy.spin(node)
@@ -474,5 +732,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
