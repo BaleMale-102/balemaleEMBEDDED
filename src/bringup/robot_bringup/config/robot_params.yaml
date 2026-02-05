@@ -56,12 +56,13 @@
 
 /loader_driver:
   ros__parameters:
-    port: "/dev/ttyUSB1"              # Loader Arduino (separate from motor Arduino)
-    baudrate: 115200
+    port: "/dev/ttyACM0"              # Loader Arduino (for direct mode)
+    baudrate: 9600                    # carrying.ino uses 9600 baud
     timeout: 0.1
     status_rate_hz: 10.0
     simulate: false
-    simulate_duration: 3.0            # Simulated operation time (seconds)
+    operation_duration: 15.0          # Fallback timeout (seconds)
+    use_bridge: true                  # Use serial_bridge node (run separately)
 
 # ============================================
 # Perception Parameters

@@ -28,6 +28,8 @@ from launch_ros.actions import Node, PushRosNamespace
 def generate_launch_description():
     # Package directories
     bringup_dir = get_package_share_directory('robot_bringup')
+    # Source directory for persistent map storage (survives rebuild)
+    bringup_src_dir = os.path.expanduser('~/balemaleEMBEDDED/src/bringup/robot_bringup')
 
     # Launch arguments
     simulation_arg = DeclareLaunchArgument(
@@ -50,8 +52,8 @@ def generate_launch_description():
 
     marker_map_arg = DeclareLaunchArgument(
         'marker_map',
-        default_value=os.path.join(bringup_dir, 'config', 'marker_map.yaml'),
-        description='Path to marker map file'
+        default_value=os.path.join(bringup_src_dir, 'config', 'marker_map.yaml'),
+        description='Path to marker map file (src directory for persistence)'
     )
 
     loader_simulate_arg = DeclareLaunchArgument(
@@ -229,7 +231,10 @@ def generate_launch_description():
             name='server_bridge',
             parameters=[
                 config_file,
-                {'simulation': simulation},
+                {
+                    'simulation': simulation,
+                    'map_file_path': marker_map,
+                },
             ],
         ),
     ])

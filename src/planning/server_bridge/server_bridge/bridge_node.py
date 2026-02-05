@@ -39,6 +39,7 @@ from typing import Any, Dict, Optional, Callable
 import yaml
 import rclpy
 from rclpy.node import Node
+from ament_index_python.packages import get_package_share_directory
 
 import paho.mqtt.client as mqtt
 
@@ -125,10 +126,14 @@ class MqttRosBridge(Node):
         # ROS Parameters - Map file
         # ====================================================================
         # Default path: config/marker_map.yaml in robot_bringup package
-        default_map_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-            "bringup", "robot_bringup", "config", "marker_map.yaml"
-        )
+        try:
+            bringup_share = get_package_share_directory('robot_bringup')
+            default_map_path = os.path.join(bringup_share, 'config', 'marker_map.yaml')
+        except Exception:
+            # Fallback to src directory if share not found
+            default_map_path = os.path.expanduser(
+                '~/balemaleEMBEDDED/src/bringup/robot_bringup/config/marker_map.yaml'
+            )
         self.declare_parameter("map_file_path", default_map_path)
         self.declare_parameter("ros.pub.map_updated", "/server/map_updated")
 

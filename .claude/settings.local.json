@@ -5,7 +5,11 @@
       "Bash(python -m py_compile:*)",
       "Bash(v4l2-ctl:*)",
       "Bash(colcon build:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(git worktree add:*)",
+      "Bash(git -C /home/a102/balemaleEMBEDDED branch:*)",
+      "Bash(git -C /home/a102/balemaleEMBEDDED_parking branch:*)",
+      "Bash(wc:*)"
     ]
   }
 }

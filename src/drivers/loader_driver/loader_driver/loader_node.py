@@ -2,27 +2,20 @@
 """
 loader_node.py - Loader Mechanism Driver Node
 
-Controls the vehicle loader mechanism via Arduino serial communication.
+Controls the vehicle loader mechanism via serial_bridge node (ROS topic bridge).
 
-Serial Protocol:
-    Commands (ROS -> Arduino):
-        L     Load vehicle
-        U     Unload vehicle
-        S     Emergency stop
-        ?     Status query
+Mode 1 (use_bridge=True): Communicates via serial_bridge node
+    Publishes: /motor_cmd (String) -> serial_bridge -> Arduino
+    Subscribes: /loading_status (String) <- serial_bridge <- Arduino
 
-    Responses (Arduino -> ROS):
-        IDLE      Ready, no operation
-        LOADING   Load operation in progress
-        UNLOADING Unload operation in progress
-        DONE      Operation completed successfully
-        ERROR     Operation failed
+Mode 2 (use_bridge=False): Direct serial communication
+    Serial Protocol (carrying.ino, 9600 baud)
 
 Subscribes:
-    /loader/command: LoaderCommand
+    /loader/command: LoaderCommand (from mission_manager)
 
 Publishes:
-    /loader/status: LoaderStatus
+    /loader/status: LoaderStatus (to mission_manager)
 """
 
 import serial
@@ -34,7 +27,7 @@ from std_msgs.msg import String
 
 
 class LoaderDriverNode(Node):
-    """ROS2 driver node for loader Arduino."""
+    """ROS2 driver node for loader Arduino (carrying.ino)."""
 
     # Status constants
     STATUS_IDLE = 'IDLE'
@@ -48,31 +41,33 @@ class LoaderDriverNode(Node):
         super().__init__('loader_driver')
 
         # Parameters
-        self.declare_parameter('port', '/dev/ttyUSB1')
-        self.declare_parameter('baudrate', 115200)
+        self.declare_parameter('port', '/dev/ttyACM0')
+        self.declare_parameter('baudrate', 9600)
         self.declare_parameter('timeout', 0.1)
         self.declare_parameter('status_rate_hz', 10.0)
         self.declare_parameter('simulate', False)
-        self.declare_parameter('simulate_duration', 3.0)  # Simulated operation time
+        self.declare_parameter('operation_duration', 10.0)  # Fallback timeout (seconds)
+        self.declare_parameter('use_bridge', True)  # Use serial_bridge node for communication
 
         self.port = self.get_parameter('port').value
         self.baudrate = self.get_parameter('baudrate').value
         self.timeout = self.get_parameter('timeout').value
         self.status_rate = self.get_parameter('status_rate_hz').value
         self.simulate = self.get_parameter('simulate').value
-        self.simulate_duration = self.get_parameter('simulate_duration').value
+        self.operation_duration = self.get_parameter('operation_duration').value
+        self.use_bridge = self.get_parameter('use_bridge').value
 
         # State
         self._serial = None
         self._connected = False
-        self._current_status = self.STATUS_DISCONNECTED
+        self._current_status = self.STATUS_IDLE if self.use_bridge else self.STATUS_DISCONNECTED
         self._is_loaded = False
         self._last_message = ''
         self._lock = threading.Lock()
 
-        # Simulation state
-        self._sim_start_time = 0.0
-        self._sim_operation = None
+        # Operation timing
+        self._operation_start_time = 0.0
+        self._current_operation = None  # 'LOAD' or 'UNLOAD'
 
         # Import custom interfaces
         try:
@@ -84,7 +79,7 @@ class LoaderDriverNode(Node):
             self.get_logger().warn('robot_interfaces not found, using String messages')
             self._has_interface = False
 
-        # Publishers
+        # Publishers - to mission_manager
         if self._has_interface:
             self.pub_status = self.create_publisher(
                 self._LoaderStatus, '/loader/status', 10
@@ -94,7 +89,7 @@ class LoaderDriverNode(Node):
                 String, '/loader/status', 10
             )
 
-        # Subscribers
+        # Subscribers - from mission_manager
         if self._has_interface:
             self.sub_command = self.create_subscription(
                 self._LoaderCommand, '/loader/command',
@@ -106,8 +101,19 @@ class LoaderDriverNode(Node):
                 self._command_string_callback, 10
             )
 
-        # Connect to serial
-        if not self.simulate:
+        # Bridge mode: communicate via serial_bridge node
+        if self.use_bridge:
+            # Publisher to serial_bridge
+            self.pub_motor_cmd = self.create_publisher(String, '/motor_cmd', 10)
+            # Subscriber from serial_bridge
+            self.sub_loading_status = self.create_subscription(
+                String, '/loading_status',
+                self._loading_status_callback, 10
+            )
+            self._connected = True
+            self.get_logger().info('Using serial_bridge mode (topics: /motor_cmd, /loading_status)')
+        elif not self.simulate:
+            # Direct serial mode
             self._connect()
         else:
             self._current_status = self.STATUS_IDLE
@@ -117,15 +123,28 @@ class LoaderDriverNode(Node):
         # Status timer
         self.timer = self.create_timer(1.0 / self.status_rate, self._status_callback)
 
-        # Serial read thread (only if real hardware)
-        if not self.simulate and self._connected:
-            self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
-            self._read_thread.start()
+        self.get_logger().info(f'LoaderDriverNode started (bridge={self.use_bridge})')
 
-        self.get_logger().info(f'LoaderDriverNode started on {self.port}')
+    def _loading_status_callback(self, msg: String):
+        """Handle response from serial_bridge (/loading_status topic)."""
+        status = msg.data.strip()
+        self.get_logger().info(f'Received from serial_bridge: {status}')
+
+        if status == "completed" and self._current_operation is not None:
+            if self._current_operation == 'LOAD':
+                self._is_loaded = True
+                self._last_message = 'Load complete (bridge confirmed)'
+                self.get_logger().info('LOAD operation complete')
+            elif self._current_operation == 'UNLOAD':
+                self._is_loaded = False
+                self._last_message = 'Unload complete (bridge confirmed)'
+                self.get_logger().info('UNLOAD operation complete')
+
+            self._current_status = self.STATUS_DONE
+            self._current_operation = None
 
     def _connect(self):
-        """Connect to Arduino serial port."""
+        """Connect to Arduino serial port (direct mode)."""
         try:
             self._serial = serial.Serial(
                 port=self.port,
@@ -137,113 +156,71 @@ class LoaderDriverNode(Node):
             self._current_status = self.STATUS_IDLE
             self.get_logger().info(f'Connected to loader Arduino on {self.port}')
 
-            # Query initial status
-            self._send_command('?')
-
         except serial.SerialException as e:
             self.get_logger().error(f'Failed to connect to {self.port}: {e}')
             self._connected = False
             self._current_status = self.STATUS_DISCONNECTED
 
     def _send_command(self, cmd: str):
-        """Send command to Arduino."""
-        if self.simulate:
-            self._handle_simulated_command(cmd)
+        """Send command to Arduino (direct serial or via bridge)."""
+        if self.use_bridge:
+            # Send via /motor_cmd topic to serial_bridge
+            msg = String()
+            msg.data = cmd
+            self.pub_motor_cmd.publish(msg)
+            self.get_logger().info(f'Published to /motor_cmd: {cmd}')
             return True
 
+        # Direct serial mode
         if not self._connected or self._serial is None:
             self.get_logger().warn('Not connected, cannot send command')
             return False
 
         try:
             with self._lock:
-                self._serial.write(f'{cmd}\n'.encode())
+                self._serial.write(f'{cmd}'.encode())
                 self._serial.flush()
-            self.get_logger().debug(f'Sent command: {cmd}')
+            self.get_logger().info(f'Sent command: {cmd}')
             return True
         except serial.SerialException as e:
             self.get_logger().error(f'Serial write error: {e}')
             self._connected = False
             return False
 
-    def _handle_simulated_command(self, cmd: str):
-        """Handle command in simulation mode."""
-        if cmd == 'L':
-            self._current_status = self.STATUS_LOADING
-            self._sim_operation = 'LOAD'
-            self._sim_start_time = time.time()
-            self.get_logger().info('[SIM] Starting LOAD operation')
-        elif cmd == 'U':
-            self._current_status = self.STATUS_UNLOADING
-            self._sim_operation = 'UNLOAD'
-            self._sim_start_time = time.time()
-            self.get_logger().info('[SIM] Starting UNLOAD operation')
-        elif cmd == 'S':
-            self._current_status = self.STATUS_IDLE
-            self._sim_operation = None
-            self.get_logger().info('[SIM] STOP command')
-        elif cmd == '?':
-            self.get_logger().info(f'[SIM] Status: {self._current_status}')
+    def _start_operation(self, operation: str):
+        """Start a load/unload operation with timer-based status tracking."""
+        if self._current_operation is not None:
+            self.get_logger().warn(f'Operation {self._current_operation} already in progress')
+            return False
 
-    def _update_simulation(self):
-        """Update simulation state."""
-        if self._sim_operation is None:
+        self._current_operation = operation
+        self._operation_start_time = time.time()
+
+        if operation == 'LOAD':
+            self._current_status = self.STATUS_LOADING
+            self._last_message = 'Loading vehicle...'
+        else:
+            self._current_status = self.STATUS_UNLOADING
+            self._last_message = 'Unloading vehicle...'
+
+        return True
+
+    def _update_operation_status(self):
+        """Update status based on elapsed time (fallback timeout)."""
+        if self._current_operation is None:
             return
 
-        elapsed = time.time() - self._sim_start_time
-        if elapsed >= self.simulate_duration:
-            # Operation complete
-            if self._sim_operation == 'LOAD':
+        elapsed = time.time() - self._operation_start_time
+        if elapsed >= self.operation_duration:
+            self.get_logger().warn(f'Operation timeout ({self.operation_duration}s), assuming complete')
+            if self._current_operation == 'LOAD':
                 self._is_loaded = True
-                self.get_logger().info('[SIM] LOAD complete')
-            elif self._sim_operation == 'UNLOAD':
+                self._last_message = 'Load complete (timeout)'
+            elif self._current_operation == 'UNLOAD':
                 self._is_loaded = False
-                self.get_logger().info('[SIM] UNLOAD complete')
-
+                self._last_message = 'Unload complete (timeout)'
             self._current_status = self.STATUS_DONE
-            self._sim_operation = None
-
-    def _read_loop(self):
-        """Background thread to read serial responses."""
-        while rclpy.ok() and self._connected:
-            try:
-                if self._serial and self._serial.in_waiting > 0:
-                    with self._lock:
-                        line = self._serial.readline().decode().strip()
-                    if line:
-                        self._parse_response(line)
-            except serial.SerialException as e:
-                self.get_logger().error(f'Serial read error: {e}')
-                self._connected = False
-                break
-            except Exception as e:
-                self.get_logger().error(f'Read loop error: {e}')
-
-            time.sleep(0.01)
-
-    def _parse_response(self, response: str):
-        """Parse Arduino response."""
-        response = response.upper().strip()
-
-        if response in (self.STATUS_IDLE, self.STATUS_LOADING,
-                        self.STATUS_UNLOADING, self.STATUS_DONE, self.STATUS_ERROR):
-            prev_status = self._current_status
-            self._current_status = response
-
-            # Track loaded state
-            if response == self.STATUS_DONE:
-                if prev_status == self.STATUS_LOADING:
-                    self._is_loaded = True
-                    self._last_message = 'Load complete'
-                elif prev_status == self.STATUS_UNLOADING:
-                    self._is_loaded = False
-                    self._last_message = 'Unload complete'
-
-            self.get_logger().debug(f'Status updated: {response}')
-        else:
-            # Treat as message
-            self._last_message = response
-            self.get_logger().info(f'Arduino message: {response}')
+            self._current_operation = None
 
     def _command_callback(self, msg):
         """Handle LoaderCommand message."""
@@ -256,24 +233,36 @@ class LoaderDriverNode(Node):
         self._execute_command(cmd)
 
     def _execute_command(self, cmd: str):
-        """Execute a command."""
+        """Execute a command (carrying.ino protocol: '1'=load, '2'=unload)."""
         if cmd == 'LOAD':
             self.get_logger().info('Executing LOAD command')
-            self._send_command('L')
+            if self._start_operation('LOAD'):
+                if self.simulate:
+                    self.get_logger().info('[SIM] LOAD started')
+                else:
+                    self._send_command('1')  # Arduino: '1' = load
+
         elif cmd == 'UNLOAD':
             self.get_logger().info('Executing UNLOAD command')
-            self._send_command('U')
+            if self._start_operation('UNLOAD'):
+                if self.simulate:
+                    self.get_logger().info('[SIM] UNLOAD started')
+                else:
+                    self._send_command('2')  # Arduino: '2' = unload
+
         elif cmd == 'STOP':
-            self.get_logger().info('Executing STOP command')
-            self._send_command('S')
+            self.get_logger().info('STOP command (state reset)')
+            self._current_operation = None
+            self._current_status = self.STATUS_IDLE
+            self._last_message = 'Stopped'
+
         else:
             self.get_logger().warn(f'Unknown command: {cmd}')
 
     def _status_callback(self):
         """Publish current status."""
-        # Update simulation if needed
-        if self.simulate:
-            self._update_simulation()
+        # Update operation status based on timer
+        self._update_operation_status()
 
         if self._has_interface:
             msg = self._LoaderStatus()
@@ -290,8 +279,9 @@ class LoaderDriverNode(Node):
     def destroy_node(self):
         """Cleanup on shutdown."""
         if self._serial and self._serial.is_open:
-            self._send_command('S')  # Safety stop
+            # carrying.ino has no stop command, just close serial
             self._serial.close()
+            self.get_logger().info('Serial connection closed')
         super().destroy_node()
 
 
