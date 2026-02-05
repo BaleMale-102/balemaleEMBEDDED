@@ -541,10 +541,12 @@ class StateMachine:
 
         if self._state == MissionState.PARK_ALIGN_MARKER:
             self._context.parking.align_marker_done = True
-            self._change_state(MissionState.PARK_ALIGN_RECT)
+            # PARK_ALIGN_RECT 건너뛰기 (slot_line_detector 미사용)
+            self._change_state(MissionState.PARK_FINAL)
             return
 
         if self._state == MissionState.PARK_ALIGN_RECT:
+            # 이 상태는 더 이상 사용하지 않지만 fallback으로 유지
             self._context.parking.align_rect_done = True
             self._change_state(MissionState.PARK_FINAL)
             return
@@ -714,7 +716,8 @@ class StateMachine:
     def _park_align_marker_transition(self) -> Optional[MissionState]:
         """Align front/back using side marker angle."""
         if self._context.parking.align_marker_done:
-            return MissionState.PARK_ALIGN_RECT
+            # PARK_ALIGN_RECT 건너뛰기 (slot_line_detector 미사용)
+            return MissionState.PARK_FINAL
         return None
 
     def _park_align_rect_transition(self) -> Optional[MissionState]:
