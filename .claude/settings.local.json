@@ -9,7 +9,13 @@
       "Bash(git worktree add:*)",
       "Bash(git -C /home/a102/balemaleEMBEDDED branch:*)",
       "Bash(git -C /home/a102/balemaleEMBEDDED_parking branch:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfix: 마커 기반 회전 종료 및 주차 정렬 개선\n\n1. 회전 중 마커 감지 시 즉시 턴 종료 \\(IMU 부정확 문제 해결\\)\n   - _turn_control에서 타겟 마커 감지 시 즉시 turn_done 발행\n   - ALIGN 모드로 전환하여 정밀 정렬 수행\n\n2. ALIGN_TO_MARKER 순서 변경: WZ → VY\n   - 회전\\(wz\\)으로 방향 먼저 맞추고\n   - 좌우이동\\(vy\\)으로 미세 정렬\n\n3. PARK_ALIGN_MARKER side camera 좌표계 수정\n   - side camera angle → vx 변환 부호 반전\n   - 로봇 heading 유지하면서 전후진만 수행\n\n4. PARK_ALIGN_RECT 단계 건너뛰기 \\(slot_line_detector 미사용\\)\n   - PARK_ALIGN_MARKER → PARK_FINAL 직접 전환\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfix: 마지막 waypoint에서 불필요한 TURNING 제거\n\n문제: 마지막 waypoint 도착 후 STOP_BUMP에서 is_last_waypoint 체크 시\nadvance_waypoint\\(\\)가 아직 호출되지 않아 False 반환 → TURNING 실행\n\n수정: next_idx = current_idx + 1로 미리 체크하여\n마지막 waypoint에서 TURNING 없이 바로 PARK_DETECT로 전환\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfeat: RETURN_HOME 시 왔던 길 역순으로 복귀\n\n갈 때: waypoints [1, 5] → slot 17\n올 때: waypoints [5, 1] → home 0\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git commit:*)"
     ]
   }
 }
