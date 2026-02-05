@@ -651,8 +651,12 @@ class StateMachine:
     def _stop_bump_transition(self) -> Optional[MissionState]:
         elapsed = time.time() - self._context.state_enter_time
         if elapsed > self._delays['stop_bump']:
-            if self._context.is_last_waypoint:
-                # Check if this is return home
+            # 다음 waypoint가 있는지 체크 (advance는 TURNING 후에 호출되므로 +1로 미리 체크)
+            next_idx = self._context.current_waypoint_idx + 1
+            has_more_waypoints = next_idx < len(self._context.waypoint_ids)
+
+            if not has_more_waypoints:
+                # 마지막 waypoint 도착 - TURNING 없이 바로 다음 단계
                 if self._context.final_goal_id == HOME_MARKER_ID:
                     return MissionState.WAIT_VEHICLE
                 elif self._context.task_type in ('PARK', 'DROPOFF'):
@@ -660,6 +664,7 @@ class StateMachine:
                 else:
                     return MissionState.FINISH
             else:
+                # 아직 waypoint 남음 - 다음 waypoint 향해 TURNING
                 return MissionState.TURNING
         return None
 
