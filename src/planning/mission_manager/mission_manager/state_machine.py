@@ -476,8 +476,11 @@ class StateMachine:
         elif new_state == MissionState.UNLOAD:
             self._context.loader.unload_complete = False
         elif new_state == MissionState.RETURN_HOME:
-            # Setup return waypoints (just go to marker 0)
-            self._context.waypoint_ids = []
+            # 왔던 길 역순으로 복귀
+            # 갈 때: [1, 5] → slot 17
+            # 올 때: [5, 1] → home 0
+            original_waypoints = self._context.waypoint_ids.copy()
+            self._context.waypoint_ids = list(reversed(original_waypoints))
             self._context.final_goal_id = HOME_MARKER_ID
             self._context.current_waypoint_idx = 0
             self._context.marker_reached = False
