@@ -44,6 +44,9 @@
     max_vy: 0.015
     max_wz: 0.15                      # 회전 제한 (rad/s)
     wz_offset: 0.0                    # 직진 보정 (왼쪽 돌면 음수)
+    # Battery voltage compensation
+    # 12V(3S) 기본값: max_pwm=2000, 11.1V(3S): max_pwm=2200, 7.4V(2S): max_pwm=3200
+    max_pwm: 3200                     # 7.4V 배터리 보상 (기본 2000 × 12/7.4 ≈ 3243)
 
 /imu_node:
   ros__parameters:
@@ -184,12 +187,13 @@
     park_distance_threshold: 0.02 # 최종 거리 완료 임계값 (m, 2cm)
     park_target_distance: 0.15    # 목표 주차 거리 (m, 마커로부터 15cm)
     # Stall detection and power boost
-    stall_check_interval: 0.5     # 스톨 체크 주기 (초)
-    stall_boost_increment: 0.002  # 스톨 시 파워 증가량
-    stall_max_boost: 0.015        # 최대 부스트 값
+    # 7.4V 배터리: 저전압에서 스톨 가능성 증가 → 부스트 강화
+    stall_check_interval: 0.4     # 스톨 체크 주기 (초) - 더 빠른 감지
+    stall_boost_increment: 0.003  # 스톨 시 파워 증가량 (7.4V 보상)
+    stall_max_boost: 0.02         # 최대 부스트 값 (7.4V 보상)
     stall_threshold_wz: 0.005     # 회전 스톨 임계값 (rad)
     stall_threshold_vy: 0.01      # 이동 스톨 임계값 (마커 각도 변화, rad)
-    stall_pulse_duration: 0.15    # 펄스 모드 지속 시간 (초)
+    stall_pulse_duration: 0.2     # 펄스 모드 지속 시간 (초) - 약간 증가
     # Post-turn marker search
     post_turn_search_timeout: 3.0 # Turn 후 마커 탐색 타임아웃 (초)
 

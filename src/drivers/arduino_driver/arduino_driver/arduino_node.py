@@ -43,6 +43,7 @@ class ArduinoNode(Node):
         self.declare_parameter('max_vy', 0.01)   # 20% of Arduino MAX_VEL_LINEAR
         self.declare_parameter('max_wz', 0.1)    # 20% of Arduino MAX_VEL_ANGULAR
         self.declare_parameter('wz_offset', 0.0)  # 직진 보정용 (왼쪽 돌면 음수, 오른쪽 돌면 양수)
+        self.declare_parameter('max_pwm', 2000)  # Arduino MAX_PWM (배터리 전압 보상용)
 
         # Load parameters
         port = self.get_parameter('port').value
@@ -55,6 +56,7 @@ class ArduinoNode(Node):
         self.max_vy = self.get_parameter('max_vy').value
         self.max_wz = self.get_parameter('max_wz').value
         self.wz_offset = self.get_parameter('wz_offset').value
+        self.max_pwm = self.get_parameter('max_pwm').value
 
         # Serial protocol
         self.protocol = SerialProtocol(
@@ -88,6 +90,11 @@ class ArduinoNode(Node):
             self.get_logger().info('Connected to Arduino')
             self.protocol.set_response_callback(self._response_callback)
             self.protocol.start_read_thread()
+
+            # Set MAX_PWM for battery voltage compensation
+            if self.max_pwm != 2000:
+                self.protocol.send_set_max_pwm(self.max_pwm)
+                self.get_logger().info(f'Set Arduino MAX_PWM to {self.max_pwm}')
         else:
             self.get_logger().error('Failed to connect to Arduino')
 
