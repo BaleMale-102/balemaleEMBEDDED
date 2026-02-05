@@ -22,7 +22,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'detector_node = anpr_detector.detector_node:main',
+            'detector_node = anpr_detector.detector_node:main',  # 기존 (호환용)
+            'anomaly_node = anpr_detector.anomaly_detector_node:main',  # 신규
+            'ocr_node = anpr_detector.ocr_detector_node:main',  # 신규
         ],
     },
 )
