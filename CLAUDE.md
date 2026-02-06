@@ -13,9 +13,13 @@
 
 ## 미션 플로우
 ```
-입고(PARK): WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → PARK → UNLOAD → RETURN_HOME
-출차(EXIT): DRIVE → PARK_* → LOAD → RETURN_HOME → UNLOAD → WAIT_VEHICLE
+입고(PARK): WAIT_VEHICLE → RECOGNIZE → APPROACH_VEHICLE → LOAD → RETREAT_FROM_VEHICLE → DRIVE → PARK → UNLOAD → RETURN_HOME → DRIVE(역순) → WAIT_VEHICLE
+출차(EXIT): DRIVE → PARK_* → LOAD → RETURN_HOME → DRIVE(역순) → UNLOAD → WAIT_VEHICLE
 ```
+- **APPROACH_VEHICLE**: 차량 방향 전진 (하드코딩 거리, 비전 미사용)
+- **RETREAT_FROM_VEHICLE**: 적재 후 원위치 후퇴 (동일 거리)
+- **RETURN_HOME**: waypoints 역순 설정 후 즉시 DRIVE 전환
+- 파라미터: `approach_distance` (m), `approach_speed` (m/s)
 
 ---
 
@@ -62,12 +66,12 @@ ros2 topic echo /mission/state
 ros2 topic echo /loader/status
 ros2 topic echo /perception/tracked_marker
 
-# 테스트 미션 (입고)
+# 테스트 미션 (입고: WAIT→RECOGNIZE→APPROACH→LOAD→RETREAT→DRIVE→PARK→UNLOAD→RETURN→WAIT)
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'WAIT'"
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'PLATE 12가3456'"
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'VERIFY 17 0,1,5'"
 
-# 테스트 미션 (출차)
+# 테스트 미션 (출차: DRIVE→PARK→LOAD→RETURN→DRIVE(역순)→UNLOAD→WAIT)
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'EXIT 1,5 17'"
 
 # 로더 테스트

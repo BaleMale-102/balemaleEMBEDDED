@@ -191,6 +191,8 @@
     park_distance_threshold: 0.02 # 최종 거리 완료 임계값 (m, 2cm)
     park_target_distance: 0.20    # 목표 주차 거리 (m, 마커로부터 20cm)
     park_align_forward: 0.000    # 정렬 완료 후 전진 거리 (m, 5mm)
+    # Vehicle approach/retreat speed
+    approach_speed: 0.01              # 차량 접근/후퇴 속도 (m/s)
     # Stall detection and power boost
     # 7.4V 배터리: 저전압에서 스톨 가능성 증가 → 부스트 강화
     stall_check_interval: 0.4     #스톨 체크 주기 (초) - 더 빠른 감지
@@ -231,6 +233,9 @@
     timeout_park_align_marker: 15.0 # PARK_ALIGN_MARKER 정렬 시간
     timeout_park_align_rect: 10.0   # PARK_ALIGN_RECT 정렬 시간
     timeout_park_final: 10.0        # PARK_FINAL 최종 조정 시간
+    # Vehicle approach/retreat (hardcoded movement)
+    approach_distance: 0.30           # 차량 접근/후퇴 거리 (m)
+    approach_speed: 0.01              # 접근/후퇴 속도 (m/s)
     # State transition delays (seconds)
     delay_stop_at_marker: 0.5       # STOP_AT_MARKER 후 다음 상태로 전환 대기
     delay_stop_bump: 0.3            # STOP_BUMP 후 다음 상태로 전환 대기

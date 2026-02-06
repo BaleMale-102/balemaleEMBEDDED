@@ -63,6 +63,9 @@ class MissionManagerNode(Node):
         self.declare_parameter('unit_scale', 0.01)
         self.declare_parameter('car_id', 'car_01')
         self.declare_parameter('auto_start_waiting', False)  # Auto-start in WAIT_VEHICLE mode
+        # Approach/retreat parameters (hardcoded movement)
+        self.declare_parameter('approach_distance', 0.30)   # Distance to vehicle (m)
+        self.declare_parameter('approach_speed', 0.01)       # Movement speed (m/s)
 
         # State timeout parameters
         self.declare_parameter('timeout_stop_at_marker', 2.0)
@@ -94,6 +97,8 @@ class MissionManagerNode(Node):
         self.unit_scale = self.get_parameter('unit_scale').value
         self.car_id = self.get_parameter('car_id').value
         auto_start_waiting = self.get_parameter('auto_start_waiting').value
+        self.approach_distance = self.get_parameter('approach_distance').value
+        self.approach_speed = self.get_parameter('approach_speed').value
 
         # Build timeout/delay configs for state machine
         # 테스트용: 주행/주차 관련 타임아웃 비활성화 (0 = 무제한)
@@ -575,6 +580,8 @@ class MissionManagerNode(Node):
             MissionState.ADVANCE_TO_CENTER,
             MissionState.ALIGN_TO_MARKER,
             MissionState.TURNING,
+            MissionState.APPROACH_VEHICLE,
+            MissionState.RETREAT_FROM_VEHICLE,
             MissionState.PARK,
             MissionState.PARK_DETECT,
             MissionState.PARK_RECOVERY,
@@ -598,6 +605,14 @@ class MissionManagerNode(Node):
         elif new_state == MissionState.RECOGNIZE:
             self.get_logger().info(
                 f'Recognizing plate: {self.fsm.context.recognition.plate_number}'
+            )
+        elif new_state in (MissionState.APPROACH_VEHICLE, MissionState.RETREAT_FROM_VEHICLE):
+            duration = self.approach_distance / self.approach_speed if self.approach_speed > 0 else 10.0
+            self.fsm.context.approach_duration = duration
+            direction = 'toward' if new_state == MissionState.APPROACH_VEHICLE else 'away from'
+            self.get_logger().info(
+                f'Moving {direction} vehicle: {self.approach_distance:.2f}m '
+                f'at {self.approach_speed:.3f}m/s ({duration:.1f}s)'
             )
         elif new_state == MissionState.LOAD:
             if self.fsm.context.task_type == 'EXIT':

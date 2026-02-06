@@ -24,7 +24,9 @@ class MissionState(Enum):
     # Full mission states
     WAIT_VEHICLE = auto()        # Wait at home for vehicle to arrive
     RECOGNIZE = auto()           # ANPR recognition + server query
+    APPROACH_VEHICLE = auto()    # Move toward vehicle (hardcoded distance)
     LOAD = auto()                # Loading vehicle onto robot
+    RETREAT_FROM_VEHICLE = auto()  # Move back after loading
     UNLOAD = auto()              # Unloading vehicle at slot
     RETURN_HOME = auto()         # Returning to home (marker 0)
 
@@ -173,6 +175,10 @@ class MissionContext:
     turn_complete: bool = False
     align_complete: bool = False
 
+    # Approach/retreat (hardcoded movement)
+    approach_start_time: float = 0.0
+    approach_duration: float = 0.0    # Set by manager (distance / speed)
+
     # Sub-contexts
     parking: ParkingContext = field(default_factory=ParkingContext)
     loader: LoaderContext = field(default_factory=LoaderContext)
@@ -199,6 +205,8 @@ class MissionContext:
         self.marker_reached = False
         self.turn_complete = False
         self.align_complete = False
+        self.approach_start_time = 0.0
+        self.approach_duration = 0.0
         self.parking = ParkingContext()
         self.loader = LoaderContext()
         self.recognition = RecognitionContext()
@@ -283,7 +291,9 @@ class StateMachine:
             # Full mission states
             MissionState.WAIT_VEHICLE: self._wait_vehicle_transition,
             MissionState.RECOGNIZE: self._recognize_transition,
+            MissionState.APPROACH_VEHICLE: self._approach_vehicle_transition,
             MissionState.LOAD: self._load_transition,
+            MissionState.RETREAT_FROM_VEHICLE: self._retreat_from_vehicle_transition,
             MissionState.UNLOAD: self._unload_transition,
             MissionState.RETURN_HOME: self._return_home_transition,
             # Navigation states
@@ -480,6 +490,8 @@ class StateMachine:
         elif new_state == MissionState.RECOGNIZE:
             self._context.recognition.query_sent = False
             self._context.recognition.response_received = False
+        elif new_state in (MissionState.APPROACH_VEHICLE, MissionState.RETREAT_FROM_VEHICLE):
+            self._context.approach_start_time = time.time()
         elif new_state == MissionState.LOAD:
             self._context.loader.load_complete = False
         elif new_state == MissionState.UNLOAD:
@@ -592,17 +604,24 @@ class StateMachine:
 
         if ctx.response_received:
             if ctx.plate_verified and ctx.assigned_slot_id >= 0:
-                # Server verified - start full mission
+                # Server verified - approach vehicle then load
                 self._context.waypoint_ids = ctx.assigned_waypoints
                 self._context.final_goal_id = ctx.assigned_slot_id
                 self._context.parking.target_slot_id = ctx.assigned_slot_id
                 self._context.task_type = 'PARK'
-                return MissionState.LOAD
+                return MissionState.APPROACH_VEHICLE
             else:
                 # Not verified - back to waiting
                 self._context.recognition = RecognitionContext()
                 return MissionState.WAIT_VEHICLE
 
+        return None
+
+    def _approach_vehicle_transition(self) -> Optional[MissionState]:
+        """Timed forward movement toward vehicle."""
+        elapsed = time.time() - self._context.approach_start_time
+        if elapsed >= self._context.approach_duration:
+            return MissionState.LOAD
         return None
 
     def _load_transition(self) -> Optional[MissionState]:
@@ -614,8 +633,17 @@ class StateMachine:
         if self._context.loader.load_complete:
             if self._context.task_type == 'EXIT':
                 return MissionState.RETURN_HOME  # 출차: 슬롯에서 적재 후 홈으로
-            return MissionState.DRIVE  # 입고: 홈에서 적재 후 슬롯으로
+            if self._context.is_full_mission:
+                return MissionState.RETREAT_FROM_VEHICLE  # 입고: 적재 후 후퇴 → 출발
+            return MissionState.DRIVE  # 단순 미션: 바로 출발
 
+        return None
+
+    def _retreat_from_vehicle_transition(self) -> Optional[MissionState]:
+        """Timed backward movement away from vehicle."""
+        elapsed = time.time() - self._context.approach_start_time
+        if elapsed >= self._context.approach_duration:
+            return MissionState.DRIVE
         return None
 
     def _unload_transition(self) -> Optional[MissionState]:
@@ -635,12 +663,8 @@ class StateMachine:
         return None
 
     def _return_home_transition(self) -> Optional[MissionState]:
-        """Wait to reach home marker."""
-        if self._context.marker_reached and self._context.current_marker_id == HOME_MARKER_ID:
-            if self._context.task_type == 'EXIT':
-                return MissionState.UNLOAD  # 출차: 홈 도착 → 차량 하역
-            return MissionState.WAIT_VEHICLE
-        return None
+        """Immediately start driving - waypoints already reversed in _change_state."""
+        return MissionState.DRIVE
 
     def _drive_transition(self) -> Optional[MissionState]:
         if self._context.marker_reached:
@@ -777,7 +801,9 @@ class StateMachine:
         if self._context.is_full_mission:
             state_progress = {
                 MissionState.RECOGNIZE: 0.05,
+                MissionState.APPROACH_VEHICLE: 0.07,
                 MissionState.LOAD: 0.1,
+                MissionState.RETREAT_FROM_VEHICLE: 0.13,
                 MissionState.DRIVE: 0.3,
                 MissionState.PARK_DETECT: 0.5,
                 MissionState.PARK_ALIGN_MARKER: 0.55,

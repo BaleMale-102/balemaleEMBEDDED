@@ -58,8 +58,11 @@ class MotionControllerNode(Node):
     MODE_PARK_DETECT = 'PARK_DETECT'
     MODE_PARK_RECOVERY = 'PARK_RECOVERY'
     MODE_PARK_ALIGN_MARKER = 'PARK_ALIGN_MARKER'
-    MODE_PARK_ALIGN_RECT = 'PARK_ALIGN_RECT'    # 안씀 
+    MODE_PARK_ALIGN_RECT = 'PARK_ALIGN_RECT'    # 안씀
     MODE_PARK_FINAL = 'PARK_FINAL'
+    # Approach/retreat modes (hardcoded movement)
+    MODE_APPROACH_VEHICLE = 'APPROACH_VEHICLE'
+    MODE_RETREAT_FROM_VEHICLE = 'RETREAT_FROM_VEHICLE'
 
     def __init__(self):
         super().__init__('motion_controller_node')
@@ -120,6 +123,9 @@ class MotionControllerNode(Node):
         self.declare_parameter('park_target_distance', 0.15)   # 15cm
         self.declare_parameter('park_align_forward', 0.03)   # 정렬 후 전진 거리 (3cm)
 
+        # Parameters - approach/retreat
+        self.declare_parameter('approach_speed', 0.01)
+
         # Parameters - stall detection and power boost
         self.declare_parameter('stall_check_interval', 0.5)
         self.declare_parameter('stall_boost_increment', 0.002)
@@ -170,6 +176,9 @@ class MotionControllerNode(Node):
         self.park_distance_threshold = self.get_parameter('park_distance_threshold').value
         self.park_target_distance = self.get_parameter('park_target_distance').value
         self.park_align_forward = self.get_parameter('park_align_forward').value
+
+        # Approach/retreat speed
+        self.approach_speed = self.get_parameter('approach_speed').value
 
         # Stall detection parameters
         self._stall_check_interval = self.get_parameter('stall_check_interval').value
@@ -417,6 +426,10 @@ class MotionControllerNode(Node):
                 self._align_action = 'MOVE'
                 self._align_action_start_time = 0.0
                 self.get_logger().info('ALIGN_TO_MARKER started (WZ → VY phases)')
+        elif state == 'APPROACH_VEHICLE':
+            self._mode = self.MODE_APPROACH_VEHICLE
+        elif state == 'RETREAT_FROM_VEHICLE':
+            self._mode = self.MODE_RETREAT_FROM_VEHICLE
         elif state in ('STOP', 'FINISH', 'STOP_BUMP'):
             self._mode = self.MODE_STOP
         # Parking states
@@ -573,6 +586,14 @@ class MotionControllerNode(Node):
 
         elif self._mode == self.MODE_PARK_FINAL:
             cmd, error_x, error_y, error_yaw, detail = self._park_final_control()
+
+        # Approach/retreat (hardcoded forward/backward movement)
+        elif self._mode == self.MODE_APPROACH_VEHICLE:
+            cmd.linear.x = self.approach_speed
+            detail = 'Approaching vehicle'
+        elif self._mode == self.MODE_RETREAT_FROM_VEHICLE:
+            cmd.linear.x = -self.approach_speed
+            detail = 'Retreating from vehicle'
 
         # Apply velocity limits
         cmd.linear.x = self._clamp(cmd.linear.x, -self.max_vx, self.max_vx)
