@@ -476,8 +476,11 @@ class StateMachine:
         elif new_state == MissionState.UNLOAD:
             self._context.loader.unload_complete = False
         elif new_state == MissionState.RETURN_HOME:
-            # Setup return waypoints (just go to marker 0)
-            self._context.waypoint_ids = []
+            # 왔던 길 역순으로 복귀
+            # 갈 때: [1, 5] → slot 17
+            # 올 때: [5, 1] → home 0
+            original_waypoints = self._context.waypoint_ids.copy()
+            self._context.waypoint_ids = list(reversed(original_waypoints))
             self._context.final_goal_id = HOME_MARKER_ID
             self._context.current_waypoint_idx = 0
             self._context.marker_reached = False
@@ -541,10 +544,12 @@ class StateMachine:
 
         if self._state == MissionState.PARK_ALIGN_MARKER:
             self._context.parking.align_marker_done = True
-            self._change_state(MissionState.PARK_ALIGN_RECT)
+            # PARK_ALIGN_RECT 건너뛰기 (slot_line_detector 미사용)
+            self._change_state(MissionState.PARK_FINAL)
             return
 
         if self._state == MissionState.PARK_ALIGN_RECT:
+            # 이 상태는 더 이상 사용하지 않지만 fallback으로 유지
             self._context.parking.align_rect_done = True
             self._change_state(MissionState.PARK_FINAL)
             return
@@ -649,8 +654,12 @@ class StateMachine:
     def _stop_bump_transition(self) -> Optional[MissionState]:
         elapsed = time.time() - self._context.state_enter_time
         if elapsed > self._delays['stop_bump']:
-            if self._context.is_last_waypoint:
-                # Check if this is return home
+            # 다음 waypoint가 있는지 체크 (advance는 TURNING 후에 호출되므로 +1로 미리 체크)
+            next_idx = self._context.current_waypoint_idx + 1
+            has_more_waypoints = next_idx < len(self._context.waypoint_ids)
+
+            if not has_more_waypoints:
+                # 마지막 waypoint 도착 - TURNING 없이 바로 다음 단계
                 if self._context.final_goal_id == HOME_MARKER_ID:
                     return MissionState.WAIT_VEHICLE
                 elif self._context.task_type in ('PARK', 'DROPOFF'):
@@ -658,6 +667,7 @@ class StateMachine:
                 else:
                     return MissionState.FINISH
             else:
+                # 아직 waypoint 남음 - 다음 waypoint 향해 TURNING
                 return MissionState.TURNING
         return None
 
@@ -714,7 +724,8 @@ class StateMachine:
     def _park_align_marker_transition(self) -> Optional[MissionState]:
         """Align front/back using side marker angle."""
         if self._context.parking.align_marker_done:
-            return MissionState.PARK_ALIGN_RECT
+            # PARK_ALIGN_RECT 건너뛰기 (slot_line_detector 미사용)
+            return MissionState.PARK_FINAL
         return None
 
     def _park_align_rect_transition(self) -> Optional[MissionState]:

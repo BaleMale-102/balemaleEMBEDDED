@@ -224,9 +224,9 @@ class MotionControllerNode(Node):
         self._park_align_rect_done_sent = False
         self._park_final_done_sent = False
 
-        # ALIGN_TO_MARKER two-phase state (vy → wz)
-        self._align_phase = 'VY'  # 'VY' or 'WZ'
-        self._align_vy_done = False
+        # ALIGN_TO_MARKER two-phase state (wz → vy)
+        self._align_phase = 'WZ'  # 'WZ' first, then 'VY'
+        self._align_wz_done = False
 
         # Turn marker tracking (for post-turn search)
         self._turn_direction = 0  # +1 = CCW, -1 = CW
@@ -382,15 +382,15 @@ class MotionControllerNode(Node):
         elif state == 'ALIGN_TO_MARKER':
             self._mode = self.MODE_ALIGN
             if prev_mode != self.MODE_ALIGN:
-                # Reset two-phase alignment state
-                self._align_phase = 'VY'
-                self._align_vy_done = False
+                # Reset two-phase alignment state (WZ first, then VY)
+                self._align_phase = 'WZ'
+                self._align_wz_done = False
                 # Reset stall detection
                 self._stall_vy_boost = 0.0
                 self._stall_wz_boost = 0.0
                 self._consecutive_stalls = 0
                 self._stall_pulse_mode = False
-                self.get_logger().info('ALIGN_TO_MARKER started (VY → WZ phases)')
+                self.get_logger().info('ALIGN_TO_MARKER started (WZ → VY phases)')
         elif state in ('STOP', 'FINISH', 'STOP_BUMP'):
             self._mode = self.MODE_STOP
         # Parking states
@@ -686,10 +686,10 @@ class MotionControllerNode(Node):
 
     def _align_to_marker(self):
         """
-        Turn 후 마커 정렬 (2단계: VY → WZ → 주행).
+        Turn 후 마커 정렬 (2단계: WZ → VY → 주행).
 
-        Phase 1 (VY): 좌우 이동으로 마커 중심 정렬
-        Phase 2 (WZ): 회전으로 각도 미세 조정
+        Phase 1 (WZ): 회전으로 마커 방향 먼저 맞춤
+        Phase 2 (VY): 좌우 이동으로 마커 중심 미세 정렬
 
         추가 기능:
         - 마커 못 찾으면 turn 방향으로 회전하며 탐색
@@ -762,55 +762,52 @@ class MotionControllerNode(Node):
         # ========================================
         # Alignment thresholds (strict)
         # ========================================
-        vy_threshold = self.marker_align_threshold  # ~6deg for VY phase
-        wz_threshold = self.marker_align_threshold * 0.5  # ~3deg for final check
-        switch_threshold = self.marker_align_threshold * 0.8  # threshold to switch phases
+        wz_threshold = self.marker_align_threshold * 0.5  # ~3deg for WZ phase
+        vy_threshold = self.marker_align_threshold * 0.3  # ~2deg for final VY
+        switch_threshold = self.marker_align_threshold * 0.6  # threshold to switch phases
 
         # ========================================
-        # Phase 1: VY alignment (좌우 이동)
+        # Phase 1: WZ alignment (회전으로 방향 맞춤)
         # ========================================
-        if self._align_phase == 'VY':
+        if self._align_phase == 'WZ':
             if abs(angle) < switch_threshold:
-                # VY phase done, move to WZ
-                self._align_phase = 'WZ'
-                self._align_vy_done = True
-                # Reset stall detection for WZ phase
-                self._stall_vy_boost = 0.0
+                # WZ phase done, move to VY
+                self._align_phase = 'VY'
+                # Reset stall detection for VY phase
+                self._stall_wz_boost = 0.0
                 self._consecutive_stalls = 0
-                self.get_logger().info(f'VY align done (angle={math.degrees(angle):.1f}deg), starting WZ phase')
+                self.get_logger().info(f'WZ align done (angle={math.degrees(angle):.1f}deg), starting VY phase')
             else:
-                # Apply VY control with stall boost
-                vy = -self.marker_vy_kp * angle * 3.0
+                # Apply WZ control with stall boost
+                wz = self.marker_wz_kp * angle * 2.0
 
                 # Apply stall boost
                 if self._stall_pulse_mode:
-                    # Pulse mode: apply higher boost for short duration
                     pulse_elapsed = now - self._stall_pulse_start_time
                     if pulse_elapsed < self._stall_pulse_duration:
-                        boost = self._stall_vy_boost * 2.0
-                        vy = vy + (boost if vy > 0 else -boost)
+                        boost = self._stall_wz_boost * 2.0
+                        wz = wz + (boost if wz > 0 else -boost)
                     else:
                         self._stall_pulse_mode = False
                 else:
-                    # Normal boost
-                    vy = vy + (self._stall_vy_boost if vy > 0 else -self._stall_vy_boost)
+                    wz = wz + (self._stall_wz_boost if wz > 0 else -self._stall_wz_boost)
 
                 # Minimum speed guarantee
-                min_speed = 0.01 + self._stall_vy_boost
-                if abs(vy) < min_speed and abs(angle) > 0.05:
-                    vy = min_speed if angle < 0 else -min_speed
+                min_wz = 0.015 + self._stall_wz_boost
+                if abs(wz) < min_wz and abs(angle) > 0.03:
+                    wz = min_wz if angle > 0 else -min_wz
 
-                cmd.linear.y = vy
+                cmd.angular.z = -wz  # Negate for motor direction
 
-                detail = f'[ALIGN-VY] a={math.degrees(angle):.1f}deg, vy={vy:.3f}, boost={self._stall_vy_boost:.3f} [{pred}]'
+                detail = f'[ALIGN-WZ] a={math.degrees(angle):.1f}deg, wz={-wz:.3f}, boost={self._stall_wz_boost:.3f} [{pred}]'
                 return cmd, error_x, error_y, error_yaw, detail
 
         # ========================================
-        # Phase 2: WZ alignment (회전 미세 조정)
+        # Phase 2: VY alignment (좌우 이동 미세 조정)
         # ========================================
-        if self._align_phase == 'WZ':
-            # Final alignment check - both VY and WZ must be aligned
-            if abs(angle) < wz_threshold:
+        if self._align_phase == 'VY':
+            # Final alignment check
+            if abs(angle) < vy_threshold:
                 # Check if stable for a short time
                 if not hasattr(self, '_align_stable_start'):
                     self._align_stable_start = now
@@ -823,36 +820,36 @@ class MotionControllerNode(Node):
                 if hasattr(self, '_align_stable_start'):
                     delattr(self, '_align_stable_start')
 
-            # If angle drifted, go back to VY
-            if abs(angle) > vy_threshold:
-                self._align_phase = 'VY'
-                self._stall_wz_boost = 0.0
+            # If angle drifted too much, go back to WZ
+            if abs(angle) > self.marker_align_threshold:
+                self._align_phase = 'WZ'
+                self._stall_vy_boost = 0.0
                 self._consecutive_stalls = 0
-                self.get_logger().info(f'Angle drifted ({math.degrees(angle):.1f}deg), back to VY phase')
-                return self._align_to_marker()  # Recursive call for VY
+                self.get_logger().info(f'Angle drifted ({math.degrees(angle):.1f}deg), back to WZ phase')
+                return self._align_to_marker()  # Recursive call for WZ
 
-            # WZ control for fine adjustment
-            wz = self.marker_wz_kp * angle * 2.0
+            # VY control for fine adjustment
+            vy = -self.marker_vy_kp * angle * 3.0
 
             # Apply stall boost
             if self._stall_pulse_mode:
                 pulse_elapsed = now - self._stall_pulse_start_time
                 if pulse_elapsed < self._stall_pulse_duration:
-                    boost = self._stall_wz_boost * 2.0
-                    wz = wz + (boost if wz > 0 else -boost)
+                    boost = self._stall_vy_boost * 2.0
+                    vy = vy + (boost if vy > 0 else -boost)
                 else:
                     self._stall_pulse_mode = False
             else:
-                wz = wz + (self._stall_wz_boost if wz > 0 else -self._stall_wz_boost)
+                vy = vy + (self._stall_vy_boost if vy > 0 else -self._stall_vy_boost)
 
             # Minimum speed guarantee
-            min_wz = 0.015 + self._stall_wz_boost
-            if abs(wz) < min_wz and abs(angle) > 0.03:
-                wz = min_wz if angle > 0 else -min_wz
+            min_speed = 0.01 + self._stall_vy_boost
+            if abs(vy) < min_speed and abs(angle) > 0.02:
+                vy = min_speed if angle < 0 else -min_speed
 
-            cmd.angular.z = -wz  # Negate for motor direction
+            cmd.linear.y = vy
 
-            detail = f'[ALIGN-WZ] a={math.degrees(angle):.1f}deg, wz={-wz:.3f}, boost={self._stall_wz_boost:.3f} [{pred}]'
+            detail = f'[ALIGN-VY] a={math.degrees(angle):.1f}deg, vy={vy:.3f}, boost={self._stall_vy_boost:.3f} [{pred}]'
             return cmd, error_x, error_y, error_yaw, detail
 
         detail = f'No marker {self._target_marker_id}, waiting...'
@@ -862,8 +859,8 @@ class MotionControllerNode(Node):
         """
         스톨 감지 및 파워 부스트 처리.
 
-        - IMU yaw 변화량으로 회전 스톨 감지
-        - 마커 각도 변화량으로 이동 스톨 감지
+        - IMU yaw 변화량으로 회전 스톨 감지 (WZ phase)
+        - 마커 각도 변화량으로 이동 스톨 감지 (VY phase)
         - 연속 스톨 시 점진적 파워 증가 또는 펄스 모드
         """
         now = self.get_clock().now().nanoseconds / 1e9
@@ -876,7 +873,7 @@ class MotionControllerNode(Node):
         if yaw_change > math.pi:
             yaw_change = 2 * math.pi - yaw_change
 
-        # Detect stall based on current phase
+        # Detect stall based on current phase (WZ first, then VY)
         is_stalled = False
 
         if self._align_phase == 'WZ':
@@ -884,7 +881,7 @@ class MotionControllerNode(Node):
             if yaw_change < self._stall_threshold_wz:
                 is_stalled = True
                 self.get_logger().debug(f'WZ stall detected: yaw_change={math.degrees(yaw_change):.2f}deg')
-        else:
+        elif self._align_phase == 'VY':
             # VY phase: check marker angle change (indicates lateral movement)
             if angle_change < self._stall_threshold_vy:
                 is_stalled = True
@@ -893,13 +890,13 @@ class MotionControllerNode(Node):
         if is_stalled:
             self._consecutive_stalls += 1
 
-            # Gradual boost increase
+            # Gradual boost increase based on current phase
             if self._align_phase == 'WZ':
                 self._stall_wz_boost = min(
                     self._stall_wz_boost + self._stall_boost_increment,
                     self._stall_max_boost
                 )
-            else:
+            elif self._align_phase == 'VY':
                 self._stall_vy_boost = min(
                     self._stall_vy_boost + self._stall_boost_increment,
                     self._stall_max_boost
@@ -927,7 +924,12 @@ class MotionControllerNode(Node):
         self._prev_marker_angle_for_stall = current_angle
 
     def _turn_control(self):
-        """In-place turn control with PD."""
+        """
+        In-place turn control with marker-based early termination.
+
+        회전 중 타겟 마커가 감지되면 IMU 각도와 상관없이 즉시 종료하고
+        ALIGN 모드로 전환하여 정밀 정렬 수행.
+        """
         cmd = Twist()
 
         if self._turn_done_sent:
@@ -935,6 +937,24 @@ class MotionControllerNode(Node):
 
         if self._imu_data is None:
             return cmd, 0.0, 0.0, 0.0, 'No IMU data'
+
+        # 타겟 마커가 감지되면 즉시 턴 종료 (IMU 각도 무시)
+        marker_ok = (self._tracked_marker is not None and
+                     self._tracked_marker.id == self._target_marker_id and
+                     (self._tracked_marker.is_detected or
+                      self._tracked_marker.prediction_confidence > 0.5))
+
+        if marker_ok:
+            # 마커 발견 - 즉시 턴 종료
+            self._marker_visible_at_turn_end = True
+            self._publish_turn_done()
+            self._turn_done_sent = True
+            marker_angle = self._tracked_marker.angle
+            self.get_logger().info(
+                f'Turn stopped: target marker {self._target_marker_id} detected! '
+                f'angle={math.degrees(marker_angle):.1f}deg, switching to ALIGN mode'
+            )
+            return cmd, 0.0, 0.0, 0.0, f'Marker {self._target_marker_id} found, stopping turn'
 
         turned = -(self._current_yaw - self._turn_start_yaw)
 
@@ -950,21 +970,16 @@ class MotionControllerNode(Node):
         while error_yaw < -math.pi:
             error_yaw += 2 * math.pi
 
+        # IMU 기반 턴 완료 체크 (마커 못 찾은 경우 fallback)
         if abs(error_yaw) < self.turn_tolerance:
-            # Check if marker is visible at turn end
-            marker_ok = (self._tracked_marker is not None and
-                         self._tracked_marker.id == self._target_marker_id and
-                         (self._tracked_marker.is_detected or
-                          self._tracked_marker.prediction_confidence > 0.3))
-            self._marker_visible_at_turn_end = marker_ok
-
+            self._marker_visible_at_turn_end = False
             self._publish_turn_done()
             self._turn_done_sent = True
             self.get_logger().info(
-                f'Turn done! turned={math.degrees(turned):.1f}deg, error={math.degrees(error_yaw):.1f}deg, '
-                f'marker_seen={self._marker_seen_during_turn}, marker_visible={marker_ok}'
+                f'Turn done (IMU)! turned={math.degrees(turned):.1f}deg, error={math.degrees(error_yaw):.1f}deg, '
+                f'marker_seen={self._marker_seen_during_turn}, no marker at end'
             )
-            return cmd, 0.0, 0.0, error_yaw, f'Turn complete, turned={math.degrees(turned):.1f}deg'
+            return cmd, 0.0, 0.0, error_yaw, f'Turn complete (IMU), turned={math.degrees(turned):.1f}deg'
 
         d_error = error_yaw - self._prev_turn_error
         self._prev_turn_error = error_yaw
@@ -1038,13 +1053,18 @@ class MotionControllerNode(Node):
 
     def _park_align_marker_control(self):
         """
-        PARK_ALIGN_MARKER: Align front/back using side marker angle.
+        PARK_ALIGN_MARKER: Side camera 기준 전후 정렬 (로봇 heading 유지).
 
-        Side camera coordinate mapping:
-        - marker.angle > 0: car is ahead of marker (need to move backward)
-        - marker.angle < 0: car is behind marker (need to move forward)
+        Side camera 좌표계 (카메라가 왼쪽을 바라봄, yaw=+90°):
+        - Camera X-right = Robot +X (앞)
+        - Camera Z-forward = Robot +Y (왼쪽)
 
-        Control: angle error -> vx (forward/backward)
+        marker.angle = atan2(-tvec[0], tvec[2]):
+        - angle > 0: 마커가 카메라 왼쪽 = 로봇 뒤쪽 = 로봇이 앞에 있음 → 후진 필요
+        - angle < 0: 마커가 카메라 오른쪽 = 로봇 앞쪽 = 로봇이 뒤에 있음 → 전진 필요
+
+        Control: angle error -> vx (forward/backward), 부호 반전 필요
+        로봇은 heading을 유지하고 전후진만 수행 (wz 없음)
         """
         cmd = Twist()
         error_x = 0.0
@@ -1069,19 +1089,18 @@ class MotionControllerNode(Node):
             detail = f'Marker aligned, angle={math.degrees(angle):.1f}deg'
             return cmd, error_x, error_y, error_yaw, detail
 
-        # Control: angle -> vx (좌측 카메라, yaw=+90°)
-        # Positive angle = car behind marker = need forward
-        # Negative angle = car ahead of marker = need backward
-        vx = self.park_align_kp * angle
+        # Control: angle -> vx (side camera 좌표계 변환)
+        # 부호 반전: angle > 0 → 후진, angle < 0 → 전진
+        vx = -self.park_align_kp * angle
         vx = self._clamp(vx, -self.park_max_vx, self.park_max_vx)
 
         # Minimum speed
         if abs(vx) < self.park_min_speed and abs(angle) > self.park_marker_threshold * 0.5:
-            vx = self.park_min_speed if angle > 0 else -self.park_min_speed
+            vx = -self.park_min_speed if angle > 0 else self.park_min_speed
 
         cmd.linear.x = vx
 
-        detail = f'Align marker: a={math.degrees(angle):.1f}deg, vx={vx:.3f}'
+        detail = f'Align marker (side): a={math.degrees(angle):.1f}deg, vx={vx:.3f}'
 
         return cmd, error_x, error_y, error_yaw, detail
 
