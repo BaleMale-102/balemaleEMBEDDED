@@ -670,6 +670,11 @@ class StateMachine:
                     return MissionState.PARK_DETECT
                 else:
                     return MissionState.FINISH
+            elif not has_more_waypoints and self._context.task_type in ('PARK', 'DROPOFF'):
+                # 마지막 waypoint 도착, 다음이 주차 슬롯 → 턴 없이 바로 PARK_DETECT
+                # (주차 마커는 사이드 카메라로 탐지, 전방 카메라 턴 불필요)
+                self._context.advance_waypoint()
+                return MissionState.PARK_DETECT
             else:
                 # 아직 갈 곳 남음 (다음 waypoint 또는 final_goal) - TURNING
                 return MissionState.TURNING

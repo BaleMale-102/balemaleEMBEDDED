@@ -40,13 +40,13 @@
     simulate: false
     cmd_rate_hz: 20.0
     watchdog_timeout: 0.15            # Arduino watchdog: 200ms
-    max_vx: 0.01                      # 속도 제한 (m/s) - 7.4V 보상
-    max_vy: 0.018                     # 7.4V 보상
-    max_wz: 0.17                      # 회전 제한 (rad/s) - 7.4V 보상
+    max_vx: 0.012                     # 적재장치 보상 -10% (was 0.013)
+    max_vy: 0.021                     # 적재장치 보상 -10% (was 0.023)
+    max_wz: 0.20                      # 적재장치 보상 -10% (was 0.22)
     wz_offset: 0.0                    # 직진 보정 (왼쪽 돌면 음수)
     # Battery voltage compensation
     # 12V(3S) 기본값: max_pwm=2000, 11.1V(3S): max_pwm=2200, 7.4V(2S): max_pwm=3200
-    max_pwm: 3200                     # 7.4V 배터리 보상 (기본 2000 × 12/7.4 ≈ 3243)
+    max_pwm: 3420                     # 적재장치 보상 -10% (was 3800)
 
 /imu_node:
   ros__parameters:
@@ -143,11 +143,11 @@
 /motion_controller:
   ros__parameters:
     control_rate: 20.0
-    max_vx: 0.008                     # 원래값 유지
-    max_vy: 0.018                     # 7.4V 보상 (was 0.015)
-    max_wz: 0.09                      # 7.4V 보상 (was 0.075)
+    max_vx: 0.01                      # -10% (was 0.011)
+    max_vy: 0.021                     # -10% (was 0.023)
+    max_wz: 0.108                     # -10% (was 0.12)
     # Fallback (센서 없을 때)
-    reverse_vx: 0.018                  # 7.4V 보상 (was 0.015)
+    reverse_vx: 0.021                  # -10% (was 0.023)
     # Lane following (비활성화)
     lane_vx: 0.004
     lane_vy_kp: 0.03
@@ -157,48 +157,48 @@
     lane_wz_ki: 0.0
     lane_wz_kd: 0.05
     # Marker approach
-    marker_vy_kp: 0.02                # 좌우 게인 강화 (was 0.012)
-    marker_vx_kp: 0.015               # 원래값 유지
-    marker_wz_kp: 0.05                # 회전 게인 강화 (was 0.03)
+    marker_vy_kp: 0.023               # -10% (was 0.025)
+    marker_vx_kp: 0.018               # -10% (was 0.02)
+    marker_wz_kp: 0.054               # -10% (was 0.06)
     marker_reach_distance: 0.25
     marker_min_distance: 0.08
     marker_lost_reach_distance: 0.35
     marker_align_threshold: 0.1  # 좌우 정렬 임계값 (rad, ~8.5도) - 이 이상이면 정렬 먼저
     align_move_duration: 0.25    # 정렬 시 이동 시간 강화 (was 0.15)
     align_settle_duration: 0.3   # 정렬 시 관찰 시간 (초) - 멈추고 카메라 확인
-    advance_vx: 0.022             # ADVANCE_TO_CENTER 전진 속도 - 7.4V 보상 (was 0.02)
+    advance_vx: 0.025             # -10% (was 0.028)
     advance_time: 0.0             # ADVANCE_TO_CENTER 스킵 (0초)
     # Turn (PD 제어 + 오버슈팅 보정)
-    turn_wz: 0.07                 # 최대 회전 속도 - 7.4V 보상 (was 0.06)
-    turn_wz_min: 0.025            # 최소 회전 속도 - 7.4V 보상 (was 0.0225)
+    turn_wz: 0.081                # -10% (was 0.09)
+    turn_wz_min: 0.032            # -10% (was 0.035)
     turn_tolerance: 0.07          # 완료 허용 오차 (rad, ~3도)
     turn_kp: 1.5                  # 비례 게인
     turn_kd: 0.3                  # 미분 게인 (급정지 방지)
     turn_decel_zone: 0.35         # 감속 시작 구간 (rad, ~20도)
     turn_scale: 1.0               # 턴 각도 스케일 (1.0=그대로, 1.1=10% 더 돌기)
     # Parking parameters
-    park_creep_vx: 0.008          # PARK_DETECT 탐색 속도 - 7.4V 강화
-    park_align_kp: 0.04           # 마커 정렬 P 게인 - 7.4V 강화 (was 0.02)
-    park_rect_kp: 0.03            # 직사각형 정렬 P 게인 - 7.4V 강화 (was 0.015)
-    park_final_kp: 0.04           # 최종 거리 조정 P 게인 - 7.4V 강화 (was 0.02)
-    park_max_vx: 0.02             # 주차 시 최대 전후 속도 - 7.4V 강화 (was 0.008)
-    park_max_vy: 0.025            # 주차 시 최대 좌우 속도 - 7.4V 강화 (was 0.01)
-    park_min_speed: 0.008         # 주차 시 최소 속도 - 7.4V 강화 (was 0.003)
+    park_creep_vx: 0.011          # -10% (was 0.012)
+    park_align_kp: 0.045          # -10% (was 0.05)
+    park_rect_kp: 0.036           # -10% (was 0.04)
+    park_final_kp: 0.045          # -10% (was 0.05)
+    park_max_vx: 0.023            # -10% (was 0.025)
+    park_max_vy: 0.029            # -10% (was 0.032)
+    park_min_speed: 0.011         # -10% (was 0.012)
     park_marker_threshold: 0.02   # 마커 정렬 완료 임계값 (rad, ~1.1도) - 더 정밀하게
     park_center_threshold: 0.01  # 중앙정렬 완료 임계값 (m, 1cm)
     park_side_camera_offset_x: 0.0  # side camera→로봇 중앙 전방 오프셋 (m, 양수=카메라가 앞에)
     park_rect_threshold: 0.015    # 직사각형 정렬 완료 임계값 (m, 1.5cm)
     park_distance_threshold: 0.02 # 최종 거리 완료 임계값 (m, 2cm)
-    park_target_distance: 0.15    # 목표 주차 거리 (m, 마커로부터 15cm)
-    park_align_forward: 0.002    # 정렬 완료 후 전진 거리 (m, 2mm)
+    park_target_distance: 0.20    # 목표 주차 거리 (m, 마커로부터 20cm)
+    park_align_forward: 0.005    # 정렬 완료 후 전진 거리 (m, 8mm)
     # Stall detection and power boost
     # 7.4V 배터리: 저전압에서 스톨 가능성 증가 → 부스트 강화
     stall_check_interval: 0.4     # 스톨 체크 주기 (초) - 더 빠른 감지
-    stall_boost_increment: 0.003  # 스톨 시 파워 증가량 (7.4V 보상)
-    stall_max_boost: 0.02         # 최대 부스트 값 (7.4V 보상)
+    stall_boost_increment: 0.006  # 적재장치 보상 강화 (was 0.0045)
+    stall_max_boost: 0.035        # 적재장치 보상 강화 (was 0.027)
     stall_threshold_wz: 0.005     # 회전 스톨 임계값 (rad)
     stall_threshold_vy: 0.01      # 이동 스톨 임계값 (마커 각도 변화, rad)
-    stall_pulse_duration: 0.2     # 펄스 모드 지속 시간 (초) - 약간 증가
+    stall_pulse_duration: 0.3     # 펄스 지속 시간 강화 (was 0.2)
     # Post-turn marker search
     post_turn_search_timeout: 3.0 # Turn 후 마커 탐색 타임아웃 (초)
 

@@ -16,7 +16,10 @@
       "Bash(git fetch:*)",
       "Bash(git merge:*)",
       "Bash(git stash push:*)",
-      "Bash(git stash pop:*)"
+      "Bash(git stash pop:*)",
+      "Bash(ls:*)",
+      "Bash(conda env:*)",
+      "Bash(tmux has-session:*)"
     ]
   }
 }

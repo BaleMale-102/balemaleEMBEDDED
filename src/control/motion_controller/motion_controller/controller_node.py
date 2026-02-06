@@ -445,6 +445,8 @@ class MotionControllerNode(Node):
                 self._park_final_phase = 'DISTANCE'  # DISTANCE → FORWARD
                 self._park_action = 'MOVE'
                 self._park_action_start_time = 0.0
+                self._park_final_last_distance = -1.0
+                self._park_final_lost_start = 0.0
         elif state == 'PARK':
             # Legacy PARK state - treat as PARK_DETECT
             self._mode = self.MODE_PARK_DETECT
@@ -855,15 +857,15 @@ class MotionControllerNode(Node):
                 if self._stall_pulse_mode:
                     pulse_elapsed = now - self._stall_pulse_start_time
                     if pulse_elapsed < self._stall_pulse_duration:
-                        boost = self._stall_wz_boost * 2.0
+                        boost = self._stall_wz_boost * 3.0
                         wz = wz + (boost if wz > 0 else -boost)
                     else:
                         self._stall_pulse_mode = False
                 else:
                     wz = wz + (self._stall_wz_boost if wz > 0 else -self._stall_wz_boost)
 
-                # Minimum speed guarantee
-                min_wz = 0.025 + self._stall_wz_boost
+                # Minimum speed guarantee (적재장치 무게 보상)
+                min_wz = 0.04 + self._stall_wz_boost
                 if abs(wz) < min_wz and abs(angle) > 0.03:
                     wz = min_wz if angle > 0 else -min_wz
 
@@ -930,15 +932,15 @@ class MotionControllerNode(Node):
             if self._stall_pulse_mode:
                 pulse_elapsed = now - self._stall_pulse_start_time
                 if pulse_elapsed < self._stall_pulse_duration:
-                    boost = self._stall_vy_boost * 2.0
+                    boost = self._stall_vy_boost * 3.0
                     vy = vy + (boost if vy > 0 else -boost)
                 else:
                     self._stall_pulse_mode = False
             else:
                 vy = vy + (self._stall_vy_boost if vy > 0 else -self._stall_vy_boost)
 
-            # Minimum speed guarantee
-            min_speed = 0.01 + self._stall_vy_boost
+            # Minimum speed guarantee (적재장치 무게 보상)
+            min_speed = 0.015 + self._stall_vy_boost
             if abs(vy) < min_speed and abs(angle) > 0.02:
                 vy = min_speed if angle < 0 else -min_speed
 
@@ -1355,11 +1357,38 @@ class MotionControllerNode(Node):
             return cmd, error_x, error_y, error_yaw, detail
 
         if self._side_marker is None:
-            detail = 'No side marker, waiting...'
+            # 마커 소실 시: 마지막 거리가 목표 근처였으면 완료 처리
+            last_dist = getattr(self, '_park_final_last_distance', -1.0)
+            lost_time = getattr(self, '_park_final_lost_start', 0.0)
+            if lost_time == 0.0:
+                self._park_final_lost_start = now
+            lost_elapsed = now - self._park_final_lost_start
+
+            if last_dist > 0:
+                remaining = last_dist - self.park_target_distance
+                # 마커 근처(오차 5cm 이내)에서 소실 → 2초 후 완료 처리
+                if remaining < 0.05 and lost_elapsed > 2.0:
+                    self.get_logger().info(
+                        f'Side marker lost near target (last={last_dist*100:.1f}cm, '
+                        f'target={self.park_target_distance*100:.1f}cm) → completing'
+                    )
+                    if self.park_align_forward > 0.001:
+                        self._park_final_phase = 'FORWARD'
+                        self._park_forward_start_time = now
+                    else:
+                        self._publish_park_final_done()
+                        self._park_final_done_sent = True
+                    detail = f'Marker lost, completing (last={last_dist*100:.1f}cm)'
+                    return cmd, error_x, error_y, error_yaw, detail
+
+            detail = f'No side marker, waiting... (last={last_dist*100:.1f}cm, lost={lost_elapsed:.1f}s)'
             return cmd, error_x, error_y, error_yaw, detail
 
+        # 마커 보이면 lost 타이머 리셋
+        self._park_final_lost_start = 0.0
         marker = self._side_marker
         distance = marker.distance
+        self._park_final_last_distance = distance
         error = distance - self.park_target_distance
         error_x = distance
 
