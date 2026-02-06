@@ -157,14 +157,14 @@
     lane_wz_ki: 0.0
     lane_wz_kd: 0.05
     # Marker approach
-    marker_vy_kp: 0.012               # 7.4V 보상 (was 0.01)
+    marker_vy_kp: 0.02                # 좌우 게인 강화 (was 0.012)
     marker_vx_kp: 0.015               # 원래값 유지
-    marker_wz_kp: 0.03                # 7.4V 보상 (was 0.025)
+    marker_wz_kp: 0.05                # 회전 게인 강화 (was 0.03)
     marker_reach_distance: 0.25
     marker_min_distance: 0.08
     marker_lost_reach_distance: 0.35
     marker_align_threshold: 0.1  # 좌우 정렬 임계값 (rad, ~8.5도) - 이 이상이면 정렬 먼저
-    align_move_duration: 0.15    # 정렬 시 이동 시간 (초) - 이 시간만큼 움직이고
+    align_move_duration: 0.25    # 정렬 시 이동 시간 강화 (was 0.15)
     align_settle_duration: 0.3   # 정렬 시 관찰 시간 (초) - 멈추고 카메라 확인
     advance_vx: 0.022             # ADVANCE_TO_CENTER 전진 속도 - 7.4V 보상 (was 0.02)
     advance_time: 0.0             # ADVANCE_TO_CENTER 스킵 (0초)

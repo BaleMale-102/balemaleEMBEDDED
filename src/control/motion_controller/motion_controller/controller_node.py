@@ -392,9 +392,16 @@ class MotionControllerNode(Node):
                 self._marker_visible_at_turn_end = False
                 self._post_turn_search_mode = False
                 self._turn_last_target = self._turn_target_rad  # 변경 감지용
+                self._turn_log_count = 0  # 초기 반복 로깅용
+                # 레이스 컨디션 진단: 턴 시작 시 target_marker_id 확인
+                tracker_id = self._tracked_marker.id if self._tracked_marker else -1
+                tracker_conf = self._tracked_marker.prediction_confidence if self._tracked_marker else 0.0
+                tracker_det = self._tracked_marker.is_detected if self._tracked_marker else False
                 self.get_logger().info(
                     f'TURN started: start_yaw={math.degrees(self._turn_start_yaw):.1f}deg, '
-                    f'target={math.degrees(self._turn_target_rad):.1f}deg, dir={self._turn_direction}'
+                    f'target={math.degrees(self._turn_target_rad):.1f}deg, dir={self._turn_direction} | '
+                    f'target_marker_id={self._target_marker_id}, '
+                    f'tracker=[id={tracker_id}, det={tracker_det}, conf={tracker_conf:.2f}]'
                 )
         elif state == 'ALIGN_TO_MARKER':
             self._mode = self.MODE_ALIGN
@@ -856,7 +863,7 @@ class MotionControllerNode(Node):
                     wz = wz + (self._stall_wz_boost if wz > 0 else -self._stall_wz_boost)
 
                 # Minimum speed guarantee
-                min_wz = 0.015 + self._stall_wz_boost
+                min_wz = 0.025 + self._stall_wz_boost
                 if abs(wz) < min_wz and abs(angle) > 0.03:
                     wz = min_wz if angle > 0 else -min_wz
 
@@ -1013,24 +1020,37 @@ class MotionControllerNode(Node):
 
     def _turn_control(self):
         """
-        In-place turn control with marker-based early termination.
+        In-place turn control - marker-only completion.
 
-        회전 중 타겟 마커가 감지되면 IMU 각도와 상관없이 즉시 종료하고
-        ALIGN 모드로 전환하여 정밀 정렬 수행.
+        일정 속도로 turn_direction 방향으로 회전하면서
+        타겟 마커가 감지되면 즉시 종료 → ALIGN 모드에서 정밀 정렬.
+        IMU 기반 완료 판단 없음 (모터 가속 오버슈트 방지).
         """
         cmd = Twist()
 
         if self._turn_done_sent:
             return cmd, 0.0, 0.0, 0.0, 'Turn done, waiting for state change'
 
-        if self._imu_data is None:
-            return cmd, 0.0, 0.0, 0.0, 'No IMU data'
+        # 초기 반복 진단 카운터
+        self._turn_log_count = getattr(self, '_turn_log_count', 0) + 1
 
-        # 타겟 마커가 감지되면 즉시 턴 종료 (IMU 각도 무시)
+        # 타겟 마커가 감지되면 즉시 턴 종료
         marker_ok = (self._tracked_marker is not None and
                      self._tracked_marker.id == self._target_marker_id and
                      (self._tracked_marker.is_detected or
                       self._tracked_marker.prediction_confidence > 0.5))
+
+        # 처음 5회 반복에서 marker_ok 상태 로깅 (레이스 컨디션 진단)
+        if self._turn_log_count <= 5:
+            tracker_id = self._tracked_marker.id if self._tracked_marker else -1
+            tracker_det = self._tracked_marker.is_detected if self._tracked_marker else False
+            tracker_conf = self._tracked_marker.prediction_confidence if self._tracked_marker else 0.0
+            self.get_logger().info(
+                f'[TURN_ITER_{self._turn_log_count}] marker_ok={marker_ok}, '
+                f'target_id={self._target_marker_id}, '
+                f'tracker=[id={tracker_id}, det={tracker_det}, conf={tracker_conf:.2f}], '
+                f'yaw={math.degrees(self._current_yaw):.1f}'
+            )
 
         if marker_ok:
             # 마커 발견 - 즉시 턴 종료
@@ -1044,56 +1064,15 @@ class MotionControllerNode(Node):
             )
             return cmd, 0.0, 0.0, 0.0, f'Marker {self._target_marker_id} found, stopping turn'
 
-        turned = -(self._current_yaw - self._turn_start_yaw)
+        # 마커 미발견 → 일정 속도로 계속 회전
+        # _turn_direction: +1 = CCW (좌회전), -1 = CW (우회전)
+        wz = self.turn_wz * self._turn_direction
+        cmd.angular.z = -wz  # 모터 부호 반전
 
-        while turned > math.pi:
-            turned -= 2 * math.pi
-        while turned < -math.pi:
-            turned += 2 * math.pi
+        detail = (f'Turn: rotating dir={self._turn_direction}, '
+                  f'wz={-wz:.3f}, yaw={math.degrees(self._current_yaw):.1f}')
 
-        error_yaw = self._turn_target_rad - turned
-
-        while error_yaw > math.pi:
-            error_yaw -= 2 * math.pi
-        while error_yaw < -math.pi:
-            error_yaw += 2 * math.pi
-
-        # IMU 기반 턴 완료 체크 (마커 못 찾은 경우 fallback)
-        if abs(error_yaw) < self.turn_tolerance:
-            self._marker_visible_at_turn_end = False
-            # IMU 턴은 오버슈트 가능성 있음 → 탐색 시 반대 방향 먼저
-            self._marker_seen_during_turn = True  # 반대 방향 탐색 유도
-            self._publish_turn_done()
-            self._turn_done_sent = True
-            self.get_logger().info(
-                f'Turn done (IMU)! turned={math.degrees(turned):.1f}deg, error={math.degrees(error_yaw):.1f}deg, '
-                f'search will try opposite direction first'
-            )
-            return cmd, 0.0, 0.0, error_yaw, f'Turn complete (IMU), turned={math.degrees(turned):.1f}deg'
-
-        d_error = error_yaw - self._prev_turn_error
-        self._prev_turn_error = error_yaw
-
-        p_term = self.turn_kp * error_yaw
-        d_term = self.turn_kd * d_error
-        wz = p_term + d_term
-
-        if abs(error_yaw) < self.turn_decel_zone:
-            scale = abs(error_yaw) / self.turn_decel_zone
-            max_wz_now = self.turn_wz_min + (self.turn_wz - self.turn_wz_min) * scale
-        else:
-            max_wz_now = self.turn_wz
-
-        if abs(wz) > max_wz_now:
-            wz = max_wz_now if wz > 0 else -max_wz_now
-        elif abs(wz) < self.turn_wz_min and abs(error_yaw) > self.turn_tolerance:
-            wz = self.turn_wz_min if error_yaw > 0 else -self.turn_wz_min
-
-        cmd.angular.z = -wz
-
-        detail = f'Turn: tgt={math.degrees(self._turn_target_rad):.0f}, turned={math.degrees(turned):.1f}, err={math.degrees(error_yaw):.1f}, wz={-wz:.2f}'
-
-        return cmd, 0.0, 0.0, error_yaw, detail
+        return cmd, 0.0, 0.0, 0.0, detail
 
     # ==========================================
     # Parking Control Methods

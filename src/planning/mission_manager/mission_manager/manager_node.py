@@ -291,10 +291,12 @@ class MissionManagerNode(Node):
         """Handle turn complete notification."""
         if msg.data:
             turn_angle = self.fsm.context.turn_target_rad
+            old_heading = self._current_heading
             self._current_heading = wrap_angle(self._current_heading + turn_angle)
 
             self.get_logger().info(
-                f'Turn complete, new heading={math.degrees(self._current_heading):.1f}deg'
+                f'[HEADING] Turn complete: {math.degrees(old_heading):.1f}deg + '
+                f'turn({math.degrees(turn_angle):.1f}deg) = {math.degrees(self._current_heading):.1f}deg'
             )
 
             heading_msg = Float32()
@@ -735,9 +737,10 @@ class MissionManagerNode(Node):
         dy = to_pos[1] - from_pos[1]
 
         if abs(dx) > 0.001 or abs(dy) > 0.001:
+            old_heading = self._current_heading
             self._current_heading = math.atan2(dy, dx)
-            self.get_logger().debug(
-                f'Heading updated: {math.degrees(self._current_heading):.1f}deg '
+            self.get_logger().info(
+                f'[HEADING] Updated: {math.degrees(old_heading):.1f}deg -> {math.degrees(self._current_heading):.1f}deg '
                 f'(from marker {from_marker} to {to_marker})'
             )
 
@@ -768,11 +771,19 @@ class MissionManagerNode(Node):
         target_direction = math.atan2(dy, dx)
         turn_angle = wrap_angle(target_direction - self._current_heading)
 
-        self.get_logger().debug(
-            f'Turn calculation: current_heading={math.degrees(self._current_heading):.1f}deg, '
-            f'target_direction={math.degrees(target_direction):.1f}deg, '
-            f'turn_angle={math.degrees(turn_angle):.1f}deg'
+        self.get_logger().info(
+            f'[TURN_ANALYSIS] From:{current_marker} To:{target_marker} | '
+            f'CurrHdg:{math.degrees(self._current_heading):.1f}deg | '
+            f'TgtDir:{math.degrees(target_direction):.1f}deg | '
+            f'FinalTurn:{math.degrees(turn_angle):.1f}deg'
         )
+
+        # ±π 경계 경고: turn_angle이 ±170° 초과 시 방향 불안정 위험
+        if abs(turn_angle) > math.radians(170):
+            self.get_logger().warn(
+                f'[TURN_ANALYSIS] WARNING: turn_angle={math.degrees(turn_angle):.1f}deg near ±180° boundary! '
+                f'Direction may be unstable. Check heading accuracy.'
+            )
 
         return turn_angle
 
