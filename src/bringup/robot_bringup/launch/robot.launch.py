@@ -62,12 +62,19 @@ def generate_launch_description():
         description='Simulate loader (no hardware)'
     )
 
+    enable_server_arg = DeclareLaunchArgument(
+        'enable_server',
+        default_value='false',
+        description='Enable server_bridge node'
+    )
+
     # Get launch configurations
     simulation = LaunchConfiguration('simulation')
     show_debug = LaunchConfiguration('show_debug')
     config_file = LaunchConfiguration('config_file')
     marker_map = LaunchConfiguration('marker_map')
     loader_simulate = LaunchConfiguration('loader_simulate')
+    enable_server = LaunchConfiguration('enable_server')
 
     # Marker map parameter dict for nodes that need it
     marker_map_param = {'marker_map_yaml': marker_map}
@@ -160,31 +167,31 @@ def generate_launch_description():
 
         # ANPR + 장애물 검출 (소켓 클라이언트 - AI 서버 먼저 실행 필요)
         # AI 서버: ./scripts/start_ai_servers.sh
-        Node(
-            package='anpr_detector',
-            executable='anomaly_node',
-            name='anomaly_detector',
-            parameters=[{
-                'image_topic': '/cam_front/image_raw',
-                'server_host': 'localhost',
-                'server_port': 9001,
-                'publish_debug_image': True,
-                'show_debug_window': False,
-            }],
-        ),
+        # Node(
+        #     package='anpr_detector',
+        #     executable='anomaly_node',
+        #     name='anomaly_detector',
+        #     parameters=[{
+        #         'image_topic': '/cam_front/image_raw',
+        #         'server_host': 'localhost',
+        #         'server_port': 9001,
+        #         'publish_debug_image': True,
+        #         'show_debug_window': False,
+        #     }],
+        # ),
 
-        Node(
-            package='anpr_detector',
-            executable='ocr_node',
-            name='ocr_detector',
-            parameters=[{
-                'image_topic': '/cam_side/image_raw',
-                'server_host': 'localhost',
-                'server_port': 9002,
-                'publish_debug_image': True,
-                'show_debug_window': False,
-            }],
-        ),
+        # Node(
+        #     package='anpr_detector',
+        #     executable='ocr_node',
+        #     name='ocr_detector',
+        #     parameters=[{
+        #         'image_topic': '/cam_side/image_raw',
+        #         'server_host': 'localhost',
+        #         'server_port': 9002,
+        #         'publish_debug_image': True,
+        #         'show_debug_window': False,
+        #     }],
+        # ),
     ])
 
     # ==========================================
@@ -224,7 +231,7 @@ def generate_launch_description():
             parameters=[config_file, marker_map_param],
         ),
 
-        # Server Bridge
+        # Server Bridge (enable_server=true일 때만 실행)
         Node(
             package='server_bridge',
             executable='bridge_node',
@@ -236,6 +243,7 @@ def generate_launch_description():
                     'map_file_path': marker_map,
                 },
             ],
+            condition=IfCondition(enable_server),
         ),
     ])
 
@@ -246,6 +254,7 @@ def generate_launch_description():
         config_file_arg,
         marker_map_arg,
         loader_simulate_arg,
+        enable_server_arg,
 
         # Node groups
         perception_group,

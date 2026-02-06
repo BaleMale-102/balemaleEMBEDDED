@@ -117,6 +117,64 @@ self._context.final_goal_id = HOME_MARKER_ID
 
 ---
 
+### 4. 7.4V 배터리 보상 및 제어 개선 (다수 커밋)
+
+#### 수정 파일
+- `src/control/motion_controller/motion_controller/controller_node.py`
+- `src/planning/mission_manager/mission_manager/state_machine.py`
+- `src/planning/mission_manager/mission_manager/manager_node.py`
+- `src/bringup/robot_bringup/config/robot_params.yaml`
+
+#### 수정 내용
+
+**1) 7.4V 배터리 속도 보상**
+- 12V→7.4V 변경으로 전체 속도 파라미터 ~1.15x 조정
+- Arduino max_pwm: 2000 → 3200
+- 주차 관련 속도 2배 강화 (park_align_kp, park_max_vx 등)
+
+**2) ADVANCE_TO_CENTER 스킵**
+- `advance_time: 0.0` → 해당 단계 즉시 완료
+
+**3) Move-Pause-Observe 패턴 (카메라 딜레이 보상)**
+- ALIGN-WZ, ALIGN-VY, PARK_ALIGN_MARKER, PARK_FINAL에 적용
+- `align_move_duration: 0.15` (이동), `align_settle_duration: 0.3` (관찰)
+- 이동 → 멈춤 → 카메라 안정화 → 측정 → 이동 반복
+
+**4) Waypoint 라우팅 버그 수정**
+- `test_drive 1,3,9` 시 마커 3에서 FINISH되는 문제
+- `_stop_bump_transition`에서 `is_last_waypoint` 판정 수정
+- 마지막 waypoint ≠ final_goal일 때 계속 주행
+
+**5) Turn 방향 레이스 컨디션 수정**
+- TURNING 중 `current_target_marker`가 이전 마커를 가리키는 문제
+- manager_node: TURNING 상태에서 다음 타겟 마커 발행
+- controller_node: `_turn_last_target` 변경 감지 → 타겟 변경 시 턴 재초기화
+- IMU 턴 완료 시 `_marker_seen_during_turn=True` → 반대 방향 탐색 유도
+
+**6) START_PARK 직접 진입**
+- 빈 waypoint + PARK 태스크 시 DRIVE 대신 PARK_DETECT로 직행
+
+**7) PARK_ALIGN_MARKER 2단계 정렬**
+- Phase 1 (ANGLE): `marker.angle` 기반 대략적 전후 정렬 → `park_marker_threshold` (0.02rad) 이하 시 전환
+- Phase 2 (CENTER): `marker.pose.position.x` (tvec[0]) 기반 미세 중앙 정렬 → `park_center_threshold` (1cm) 이하 + 0.5초 안정 시 완료
+- angle 크게 벗어나면 Phase 1로 자동 복귀
+
+**8) PARK_FINAL 완료 후 고정 전진**
+- 거리 조정 완료 후 `park_align_forward` (2mm)만큼 전진 후 done
+- 0으로 설정 시 스킵
+
+#### 추가된 파라미터
+
+| 파라미터 | 값 | 설명 |
+|---------|-----|------|
+| `align_move_duration` | 0.15 | 정렬 시 이동 시간 (초) |
+| `align_settle_duration` | 0.3 | 정렬 시 관찰 시간 (초) |
+| `park_center_threshold` | 0.01 | 중앙정렬 완료 임계값 (m) |
+| `park_side_camera_offset_x` | 0.0 | side camera→로봇 중앙 전방 오프셋 (m) |
+| `park_align_forward` | 0.002 | PARK_FINAL 후 전진 거리 (m) |
+
+---
+
 ## 테스트 시 확인 사항
 
 ### 1. 회전 및 정렬
@@ -129,13 +187,16 @@ self._context.final_goal_id = HOME_MARKER_ID
 - [ ] 로봇 heading이 유지되는지 (slot 방향으로 회전하지 않는지)
 
 ### 3. 주차 정렬 (PARK_ALIGN_MARKER)
-- [ ] side camera 마커 angle로 전후진(vx)만 수행하는지
-- [ ] 회전(wz) 없이 heading 유지하는지
-- [ ] 부호 방향 확인: angle > 0 → 후진, angle < 0 → 전진
+- [x] side camera 마커 angle로 전후진(vx)만 수행하는지
+- [x] 회전(wz) 없이 heading 유지하는지
+- [x] 부호 방향 확인: angle > 0 → 후진, angle < 0 → 전진
+- [x] Phase 1 (ANGLE) → Phase 2 (CENTER) 순서로 진행
+- [x] move-pause-observe 패턴 적용
 
 ### 4. 주차 최종 (PARK_FINAL)
 - [ ] side camera 마커 distance로 측면이동(vy)하는지
 - [ ] target distance (15cm)에 도달하는지
+- [ ] 거리 조정 후 고정 전진 (park_align_forward) 수행하는지
 
 ### 5. 복귀
 - [ ] UNLOAD 완료 후 자동으로 RETURN_HOME 전환하는지

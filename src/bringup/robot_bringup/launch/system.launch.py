@@ -68,6 +68,12 @@ def generate_launch_description():
         description='Simulate loader (no hardware)'
     )
 
+    enable_server_arg = DeclareLaunchArgument(
+        'enable_server',
+        default_value='false',
+        description='Enable server_bridge node'
+    )
+
     # ==========================================
     # Include Sensors Launch
     # ==========================================
@@ -94,6 +100,7 @@ def generate_launch_description():
             'simulation': LaunchConfiguration('simulation'),
             'show_debug': LaunchConfiguration('show_debug'),
             'loader_simulate': LaunchConfiguration('loader_simulate'),
+            'enable_server': LaunchConfiguration('enable_server'),
         }.items()
     )
 
@@ -105,6 +112,7 @@ def generate_launch_description():
         cam_side_dev_arg,
         arduino_port_arg,
         loader_simulate_arg,
+        enable_server_arg,
 
         # Launches
         sensors_launch,

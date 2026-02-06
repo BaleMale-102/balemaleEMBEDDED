@@ -512,8 +512,16 @@ class MissionManagerNode(Node):
         self.pub_state.publish(state_msg)
 
         # Publish target marker
+        # TURNING 중에는 다음 타겟(회전 목적지)을 publish
         target_msg = Int32()
-        target_msg.data = self.fsm.context.current_target_marker
+        if self.fsm.state == MissionState.TURNING:
+            next_idx = self.fsm.context.current_waypoint_idx + 1
+            if next_idx < len(self.fsm.context.waypoint_ids):
+                target_msg.data = self.fsm.context.waypoint_ids[next_idx]
+            else:
+                target_msg.data = self.fsm.context.final_goal_id
+        else:
+            target_msg.data = self.fsm.context.current_target_marker
         self.pub_target_marker.publish(target_msg)
 
         # Publish parking target slot

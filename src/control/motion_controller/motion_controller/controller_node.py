@@ -58,7 +58,7 @@ class MotionControllerNode(Node):
     MODE_PARK_DETECT = 'PARK_DETECT'
     MODE_PARK_RECOVERY = 'PARK_RECOVERY'
     MODE_PARK_ALIGN_MARKER = 'PARK_ALIGN_MARKER'
-    MODE_PARK_ALIGN_RECT = 'PARK_ALIGN_RECT'
+    MODE_PARK_ALIGN_RECT = 'PARK_ALIGN_RECT'    # 안씀 
     MODE_PARK_FINAL = 'PARK_FINAL'
 
     def __init__(self):
@@ -92,6 +92,8 @@ class MotionControllerNode(Node):
         self.declare_parameter('marker_align_threshold', 0.15)
         self.declare_parameter('advance_vx', 0.02)
         self.declare_parameter('advance_time', 0.5)
+        self.declare_parameter('align_move_duration', 0.15)
+        self.declare_parameter('align_settle_duration', 0.3)
 
         # Parameters - turn
         self.declare_parameter('turn_wz', 0.04)
@@ -111,9 +113,12 @@ class MotionControllerNode(Node):
         self.declare_parameter('park_max_vy', 0.01)
         self.declare_parameter('park_min_speed', 0.003)
         self.declare_parameter('park_marker_threshold', 0.05)  # ~3deg
+        self.declare_parameter('park_center_threshold', 0.01)  # 1cm
+        self.declare_parameter('park_side_camera_offset_x', 0.0)  # camera offset
         self.declare_parameter('park_rect_threshold', 0.015)   # 1.5cm
         self.declare_parameter('park_distance_threshold', 0.02)  # 2cm
         self.declare_parameter('park_target_distance', 0.15)   # 15cm
+        self.declare_parameter('park_align_forward', 0.03)   # 정렬 후 전진 거리 (3cm)
 
         # Parameters - stall detection and power boost
         self.declare_parameter('stall_check_interval', 0.5)
@@ -140,6 +145,8 @@ class MotionControllerNode(Node):
         self.marker_align_threshold = self.get_parameter('marker_align_threshold').value
         self.advance_vx = self.get_parameter('advance_vx').value
         self.advance_time = self.get_parameter('advance_time').value
+        self.align_move_duration = self.get_parameter('align_move_duration').value
+        self.align_settle_duration = self.get_parameter('align_settle_duration').value
         self.turn_wz = self.get_parameter('turn_wz').value
         self.turn_wz_min = self.get_parameter('turn_wz_min').value
         self.turn_tolerance = self.get_parameter('turn_tolerance').value
@@ -157,9 +164,12 @@ class MotionControllerNode(Node):
         self.park_max_vy = self.get_parameter('park_max_vy').value
         self.park_min_speed = self.get_parameter('park_min_speed').value
         self.park_marker_threshold = self.get_parameter('park_marker_threshold').value
+        self.park_center_threshold = self.get_parameter('park_center_threshold').value
+        self.park_side_camera_offset_x = self.get_parameter('park_side_camera_offset_x').value
         self.park_rect_threshold = self.get_parameter('park_rect_threshold').value
         self.park_distance_threshold = self.get_parameter('park_distance_threshold').value
         self.park_target_distance = self.get_parameter('park_target_distance').value
+        self.park_align_forward = self.get_parameter('park_align_forward').value
 
         # Stall detection parameters
         self._stall_check_interval = self.get_parameter('stall_check_interval').value
@@ -199,6 +209,7 @@ class MotionControllerNode(Node):
         self._current_yaw = 0.0
         self._prev_turn_error = 0.0
         self._turn_done_sent = False
+        self._turn_last_target = 0.0
 
         # Recovery state
         self._recovery_direction = ''
@@ -227,6 +238,9 @@ class MotionControllerNode(Node):
         # ALIGN_TO_MARKER two-phase state (wz → vy)
         self._align_phase = 'WZ'  # 'WZ' first, then 'VY'
         self._align_wz_done = False
+        # Move-pause-observe pattern for alignment
+        self._align_action = 'MOVE'  # 'MOVE' or 'SETTLE'
+        self._align_action_start_time = 0.0
 
         # Turn marker tracking (for post-turn search)
         self._turn_direction = 0  # +1 = CCW, -1 = CW
@@ -373,12 +387,15 @@ class MotionControllerNode(Node):
                 self._turn_start_yaw = self._current_yaw
                 self._prev_turn_error = 0.0
                 self._turn_done_sent = False
-                # Track turn direction for post-turn search
                 self._turn_direction = 1 if self._turn_target_rad > 0 else -1
                 self._marker_seen_during_turn = False
                 self._marker_visible_at_turn_end = False
                 self._post_turn_search_mode = False
-                self.get_logger().info(f'TURN started: start_yaw={math.degrees(self._turn_start_yaw):.1f}deg, target={math.degrees(self._turn_target_rad):.1f}deg')
+                self._turn_last_target = self._turn_target_rad  # 변경 감지용
+                self.get_logger().info(
+                    f'TURN started: start_yaw={math.degrees(self._turn_start_yaw):.1f}deg, '
+                    f'target={math.degrees(self._turn_target_rad):.1f}deg, dir={self._turn_direction}'
+                )
         elif state == 'ALIGN_TO_MARKER':
             self._mode = self.MODE_ALIGN
             if prev_mode != self.MODE_ALIGN:
@@ -390,6 +407,8 @@ class MotionControllerNode(Node):
                 self._stall_wz_boost = 0.0
                 self._consecutive_stalls = 0
                 self._stall_pulse_mode = False
+                self._align_action = 'MOVE'
+                self._align_action_start_time = 0.0
                 self.get_logger().info('ALIGN_TO_MARKER started (WZ → VY phases)')
         elif state in ('STOP', 'FINISH', 'STOP_BUMP'):
             self._mode = self.MODE_STOP
@@ -404,6 +423,10 @@ class MotionControllerNode(Node):
             self._mode = self.MODE_PARK_ALIGN_MARKER
             if prev_mode != self.MODE_PARK_ALIGN_MARKER:
                 self._park_align_marker_done_sent = False
+                self._park_align_phase = 'ANGLE'  # Phase 1: angle, Phase 2: center
+                self._park_action = 'MOVE'
+                self._park_action_start_time = 0.0
+                self.get_logger().info('PARK_ALIGN_MARKER: Phase 1 (ANGLE) → Phase 2 (CENTER)')
         elif state == 'PARK_ALIGN_RECT':
             self._mode = self.MODE_PARK_ALIGN_RECT
             if prev_mode != self.MODE_PARK_ALIGN_RECT:
@@ -412,6 +435,9 @@ class MotionControllerNode(Node):
             self._mode = self.MODE_PARK_FINAL
             if prev_mode != self.MODE_PARK_FINAL:
                 self._park_final_done_sent = False
+                self._park_final_phase = 'DISTANCE'  # DISTANCE → FORWARD
+                self._park_action = 'MOVE'
+                self._park_action_start_time = 0.0
         elif state == 'PARK':
             # Legacy PARK state - treat as PARK_DETECT
             self._mode = self.MODE_PARK_DETECT
@@ -437,7 +463,19 @@ class MotionControllerNode(Node):
     def _turn_target_callback(self, msg):
         """Handle turn target angle."""
         raw_rad = msg.data / 100.0
-        self._turn_target_rad = raw_rad * self.turn_scale
+        new_target = raw_rad * self.turn_scale
+        # TURN 중 target이 크게 바뀌면 재초기화 (레이스 컨디션 보정)
+        if (self._mode == self.MODE_TURN and not self._turn_done_sent and
+                abs(new_target - getattr(self, '_turn_last_target', new_target)) > 0.1):
+            self._turn_start_yaw = self._current_yaw
+            self._turn_direction = 1 if new_target > 0 else -1
+            self._prev_turn_error = 0.0
+            self._turn_last_target = new_target
+            self.get_logger().info(
+                f'TURN reinit: target changed to {math.degrees(new_target):.1f}deg, '
+                f'start_yaw={math.degrees(self._turn_start_yaw):.1f}deg, dir={self._turn_direction}'
+            )
+        self._turn_target_rad = new_target
 
     def _marker_callback(self, msg):
         """Handle tracked marker updates."""
@@ -773,11 +811,36 @@ class MotionControllerNode(Node):
             if abs(angle) < switch_threshold:
                 # WZ phase done, move to VY
                 self._align_phase = 'VY'
-                # Reset stall detection for VY phase
+                # Reset stall detection and settle timer for VY phase
                 self._stall_wz_boost = 0.0
                 self._consecutive_stalls = 0
+                self._align_action = 'MOVE'
+                self._align_action_start_time = 0.0
                 self.get_logger().info(f'WZ align done (angle={math.degrees(angle):.1f}deg), starting VY phase')
             else:
+                # Move-pause-observe pattern
+                if self._align_action_start_time == 0.0:
+                    self._align_action = 'MOVE'
+                    self._align_action_start_time = now
+
+                action_elapsed = now - self._align_action_start_time
+
+                if self._align_action == 'SETTLE':
+                    # Pause: wait for camera to observe result
+                    if action_elapsed >= self.align_settle_duration:
+                        self._align_action = 'MOVE'
+                        self._align_action_start_time = now
+                    detail = f'[ALIGN-WZ] SETTLE {action_elapsed:.2f}/{self.align_settle_duration:.1f}s, a={math.degrees(angle):.1f}deg [{pred}]'
+                    return cmd, error_x, error_y, error_yaw, detail
+
+                # MOVE phase
+                if action_elapsed >= self.align_move_duration:
+                    # Switch to settle
+                    self._align_action = 'SETTLE'
+                    self._align_action_start_time = now
+                    detail = f'[ALIGN-WZ] → SETTLE, a={math.degrees(angle):.1f}deg [{pred}]'
+                    return cmd, error_x, error_y, error_yaw, detail
+
                 # Apply WZ control with stall boost
                 wz = self.marker_wz_kp * angle * 2.0
 
@@ -799,7 +862,7 @@ class MotionControllerNode(Node):
 
                 cmd.angular.z = -wz  # Negate for motor direction
 
-                detail = f'[ALIGN-WZ] a={math.degrees(angle):.1f}deg, wz={-wz:.3f}, boost={self._stall_wz_boost:.3f} [{pred}]'
+                detail = f'[ALIGN-WZ] MOVE a={math.degrees(angle):.1f}deg, wz={-wz:.3f}, boost={self._stall_wz_boost:.3f} [{pred}]'
                 return cmd, error_x, error_y, error_yaw, detail
 
         # ========================================
@@ -825,8 +888,33 @@ class MotionControllerNode(Node):
                 self._align_phase = 'WZ'
                 self._stall_vy_boost = 0.0
                 self._consecutive_stalls = 0
+                self._align_action = 'MOVE'
+                self._align_action_start_time = 0.0
                 self.get_logger().info(f'Angle drifted ({math.degrees(angle):.1f}deg), back to WZ phase')
                 return self._align_to_marker()  # Recursive call for WZ
+
+            # Move-pause-observe pattern for VY
+            if self._align_action_start_time == 0.0:
+                self._align_action = 'MOVE'
+                self._align_action_start_time = now
+
+            action_elapsed = now - self._align_action_start_time
+
+            if self._align_action == 'SETTLE':
+                # Pause: wait for camera to observe result
+                if action_elapsed >= self.align_settle_duration:
+                    self._align_action = 'MOVE'
+                    self._align_action_start_time = now
+                detail = f'[ALIGN-VY] SETTLE {action_elapsed:.2f}/{self.align_settle_duration:.1f}s, a={math.degrees(angle):.1f}deg [{pred}]'
+                return cmd, error_x, error_y, error_yaw, detail
+
+            # MOVE phase
+            if action_elapsed >= self.align_move_duration:
+                # Switch to settle
+                self._align_action = 'SETTLE'
+                self._align_action_start_time = now
+                detail = f'[ALIGN-VY] → SETTLE, a={math.degrees(angle):.1f}deg [{pred}]'
+                return cmd, error_x, error_y, error_yaw, detail
 
             # VY control for fine adjustment
             vy = -self.marker_vy_kp * angle * 3.0
@@ -849,7 +937,7 @@ class MotionControllerNode(Node):
 
             cmd.linear.y = vy
 
-            detail = f'[ALIGN-VY] a={math.degrees(angle):.1f}deg, vy={vy:.3f}, boost={self._stall_vy_boost:.3f} [{pred}]'
+            detail = f'[ALIGN-VY] MOVE a={math.degrees(angle):.1f}deg, vy={vy:.3f}, boost={self._stall_vy_boost:.3f} [{pred}]'
             return cmd, error_x, error_y, error_yaw, detail
 
         detail = f'No marker {self._target_marker_id}, waiting...'
@@ -973,11 +1061,13 @@ class MotionControllerNode(Node):
         # IMU 기반 턴 완료 체크 (마커 못 찾은 경우 fallback)
         if abs(error_yaw) < self.turn_tolerance:
             self._marker_visible_at_turn_end = False
+            # IMU 턴은 오버슈트 가능성 있음 → 탐색 시 반대 방향 먼저
+            self._marker_seen_during_turn = True  # 반대 방향 탐색 유도
             self._publish_turn_done()
             self._turn_done_sent = True
             self.get_logger().info(
                 f'Turn done (IMU)! turned={math.degrees(turned):.1f}deg, error={math.degrees(error_yaw):.1f}deg, '
-                f'marker_seen={self._marker_seen_during_turn}, no marker at end'
+                f'search will try opposite direction first'
             )
             return cmd, 0.0, 0.0, error_yaw, f'Turn complete (IMU), turned={math.degrees(turned):.1f}deg'
 
@@ -1053,18 +1143,17 @@ class MotionControllerNode(Node):
 
     def _park_align_marker_control(self):
         """
-        PARK_ALIGN_MARKER: Side camera 기준 전후 정렬 (로봇 heading 유지).
+        PARK_ALIGN_MARKER: 2단계 정렬 (Side camera 기준).
 
-        Side camera 좌표계 (카메라가 왼쪽을 바라봄, yaw=+90°):
-        - Camera X-right = Robot +X (앞)
-        - Camera Z-forward = Robot +Y (왼쪽)
+        Phase 1 (ANGLE): marker.angle 기반 대략적 정렬
+        - angle > 0: 마커가 카메라 왼쪽 = 로봇이 앞에 → 후진
+        - angle < 0: 마커가 카메라 오른쪽 = 로봇이 뒤에 → 전진
+        - park_marker_threshold 이하이면 Phase 2로 전환
 
-        marker.angle = atan2(-tvec[0], tvec[2]):
-        - angle > 0: 마커가 카메라 왼쪽 = 로봇 뒤쪽 = 로봇이 앞에 있음 → 후진 필요
-        - angle < 0: 마커가 카메라 오른쪽 = 로봇 앞쪽 = 로봇이 뒤에 있음 → 전진 필요
-
-        Control: angle error -> vx (forward/backward), 부호 반전 필요
-        로봇은 heading을 유지하고 전후진만 수행 (wz 없음)
+        Phase 2 (CENTER): pose.position.x (tvec[0]) 기반 미세 중앙 정렬
+        - offset_x > 0: 마커가 카메라 오른쪽 = 로봇 앞 → 후진
+        - offset_x < 0: 마커가 카메라 왼쪽 = 로봇 뒤 → 전진
+        - park_center_threshold 이하이면 완료
         """
         cmd = Twist()
         error_x = 0.0
@@ -1079,29 +1168,130 @@ class MotionControllerNode(Node):
             return cmd, error_x, error_y, error_yaw, detail
 
         marker = self._side_marker
+        now = self.get_clock().now().nanoseconds / 1e9
         angle = marker.angle
-        error_yaw = angle
+        offset_x = marker.pose.position.x - self.park_side_camera_offset_x
 
-        # Check if aligned
-        if abs(angle) < self.park_marker_threshold:
-            self._publish_park_align_marker_done()
-            self._park_align_marker_done_sent = True
-            detail = f'Marker aligned, angle={math.degrees(angle):.1f}deg'
+        # ========================================
+        # Phase 1: ANGLE 기반 대략적 정렬
+        # ========================================
+        if self._park_align_phase == 'ANGLE':
+            error_yaw = angle
+
+            # angle이 threshold 이하이면 Phase 2로 전환
+            if abs(angle) < self.park_marker_threshold:
+                self._park_align_phase = 'CENTER'
+                self._park_action = 'MOVE'
+                self._park_action_start_time = 0.0
+                if hasattr(self, '_park_align_stable_start'):
+                    delattr(self, '_park_align_stable_start')
+                self.get_logger().info(
+                    f'Phase 1 (ANGLE) done: angle={math.degrees(angle):.1f}deg, '
+                    f'switching to Phase 2 (CENTER), offset={offset_x*100:.1f}cm'
+                )
+                # Fall through to CENTER phase below
+
+            else:
+                # Move-pause-observe pattern
+                if self._park_action_start_time == 0.0:
+                    self._park_action = 'MOVE'
+                    self._park_action_start_time = now
+
+                action_elapsed = now - self._park_action_start_time
+
+                if self._park_action == 'SETTLE':
+                    if action_elapsed >= self.align_settle_duration:
+                        self._park_action = 'MOVE'
+                        self._park_action_start_time = now
+                    detail = f'[ANGLE] SETTLE {action_elapsed:.2f}s, a={math.degrees(angle):.1f}deg'
+                    return cmd, error_x, error_y, error_yaw, detail
+
+                if action_elapsed >= self.align_move_duration:
+                    self._park_action = 'SETTLE'
+                    self._park_action_start_time = now
+                    detail = f'[ANGLE] → SETTLE, a={math.degrees(angle):.1f}deg'
+                    return cmd, error_x, error_y, error_yaw, detail
+
+                # Control: angle -> vx
+                # angle > 0 → 마커가 뒤에 → 후진 필요 → -vx
+                vx = -self.park_align_kp * angle
+                vx = self._clamp(vx, -self.park_max_vx, self.park_max_vx)
+
+                if abs(vx) < self.park_min_speed and abs(angle) > self.park_marker_threshold * 0.5:
+                    vx = -self.park_min_speed if angle > 0 else self.park_min_speed
+
+                cmd.linear.x = vx
+                detail = f'[ANGLE] MOVE: a={math.degrees(angle):.1f}deg, vx={vx:.3f}'
+                return cmd, error_x, error_y, error_yaw, detail
+
+        # ========================================
+        # Phase 2: CENTER 기반 미세 정렬
+        # ========================================
+        if self._park_align_phase == 'CENTER':
+            error_x = offset_x
+
+            # angle이 크게 벗어나면 Phase 1로 복귀
+            if abs(angle) > self.park_marker_threshold * 3.0:
+                self._park_align_phase = 'ANGLE'
+                self._park_action = 'MOVE'
+                self._park_action_start_time = 0.0
+                if hasattr(self, '_park_align_stable_start'):
+                    delattr(self, '_park_align_stable_start')
+                self.get_logger().info(
+                    f'Angle drifted ({math.degrees(angle):.1f}deg), back to Phase 1 (ANGLE)'
+                )
+                return cmd, error_x, error_y, error_yaw, f'[CENTER] → ANGLE (drift)'
+
+            # 중앙 정렬 완료 체크 (stability)
+            if abs(offset_x) < self.park_center_threshold:
+                if not hasattr(self, '_park_align_stable_start'):
+                    self._park_align_stable_start = now
+                elif now - self._park_align_stable_start > 0.5:
+                    if hasattr(self, '_park_align_stable_start'):
+                        delattr(self, '_park_align_stable_start')
+                    self._publish_park_align_marker_done()
+                    self._park_align_marker_done_sent = True
+                    detail = f'Centered! off={offset_x*100:.1f}cm'
+                    return cmd, error_x, error_y, error_yaw, detail
+                detail = f'[CENTER] stable: off={offset_x*100:.1f}cm, {now - self._park_align_stable_start:.1f}/0.5s'
+                return cmd, error_x, error_y, error_yaw, detail
+            else:
+                if hasattr(self, '_park_align_stable_start'):
+                    delattr(self, '_park_align_stable_start')
+
+            # Move-pause-observe pattern
+            if self._park_action_start_time == 0.0:
+                self._park_action = 'MOVE'
+                self._park_action_start_time = now
+
+            action_elapsed = now - self._park_action_start_time
+
+            if self._park_action == 'SETTLE':
+                if action_elapsed >= self.align_settle_duration:
+                    self._park_action = 'MOVE'
+                    self._park_action_start_time = now
+                detail = f'[CENTER] SETTLE {action_elapsed:.2f}s, off={offset_x*100:.1f}cm'
+                return cmd, error_x, error_y, error_yaw, detail
+
+            if action_elapsed >= self.align_move_duration:
+                self._park_action = 'SETTLE'
+                self._park_action_start_time = now
+                detail = f'[CENTER] → SETTLE, off={offset_x*100:.1f}cm'
+                return cmd, error_x, error_y, error_yaw, detail
+
+            # Control: offset_x -> vx (미터 단위 직접 제어)
+            # offset_x > 0 → 마커가 앞에 → 후진 (-vx)
+            vx = -self.park_align_kp * offset_x
+            vx = self._clamp(vx, -self.park_max_vx, self.park_max_vx)
+
+            if abs(vx) < self.park_min_speed and abs(offset_x) > self.park_center_threshold * 0.5:
+                vx = -self.park_min_speed if offset_x > 0 else self.park_min_speed
+
+            cmd.linear.x = vx
+            detail = f'[CENTER] MOVE: off={offset_x*100:.1f}cm, vx={vx:.3f}'
             return cmd, error_x, error_y, error_yaw, detail
 
-        # Control: angle -> vx (side camera 좌표계 변환)
-        # 부호 반전: angle > 0 → 후진, angle < 0 → 전진
-        vx = -self.park_align_kp * angle
-        vx = self._clamp(vx, -self.park_max_vx, self.park_max_vx)
-
-        # Minimum speed
-        if abs(vx) < self.park_min_speed and abs(angle) > self.park_marker_threshold * 0.5:
-            vx = -self.park_min_speed if angle > 0 else self.park_min_speed
-
-        cmd.linear.x = vx
-
-        detail = f'Align marker (side): a={math.degrees(angle):.1f}deg, vx={vx:.3f}'
-
+        detail = f'No side marker, waiting...'
         return cmd, error_x, error_y, error_yaw, detail
 
     def _park_align_rect_control(self):
@@ -1168,6 +1358,23 @@ class MotionControllerNode(Node):
         if self._park_final_done_sent:
             return cmd, error_x, error_y, error_yaw, 'Final done, waiting'
 
+        now = self.get_clock().now().nanoseconds / 1e9
+
+        # Phase: FORWARD (거리 조정 완료 후 고정 전진) 차량 중심이랑 카메라 중심이랑 오차 맞춰주기.
+        if getattr(self, '_park_final_phase', 'DISTANCE') == 'FORWARD':
+            fwd_time = self.park_align_forward / self.park_min_speed
+            elapsed = now - self._park_forward_start_time
+
+            if elapsed >= fwd_time:
+                self._publish_park_final_done()
+                self._park_final_done_sent = True
+                detail = f'[FORWARD] done! {self.park_align_forward*100:.1f}cm in {elapsed:.1f}s'
+                return cmd, error_x, error_y, error_yaw, detail
+
+            cmd.linear.x = self.park_min_speed
+            detail = f'[FORWARD] {elapsed:.2f}/{fwd_time:.1f}s'
+            return cmd, error_x, error_y, error_yaw, detail
+
         if self._side_marker is None:
             detail = 'No side marker, waiting...'
             return cmd, error_x, error_y, error_yaw, detail
@@ -1177,11 +1384,50 @@ class MotionControllerNode(Node):
         error = distance - self.park_target_distance
         error_x = distance
 
-        # Check if done
+        # Check if done (with stability check)
         if abs(error) < self.park_distance_threshold:
-            self._publish_park_final_done()
-            self._park_final_done_sent = True
-            detail = f'Final complete, dist={distance*100:.1f}cm'
+            if not hasattr(self, '_park_final_stable_start'):
+                self._park_final_stable_start = now
+            elif now - self._park_final_stable_start > 0.5:  # 0.5초 안정 유지
+                if hasattr(self, '_park_final_stable_start'):
+                    delattr(self, '_park_final_stable_start')
+                # 거리 조정 완료 → FORWARD 전진
+                if self.park_align_forward > 0.001:
+                    self._park_final_phase = 'FORWARD'
+                    self._park_forward_start_time = now
+                    fwd_time = self.park_align_forward / self.park_min_speed
+                    self.get_logger().info(
+                        f'PARK_FINAL distance done, forward {self.park_align_forward*100:.1f}cm (~{fwd_time:.1f}s)'
+                    )
+                else:
+                    self._publish_park_final_done()
+                    self._park_final_done_sent = True
+                detail = f'Final complete, dist={distance*100:.1f}cm'
+                return cmd, error_x, error_y, error_yaw, detail
+            detail = f'Final stable check: d={distance*100:.1f}cm, {now - self._park_final_stable_start:.1f}/0.5s'
+            return cmd, error_x, error_y, error_yaw, detail
+        else:
+            if hasattr(self, '_park_final_stable_start'):
+                delattr(self, '_park_final_stable_start')
+
+        # Move-pause-observe pattern
+        if self._park_action_start_time == 0.0:
+            self._park_action = 'MOVE'
+            self._park_action_start_time = now
+
+        action_elapsed = now - self._park_action_start_time
+
+        if self._park_action == 'SETTLE':
+            if action_elapsed >= self.align_settle_duration:
+                self._park_action = 'MOVE'
+                self._park_action_start_time = now
+            detail = f'Final SETTLE {action_elapsed:.2f}s, d={distance*100:.1f}cm'
+            return cmd, error_x, error_y, error_yaw, detail
+
+        if action_elapsed >= self.align_move_duration:
+            self._park_action = 'SETTLE'
+            self._park_action_start_time = now
+            detail = f'Final → SETTLE, d={distance*100:.1f}cm'
             return cmd, error_x, error_y, error_yaw, detail
 
         # Control: distance error -> vy (좌측 카메라, 마커가 왼쪽에 있음)
@@ -1196,7 +1442,7 @@ class MotionControllerNode(Node):
 
         cmd.linear.y = vy
 
-        detail = f'Final: d={distance*100:.1f}cm, target={self.park_target_distance*100:.1f}cm, vy={vy:.3f}'
+        detail = f'Final MOVE: d={distance*100:.1f}cm, target={self.park_target_distance*100:.1f}cm, vy={vy:.3f}'
 
         return cmd, error_x, error_y, error_yaw, detail
 

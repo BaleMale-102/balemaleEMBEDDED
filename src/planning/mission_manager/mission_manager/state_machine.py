@@ -336,7 +336,11 @@ class StateMachine:
             if not task_type:
                 self._context.task_type = 'PARK'
 
-        self._change_state(MissionState.DRIVE)
+        # waypoint 없는 PARK → 바로 PARK_DETECT (side camera 사용)
+        if not waypoint_ids and self._context.task_type in ('PARK', 'DROPOFF'):
+            self._change_state(MissionState.PARK_DETECT)
+        else:
+            self._change_state(MissionState.DRIVE)
 
     def start_full_mission(self, plate_number: str, assigned_slot_id: int,
                            waypoint_ids: List[int], task_id: str = ''):
@@ -658,8 +662,8 @@ class StateMachine:
             next_idx = self._context.current_waypoint_idx + 1
             has_more_waypoints = next_idx < len(self._context.waypoint_ids)
 
-            if not has_more_waypoints:
-                # 마지막 waypoint 도착 - TURNING 없이 바로 다음 단계
+            if not has_more_waypoints and self._context.is_last_waypoint:
+                # final_goal_id에 도착 완료 - 미션 종료
                 if self._context.final_goal_id == HOME_MARKER_ID:
                     return MissionState.WAIT_VEHICLE
                 elif self._context.task_type in ('PARK', 'DROPOFF'):
@@ -667,7 +671,7 @@ class StateMachine:
                 else:
                     return MissionState.FINISH
             else:
-                # 아직 waypoint 남음 - 다음 waypoint 향해 TURNING
+                # 아직 갈 곳 남음 (다음 waypoint 또는 final_goal) - TURNING
                 return MissionState.TURNING
         return None
 
