@@ -19,6 +19,9 @@ int32 y1                    # 좌상단 y
 int32 x2                    # 우하단 x
 int32 y2                    # 우하단 y
 
+# 거리 정보
+float32 distance            # 카메라로부터의 추정 거리 (cm), 0이면 미계산
+
 # 추가 정보 (OCR 결과 등)
 string text                 # OCR 결과 (번호판인 경우)
 bool has_sticker            # 스티커 유무 (번호판인 경우)

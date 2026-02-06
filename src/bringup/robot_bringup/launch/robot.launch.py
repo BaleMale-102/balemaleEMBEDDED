@@ -167,31 +167,31 @@ def generate_launch_description():
 
         # ANPR + 장애물 검출 (소켓 클라이언트 - AI 서버 먼저 실행 필요)
         # AI 서버: ./scripts/start_ai_servers.sh
-        # Node(
-        #     package='anpr_detector',
-        #     executable='anomaly_node',
-        #     name='anomaly_detector',
-        #     parameters=[{
-        #         'image_topic': '/cam_front/image_raw',
-        #         'server_host': 'localhost',
-        #         'server_port': 9001,
-        #         'publish_debug_image': True,
-        #         'show_debug_window': False,
-        #     }],
-        # ),
+        Node(
+            package='anpr_detector',
+            executable='anomaly_node',
+            name='anomaly_detector',
+            parameters=[{
+                'image_topic': '/cam_front/image_raw',
+                'server_host': 'localhost',
+                'server_port': 9001,
+                'publish_debug_image': True,
+                'show_debug_window': False,
+            }],
+        ),
 
-        # Node(
-        #     package='anpr_detector',
-        #     executable='ocr_node',
-        #     name='ocr_detector',
-        #     parameters=[{
-        #         'image_topic': '/cam_side/image_raw',
-        #         'server_host': 'localhost',
-        #         'server_port': 9002,
-        #         'publish_debug_image': True,
-        #         'show_debug_window': False,
-        #     }],
-        # ),
+        Node(
+            package='anpr_detector',
+            executable='ocr_node',
+            name='ocr_detector',
+            parameters=[{
+                'image_topic': '/cam_side/image_raw',
+                'server_host': 'localhost',
+                'server_port': 9002,
+                'publish_debug_image': True,
+                'show_debug_window': False,
+            }],
+        ),
     ])
 
     # ==========================================

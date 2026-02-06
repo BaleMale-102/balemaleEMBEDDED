@@ -169,6 +169,7 @@ class AnomalyDetectorNode(Node):
                 detection_msg.y1 = int(det['box'][1])
                 detection_msg.x2 = int(det['box'][2])
                 detection_msg.y2 = int(det['box'][3])
+                detection_msg.distance = float(det.get('distance', 0.0))
                 det_array_msg.detections.append(detection_msg)
 
             self.pub_detections.publish(det_array_msg)
@@ -176,7 +177,7 @@ class AnomalyDetectorNode(Node):
             # 로깅 (첫 검출에만)
             if detections and not self.first_detection_logged:
                 summary = ', '.join([
-                    f"{self.CLASS_NAMES.get(d['class'], '?')}({d['confidence']:.2f})"
+                    f"{self.CLASS_NAMES.get(d['class'], '?')}({d.get('distance', 0):.1f}cm)"
                     for d in detections
                 ])
                 self.get_logger().info(f'Anomaly: {summary}')
@@ -214,12 +215,13 @@ class AnomalyDetectorNode(Node):
             x1, y1, x2, y2 = map(int, det['box'])
             cls = det['class']
             conf = det['confidence']
+            dist = det.get('distance', 0.0)
             color = colors.get(cls, (255, 255, 255))
             label = self.CLASS_NAMES.get(cls, f'Class{cls}')
 
             cv2.rectangle(result, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
-                result, f'{label} {conf:.2f}',
+                result, f'{label} {dist:.1f}cm',
                 (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
                 0.5, color, 2
             )
