@@ -7,7 +7,8 @@
 - **단위**: 거리 m, 각도 rad, 속도 m/s
 - **시스템 유형**: 주차 로봇 (TARGET 차량을 적재/하역하는 로봇)
 - **현재 상태**: 라인 인식 비활성화, 마커 전용 주행
-- **풀 미션 플로우**: WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → PARK → UNLOAD → RETURN_HOME → WAIT_VEHICLE
+- **입고 플로우(PARK)**: WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → PARK → UNLOAD → RETURN_HOME → WAIT_VEHICLE
+- **출차 플로우(EXIT)**: DRIVE → PARK_* → LOAD → RETURN_HOME → UNLOAD → WAIT_VEHICLE
 - **주차 시스템**: PARK_DETECT → PARK_ALIGN_MARKER → PARK_FINAL (side_cam 마커 전용, slot_line 비활성화)
 - **완료된 과제**: IMU 기반 Turn, ALIGN 모드, ANPR+장애물 검출 통합, Side Camera 주차 시스템, Loader 드라이버, Server Bridge (MQTT)
 - **Loader 통신**: serial_bridge 모드 (ROS 토픽 → 별도 Python 스크립트 → Arduino)
@@ -782,7 +783,7 @@ python3 serial_bridge.py
 
 ## 미션 FSM 상태
 
-### 풀 미션 플로우 (자동 주차 로봇)
+### 입고 플로우 (PARK - 서버 type 1)
 ```
        ┌──────────────────────────────────────────────────────────────────┐
        │                                                                  │
@@ -791,7 +792,18 @@ IDLE → WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → ... → PARK → UNLO
            ↑              │                              │
            │              │                              ↓
            └──────────────┴─────────(ERROR)──────────> ERROR
+```
 
+### 출차 플로우 (EXIT - 서버 type 3)
+```
+서버 출차명령 (슬롯ID + 경로)
+    ↓
+DRIVE → ... → PARK_* → LOAD → RETURN_HOME → UNLOAD → WAIT_VEHICLE
+ (슬롯으로)     (정렬)   (적재)  (홈 복귀)      (하역)
+```
+
+### 공통 서브사이클
+```
 주행 사이클 (DRIVE 내부):
 DRIVE → STOP_AT_MARKER → ADVANCE_TO_CENTER → STOP_BUMP → TURNING → ALIGN_TO_MARKER → DRIVE
 
@@ -802,14 +814,16 @@ PARK_DETECT → PARK_ALIGN_MARKER → PARK_ALIGN_RECT → PARK_FINAL
 ```
 
 ### 풀 미션 상태 (Full Mission States)
-| 상태 | 설명 | 타임아웃 | 다음 상태 |
-|------|------|----------|-----------|
-| IDLE | 대기 중 | - | → WAIT_VEHICLE (auto_start) |
-| WAIT_VEHICLE | 홈에서 차량 대기 (ANPR 감시) | - | → RECOGNIZE (번호판 검출) |
-| RECOGNIZE | 서버에 번호판 조회 | 60s | → LOAD (verified) / ERROR |
-| LOAD | 차량 적재 중 | 30s | → DRIVE (DONE) |
-| UNLOAD | 차량 하역 중 | 30s | → RETURN_HOME (DONE) |
-| RETURN_HOME | 홈으로 복귀 주행 | 120s | → WAIT_VEHICLE |
+| 상태 | 입고(PARK) | 출차(EXIT) |
+|------|-----------|-----------|
+| IDLE | 대기 중 | 대기 중 |
+| WAIT_VEHICLE | 홈에서 차량 대기 (ANPR) | 출차 하역 후 대기 |
+| RECOGNIZE | 서버에 번호판 조회 (60s) | - |
+| LOAD | 홈에서 적재 → DRIVE | 슬롯에서 적재 → RETURN_HOME |
+| DRIVE | 홈→슬롯 주행 | 홈→슬롯 / 슬롯→홈 주행 |
+| PARK_* | 슬롯 정렬 → UNLOAD | 슬롯 정렬 → LOAD |
+| UNLOAD | 슬롯에서 하역 → RETURN_HOME | 홈에서 하역 → WAIT_VEHICLE |
+| RETURN_HOME | 슬롯→홈 빈차 복귀 | 슬롯→홈 차량 탑재 복귀 |
 
 ### 주행 상태 (Driving States)
 | 상태 | 설명 | 타임아웃 | 다음 상태 |
@@ -1138,11 +1152,15 @@ ros2 topic pub --once /loading_status std_msgs/String "data: 'completed'"
 ros2 topic echo /plate/query
 ros2 topic echo /plate/response
 
-# 풀 미션 수동 시뮬레이션 (센서/서버 없이)
+# 풀 미션 수동 시뮬레이션 - 입고 (센서/서버 없이)
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'WAIT'"
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'PLATE 12가3456'"
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'VERIFY 17 0,1,5'"
 # → LOAD 상태로 전환, /loader/command 발행됨
+
+# 출차 테스트 (슬롯에서 차량 회수)
+ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'EXIT 1,5 17'"
+# → DRIVE→PARK→LOAD→RETURN_HOME→UNLOAD 플로우
 
 # 로더 완료 시뮬레이션 (serial_bridge 없을 때)
 ros2 topic pub --once /loading_status std_msgs/String "data: 'completed'"

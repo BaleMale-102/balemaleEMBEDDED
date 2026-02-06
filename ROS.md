@@ -68,6 +68,9 @@ ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'START 1,2'"
 # 주차 테스트 (슬롯 17)
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'START_PARK 17'"
 
+# 출차 테스트 (슬롯 17에서 차량 회수)
+ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'EXIT 1,5 17'"
+
 # 주차 디버그
 ros2 topic echo /parking/status
 ros2 topic echo /perception/side_markers

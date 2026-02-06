@@ -495,6 +495,18 @@ class MissionManagerNode(Node):
                     waypoints = [int(x) for x in parts[2].split(',')]
                 self.fsm.notify_plate_response(True, slot_id, waypoints)
                 self.get_logger().info(f'Simulated verify: slot={slot_id}, waypoints={waypoints}')
+        elif cmd.startswith('EXIT'):
+            # 출차: EXIT 1,5 17 (waypoints then slot) or EXIT 17 (direct)
+            parts = cmd.split()
+            if len(parts) >= 3:
+                waypoints = [int(x) for x in parts[1].split(',')]
+                slot_id = int(parts[2])
+                self.fsm.start_mission(waypoints, slot_id, 'test_exit', 'EXIT')
+                self.get_logger().info(f'Exit mission started: {waypoints} -> slot {slot_id}')
+            elif len(parts) == 2:
+                slot_id = int(parts[1])
+                self.fsm.start_mission([], slot_id, 'test_exit', 'EXIT')
+                self.get_logger().info(f'Exit mission started: direct to slot {slot_id}')
         elif cmd == 'HOME' or cmd == 'RETURN_HOME':
             # Start return to home (marker 0)
             self.fsm.start_return_home()
@@ -588,13 +600,22 @@ class MissionManagerNode(Node):
                 f'Recognizing plate: {self.fsm.context.recognition.plate_number}'
             )
         elif new_state == MissionState.LOAD:
-            self.get_logger().info('Starting load operation')
+            if self.fsm.context.task_type == 'EXIT':
+                self.get_logger().info('Starting load operation (출차: picking up at slot)')
+            else:
+                self.get_logger().info('Starting load operation')
             self._send_loader_command('LOAD')
         elif new_state == MissionState.UNLOAD:
-            self.get_logger().info('Starting unload operation')
+            if self.fsm.context.task_type == 'EXIT':
+                self.get_logger().info('Starting unload operation (출차: delivering at home)')
+            else:
+                self.get_logger().info('Starting unload operation')
             self._send_loader_command('UNLOAD')
         elif new_state == MissionState.RETURN_HOME:
-            self.get_logger().info('Returning to home position')
+            if self.fsm.context.task_type == 'EXIT':
+                self.get_logger().info('Returning to home with vehicle (출차)')
+            else:
+                self.get_logger().info('Returning to home position')
         elif new_state == MissionState.PARK_DETECT:
             self.get_logger().info(
                 f'Starting parking detection for slot {self.fsm.context.parking.target_slot_id}'

@@ -190,10 +190,10 @@
     park_rect_threshold: 0.015    # 직사각형 정렬 완료 임계값 (m, 1.5cm)
     park_distance_threshold: 0.02 # 최종 거리 완료 임계값 (m, 2cm)
     park_target_distance: 0.20    # 목표 주차 거리 (m, 마커로부터 20cm)
-    park_align_forward: 0.005    # 정렬 완료 후 전진 거리 (m, 8mm)
+    park_align_forward: 0.000    # 정렬 완료 후 전진 거리 (m, 5mm)
     # Stall detection and power boost
     # 7.4V 배터리: 저전압에서 스톨 가능성 증가 → 부스트 강화
-    stall_check_interval: 0.4     # 스톨 체크 주기 (초) - 더 빠른 감지
+    stall_check_interval: 0.4     #스톨 체크 주기 (초) - 더 빠른 감지
     stall_boost_increment: 0.006  # 적재장치 보상 강화 (was 0.0045)
     stall_max_boost: 0.035        # 적재장치 보상 강화 (was 0.027)
     stall_threshold_wz: 0.005     # 회전 스톨 임계값 (rad)

@@ -11,9 +11,10 @@
 - **Loader**: serial_bridge 모드 (`~/testArduino/serial_bridge.py` 별도 실행)
 - **ANPR**: conda anpr_310 환경에서 별도 실행
 
-## 풀 미션 플로우
+## 미션 플로우
 ```
-WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → PARK → UNLOAD → RETURN_HOME
+입고(PARK): WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → PARK → UNLOAD → RETURN_HOME
+출차(EXIT): DRIVE → PARK_* → LOAD → RETURN_HOME → UNLOAD → WAIT_VEHICLE
 ```
 
 ---
@@ -61,10 +62,13 @@ ros2 topic echo /mission/state
 ros2 topic echo /loader/status
 ros2 topic echo /perception/tracked_marker
 
-# 테스트 미션
+# 테스트 미션 (입고)
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'WAIT'"
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'PLATE 12가3456'"
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'VERIFY 17 0,1,5'"
+
+# 테스트 미션 (출차)
+ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'EXIT 1,5 17'"
 
 # 로더 테스트
 ros2 topic pub --once /loader/command robot_interfaces/LoaderCommand "{command: 'LOAD'}"

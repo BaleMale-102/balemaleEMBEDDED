@@ -3,7 +3,8 @@
 state_machine.py - Mission State Machine
 
 Full mission FSM for autonomous parking robot:
-  WAIT_VEHICLE -> RECOGNIZE -> LOAD -> DRIVE -> PARK_* -> UNLOAD -> RETURN_HOME -> WAIT_VEHICLE
+  입고(PARK): WAIT_VEHICLE -> RECOGNIZE -> LOAD -> DRIVE -> PARK_* -> UNLOAD -> RETURN_HOME -> WAIT_VEHICLE
+  출차(EXIT): DRIVE -> PARK_* -> LOAD -> RETURN_HOME -> UNLOAD -> WAIT_VEHICLE
 
 Parking sub-states:
   PARK_DETECT -> PARK_ALIGN_MARKER -> PARK_ALIGN_RECT -> PARK_FINAL
@@ -336,8 +337,12 @@ class StateMachine:
             if not task_type:
                 self._context.task_type = 'PARK'
 
-        # waypoint 없는 PARK → 바로 PARK_DETECT (side camera 사용)
-        if not waypoint_ids and self._context.task_type in ('PARK', 'DROPOFF'):
+        # EXIT(출차)는 풀 미션 (슬롯→적재→복귀→하역)
+        if task_type == 'EXIT':
+            self._context.is_full_mission = True
+
+        # waypoint 없는 PARK/EXIT → 바로 PARK_DETECT (side camera 사용)
+        if not waypoint_ids and self._context.task_type in ('PARK', 'DROPOFF', 'EXIT'):
             self._change_state(MissionState.PARK_DETECT)
         else:
             self._change_state(MissionState.DRIVE)
@@ -560,9 +565,10 @@ class StateMachine:
 
         if self._state == MissionState.PARK_FINAL:
             self._context.parking.final_done = True
-            # In full mission, go to UNLOAD; otherwise FINISH
-            if self._context.is_full_mission:
-                self._change_state(MissionState.UNLOAD)
+            if self._context.task_type == 'EXIT':
+                self._change_state(MissionState.LOAD)   # 출차: 슬롯에서 적재
+            elif self._context.is_full_mission:
+                self._change_state(MissionState.UNLOAD)  # 입고: 슬롯에서 하역
             else:
                 self._change_state(MissionState.FINISH)
             return
@@ -606,7 +612,9 @@ class StateMachine:
             return MissionState.ERROR
 
         if self._context.loader.load_complete:
-            return MissionState.DRIVE
+            if self._context.task_type == 'EXIT':
+                return MissionState.RETURN_HOME  # 출차: 슬롯에서 적재 후 홈으로
+            return MissionState.DRIVE  # 입고: 홈에서 적재 후 슬롯으로
 
         return None
 
@@ -617,8 +625,10 @@ class StateMachine:
             return MissionState.ERROR
 
         if self._context.loader.unload_complete:
+            if self._context.task_type == 'EXIT':
+                return MissionState.WAIT_VEHICLE  # 출차: 홈에서 하역 완료 → 대기
             if self._context.is_full_mission:
-                return MissionState.RETURN_HOME
+                return MissionState.RETURN_HOME  # 입고: 슬롯에서 하역 후 복귀
             else:
                 return MissionState.FINISH
 
@@ -627,7 +637,8 @@ class StateMachine:
     def _return_home_transition(self) -> Optional[MissionState]:
         """Wait to reach home marker."""
         if self._context.marker_reached and self._context.current_marker_id == HOME_MARKER_ID:
-            # Back to waiting for next vehicle
+            if self._context.task_type == 'EXIT':
+                return MissionState.UNLOAD  # 출차: 홈 도착 → 차량 하역
             return MissionState.WAIT_VEHICLE
         return None
 
@@ -665,12 +676,14 @@ class StateMachine:
             if not has_more_waypoints and self._context.is_last_waypoint:
                 # final_goal_id에 도착 완료 - 미션 종료
                 if self._context.final_goal_id == HOME_MARKER_ID:
+                    if self._context.task_type == 'EXIT':
+                        return MissionState.UNLOAD  # 출차 복귀: 홈 도착 → 하역
                     return MissionState.WAIT_VEHICLE
-                elif self._context.task_type in ('PARK', 'DROPOFF'):
+                elif self._context.task_type in ('PARK', 'DROPOFF', 'EXIT'):
                     return MissionState.PARK_DETECT
                 else:
                     return MissionState.FINISH
-            elif not has_more_waypoints and self._context.task_type in ('PARK', 'DROPOFF'):
+            elif not has_more_waypoints and self._context.task_type in ('PARK', 'DROPOFF', 'EXIT'):
                 # 마지막 waypoint 도착, 다음이 주차 슬롯 → 턴 없이 바로 PARK_DETECT
                 # (주차 마커는 사이드 카메라로 탐지, 전방 카메라 턴 불필요)
                 self._context.advance_waypoint()
@@ -684,7 +697,7 @@ class StateMachine:
         if self._context.turn_complete:
             self._context.advance_waypoint()
             # If next target is a parking slot, go directly to PARK_DETECT
-            if self._context.is_last_waypoint and self._context.task_type in ('PARK', 'DROPOFF'):
+            if self._context.is_last_waypoint and self._context.task_type in ('PARK', 'DROPOFF', 'EXIT'):
                 return MissionState.PARK_DETECT
             return MissionState.ALIGN_TO_MARKER
         return None
@@ -746,9 +759,10 @@ class StateMachine:
     def _park_final_transition(self) -> Optional[MissionState]:
         """Final distance adjustment to slot center."""
         if self._context.parking.final_done:
-            # In full mission, proceed to UNLOAD
+            if self._context.task_type == 'EXIT':
+                return MissionState.LOAD   # 출차: 슬롯에서 차량 적재
             if self._context.is_full_mission:
-                return MissionState.UNLOAD
+                return MissionState.UNLOAD  # 입고: 슬롯에서 차량 하역
             return MissionState.FINISH
         return None
 

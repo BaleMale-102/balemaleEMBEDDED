@@ -13,20 +13,25 @@ show_help() {
     echo "  wait                    WAIT_VEHICLE 상태로 진입 (번호판 대기)"
     echo "  plate <번호판>          번호판 인식 시뮬레이션"
     echo "  verify <슬롯> [경로]    서버 응답 시뮬레이션"
-    echo "  full <번호판> <슬롯> [경로]  전체 플로우 시뮬레이션"
+    echo "  full <번호판> <슬롯> [경로]  입고 전체 플로우 시뮬레이션"
+    echo "  exit <경로> <슬롯>      출차 테스트 (슬롯에서 차량 회수)"
     echo "  status                  현재 상태 확인"
     echo ""
     echo "Examples:"
     echo "  $0 wait                 # 대기 상태 진입"
     echo "  $0 plate 12가3456       # 번호판 인식"
     echo "  $0 verify 17 0,1,5      # 서버 응답 (슬롯17, 경로 0→1→5)"
-    echo "  $0 full 12가3456 17 0,1,5  # 전체 테스트"
+    echo "  $0 full 12가3456 17 0,1,5  # 입고 전체 테스트"
+    echo "  $0 exit 1,5 17          # 출차 테스트 (1→5→슬롯17)"
+    echo "  $0 exit 17              # 출차 테스트 (직접 슬롯17)"
     echo "  $0 status               # 상태 확인"
     echo ""
-    echo "=== 실제 서버 연동 시 ==="
+    echo "=== 입고: 실제 서버 연동 시 ==="
     echo "1. wait 로 대기 상태 진입"
     echo "2. ANPR이 번호판 인식하면 자동으로 서버에 요청"
     echo "3. 서버 응답 받으면 자동으로 주행 시작"
+    echo ""
+    echo "=== 출차: 서버 type 3 명령 수신 시 자동 시작 ==="
 }
 
 case "$1" in
@@ -92,6 +97,21 @@ case "$1" in
 
         echo ""
         echo "Mission started! Monitor with: ./monitor.sh 1"
+        ;;
+    exit)
+        if [ -z "$2" ]; then
+            echo "Usage: $0 exit <경로> <슬롯>  OR  $0 exit <슬롯>"
+            echo "Example: $0 exit 1,5 17"
+            echo "Example: $0 exit 17"
+            exit 1
+        fi
+        if [ -n "$3" ]; then
+            echo "Exit mission: waypoints=$2 -> slot $3"
+            ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'EXIT $2 $3'"
+        else
+            echo "Exit mission: direct to slot $2"
+            ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'EXIT $2'"
+        fi
         ;;
     status)
         echo "=== Current State ==="

@@ -46,9 +46,13 @@ string detail
 string command            # START, STOP, REROUTE
 int32[] waypoint_ids
 int32 final_goal_id
-string task_type          # PARK, EXIT
+string task_type          # PARK (입고), EXIT (출차), REROUTE
 string task_id
 ```
+
+### task_type별 플로우
+- **PARK**: DRIVE → PARK_* → UNLOAD → RETURN_HOME (홈에서 적재 후 슬롯에 하역)
+- **EXIT**: DRIVE → PARK_* → LOAD → RETURN_HOME → UNLOAD (슬롯에서 적재 후 홈에 하역)
 
 ## MissionStatus.msg
 ```

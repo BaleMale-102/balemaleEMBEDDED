@@ -82,11 +82,19 @@ balemale/robot/{robotId}/heartbeat    # Publish: 하트비트
 {"reqId": "...", "plate": "12가3456", "nowNodeId": 0, "ts": "..."}
 ```
 
-### 서버 명령 (type 1: 배차)
+### 서버 명령 (type 1: 입고 배차, type 3: 출차)
 ```json
+// type 1: 입고 (PARK) - 홈에서 슬롯으로
 {
   "type": "1",
   "reqId": "...",
+  "cmdId": "...",
+  "payload": {"vehicleId": 1, "targetNodeId": 17, "path": [0,1,5,17]}
+}
+
+// type 3: 출차 (EXIT) - 슬롯에서 차량 회수
+{
+  "type": "3",
   "cmdId": "...",
   "payload": {"vehicleId": 1, "targetNodeId": 17, "path": [0,1,5,17]}
 }

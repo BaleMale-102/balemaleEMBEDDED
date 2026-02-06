@@ -46,11 +46,19 @@ balemaleEMBEDDED/
 
 ## 미션 FSM
 
-### 풀 미션 플로우
+### 입고 플로우 (PARK)
 ```
 IDLE → WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → PARK → UNLOAD → RETURN_HOME
                                     ↑                              ↓
                                     └──────────────────────────────┘
+```
+
+### 출차 플로우 (EXIT)
+```
+서버 출차명령 (슬롯ID + 경로)
+    ↓
+DRIVE → PARK_* → LOAD → RETURN_HOME → UNLOAD → WAIT_VEHICLE
+ (슬롯으로)  (정렬)  (적재)   (홈 복귀)    (하역)
 ```
 
 ### 주행 사이클
@@ -66,14 +74,16 @@ PARK_DETECT → PARK_ALIGN_MARKER → PARK_FINAL
 ```
 
 ### 상태 설명
-| 상태 | 설명 |
-|------|------|
-| WAIT_VEHICLE | 홈에서 차량 대기 (ANPR 감시) |
-| RECOGNIZE | 서버에 번호판 조회 |
-| LOAD/UNLOAD | 차량 적재/하역 |
-| DRIVE | 마커 추종 주행 |
-| TURNING | 제자리 회전 |
-| PARK_* | 주차 서브상태 |
+| 상태 | 입고(PARK) | 출차(EXIT) |
+|------|-----------|-----------|
+| WAIT_VEHICLE | 홈에서 차량 대기 (ANPR) | 출차 하역 후 대기 |
+| RECOGNIZE | 서버에 번호판 조회 | - |
+| DRIVE | 홈→슬롯 주행 | 홈→슬롯 주행 / 슬롯→홈 복귀 |
+| PARK_* | 슬롯 정렬 (하역 전) | 슬롯 정렬 (적재 전) |
+| LOAD | 홈에서 차량 적재 | 슬롯에서 차량 적재 |
+| UNLOAD | 슬롯에서 차량 하역 | 홈에서 차량 하역 |
+| RETURN_HOME | 슬롯→홈 복귀 | 슬롯→홈 복귀 (차량 탑재) |
+| TURNING | 제자리 회전 | 제자리 회전 |
 
 ---
 
