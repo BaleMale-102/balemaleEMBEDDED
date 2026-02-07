@@ -240,6 +240,7 @@
     approach_distance: 0.30           # 차량 접근/후퇴 거리 (m)
     approach_speed: 0.01              # 접근/후퇴 속도 (m/s)
     retreat_from_slot_distance: 0.05  # 주차 슬롯→길 복귀 거리 (m, +vy로 이동)
+    retreat_from_slot_speed: 0.02     # 주차 슬롯→길 복귀 속도 (m/s)
     # State transition delays (seconds)
     delay_stop_at_marker: 0.5       # STOP_AT_MARKER 후 다음 상태로 전환 대기
     delay_stop_bump: 0.3            # STOP_BUMP 후 다음 상태로 전환 대기

@@ -51,8 +51,8 @@ string task_id
 ```
 
 ### task_type별 플로우
-- **PARK**: DRIVE → PARK_* → UNLOAD → RETURN_HOME (홈에서 적재 후 슬롯에 하역)
-- **EXIT**: DRIVE → PARK_* → LOAD → RETURN_HOME → UNLOAD (슬롯에서 적재 후 홈에 하역)
+- **PARK**: LOAD → DRIVE → PARK_* → UNLOAD → RETURN_HOME → RETREAT_FROM_SLOT → DRIVE(역순) → WAIT
+- **EXIT**: DRIVE → PARK_* → LOAD → RETURN_HOME → RETREAT_FROM_SLOT → DRIVE(역순) → UNLOAD → WAIT
 
 ## MissionStatus.msg
 ```
@@ -72,6 +72,7 @@ uint8 class_id
 string class_name
 float32 confidence
 int32 x1, y1, x2, y2
+float32 distance          # 카메라로부터의 추정 거리 (cm), 0이면 미계산
 string text               # OCR 결과
 bool has_sticker
 ```

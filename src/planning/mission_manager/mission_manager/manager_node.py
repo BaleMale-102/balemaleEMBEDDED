@@ -104,6 +104,7 @@ class MissionManagerNode(Node):
         self.approach_distance = self.get_parameter('approach_distance').value
         self.approach_speed = self.get_parameter('approach_speed').value
         self.retreat_from_slot_distance = self.get_parameter('retreat_from_slot_distance').value
+        self.retreat_from_slot_speed = self.get_parameter('retreat_from_slot_speed').value
         self.anomaly_stop_distance = self.get_parameter('anomaly_stop_distance').value
         self.anomaly_clear_timeout = self.get_parameter('anomaly_clear_timeout').value
 
@@ -826,11 +827,15 @@ class MissionManagerNode(Node):
                     f'current_marker={ctx.current_marker_id}'
                 )
         elif new_state == MissionState.RETREAT_FROM_SLOT:
-            retreat_vy = 0.02  # 하드코딩 (controller와 동일)
+            retreat_vy = self.retreat_from_slot_speed
+            if retreat_vy <= 0.0:
+                retreat_vy = 0.02
+                self.get_logger().warn('retreat_from_slot_speed is 0, using default 0.02')
+
             duration = self.retreat_from_slot_distance / retreat_vy
             self.fsm.context.approach_duration = duration
             self.get_logger().info(
-                f'Retreat from slot: +vy=0.02, {self.retreat_from_slot_distance:.2f}m, {duration:.1f}s'
+                f'Retreat from slot: +vy={retreat_vy}, {self.retreat_from_slot_distance:.2f}m, {duration:.1f}s'
             )
         elif new_state == MissionState.PARK_DETECT:
             self.get_logger().info(

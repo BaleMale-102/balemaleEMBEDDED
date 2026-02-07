@@ -126,6 +126,7 @@ class MotionControllerNode(Node):
 
         # Parameters - approach/retreat
         self.declare_parameter('approach_speed', 0.01)
+        self.declare_parameter('retreat_from_slot_speed', 0.02)
 
         # Parameters - stall detection and power boost
         self.declare_parameter('stall_check_interval', 0.5)
@@ -184,6 +185,7 @@ class MotionControllerNode(Node):
 
         # Approach/retreat speed
         self.approach_speed = self.get_parameter('approach_speed').value
+        self.retreat_from_slot_speed = self.get_parameter('retreat_from_slot_speed').value
 
         # Drive search creep (긴 구간에서 마커 안 보일 때 전진 탐색)
         self._drive_search_creep_vx = self.get_parameter('drive_search_creep_vx').value
@@ -645,8 +647,8 @@ class MotionControllerNode(Node):
 
         # Retreat from parking slot: 슬롯→도로 복귀 (side cam 왼쪽, +vy=오른쪽)
         elif self._mode == self.MODE_RETREAT_FROM_SLOT:
-            cmd.linear.y = 0.02  # 하드코딩: max_vy로 복귀
-            detail = 'Retreat from slot: +vy=0.020'
+            cmd.linear.y = self.retreat_from_slot_speed
+            detail = f'Retreat from slot: +vy={cmd.linear.y:.3f}'
 
         # Apply velocity limits
         cmd.linear.x = self._clamp(cmd.linear.x, -self.max_vx, self.max_vx)

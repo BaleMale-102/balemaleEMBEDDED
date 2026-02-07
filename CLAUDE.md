@@ -7,19 +7,22 @@
 
 ## 현재 상태
 - **시스템**: 주차 로봇 (차량 적재/하역)
-- **주행**: 마커 전용 (라인 인식 비활성화)
+- **주행**: 마커 전용 (라인 인식 비활성화), vx+vy+wz 동시 제어
 - **Loader**: serial_bridge 모드 (`~/testArduino/serial_bridge.py` 별도 실행)
 - **ANPR**: conda anpr_310 환경에서 별도 실행
+- **이상탐지**: anomaly_detector (전방) + ocr_detector (사이드, anomaly 겸용) launch에 포함
+- **APPROACH/RETREAT_VEHICLE**: 코드 존재하나 **비활성화** (주석처리)
 
 ## 미션 플로우
 ```
-입고(PARK): WAIT_VEHICLE → RECOGNIZE → APPROACH_VEHICLE → LOAD → RETREAT_FROM_VEHICLE → DRIVE → PARK → UNLOAD → RETURN_HOME → DRIVE(역순) → WAIT_VEHICLE
-출차(EXIT): DRIVE → PARK_* → LOAD → RETURN_HOME → DRIVE(역순) → UNLOAD → WAIT_VEHICLE
+입고(PARK): WAIT_VEHICLE → RECOGNIZE → LOAD → DRIVE → PARK_* → UNLOAD → RETURN_HOME → RETREAT_FROM_SLOT → TURNING → DRIVE(역순) → WAIT_VEHICLE
+출차(EXIT): DRIVE → PARK_* → LOAD → RETURN_HOME → RETREAT_FROM_SLOT → TURNING → DRIVE(역순) → UNLOAD → WAIT_VEHICLE
 ```
-- **APPROACH_VEHICLE**: 차량 방향 전진 (하드코딩 거리, 비전 미사용)
-- **RETREAT_FROM_VEHICLE**: 적재 후 원위치 후퇴 (동일 거리)
-- **RETURN_HOME**: waypoints 역순 설정 후 즉시 DRIVE 전환
-- 파라미터: `approach_distance` (m), `approach_speed` (m/s)
+- **RETREAT_FROM_SLOT**: 주차 슬롯에서 도로로 횡이동 (+vy, 하드코딩 0.02m/s)
+- **RETURN_HOME**: waypoints 역순 설정 후 즉시 RETREAT_FROM_SLOT 전환
+- **DRIVE 제어**: 항상 전진(vx) + 횡이동(vy) + 부드러운 조향(wz*0.3) 동시 적용
+- **TURN 제어**: 마커 발견 시 angle < threshold까지 정렬, IMU fallback (마커 미감지 시 90% 목표각)
+- 파라미터: `retreat_from_slot_distance` (m), `approach_speed` (m/s)
 
 ---
 
@@ -32,6 +35,9 @@
 | `/control/cmd_vel` | Twist | 모터 명령 |
 | `/perception/tracked_marker` | TrackedMarker | 추적 마커 |
 | `/perception/side_markers` | MarkerArray | 주차용 마커 |
+| `/perception/anomaly/detections` | DetectionArray | 전방 장애물 (person/box/cone) |
+| `/perception/side_anomaly/detections` | DetectionArray | 사이드 장애물 (person/box/cone) |
+| `/server/anomaly_report` | String (JSON) | 서버에 이상 보고 |
 | `/loader/command` | LoaderCommand | 적재 명령 (LOAD/UNLOAD) |
 | `/loader/status` | LoaderStatus | 적재 상태 |
 | `/motor_cmd` | String | Arduino 명령 (serial_bridge) |
@@ -48,9 +54,13 @@
 cd ~/balemaleEMBEDDED && colcon build && source install/setup.bash
 
 # 실행 (3개 터미널)
-ros2 launch robot_bringup system.launch.py          # 터미널 1: 메인
+ros2 launch robot_bringup system.launch.py          # 터미널 1: 메인 (anomaly/ocr 포함)
 cd ~/testArduino && python3 serial_bridge.py        # 터미널 2: Loader
 conda activate anpr_310 && ros2 run anpr_detector detector_node  # 터미널 3: ANPR
+
+# 풀 미션 스크립트 (입고)
+./scripts/full.sh 0,1,5 17                          # 0→1→5→slot17 → 하역 → 복귀
+./scripts/full.sh 0,1,5 17 12가3456                  # 번호판 지정
 
 # 서버 통신만 테스트
 ros2 launch robot_bringup server_test.launch.py simulation:=true
@@ -65,8 +75,9 @@ ros2 launch robot_bringup server_test.launch.py simulation:=true
 ros2 topic echo /mission/state
 ros2 topic echo /loader/status
 ros2 topic echo /perception/tracked_marker
+ros2 topic echo /perception/anomaly/detections
 
-# 테스트 미션 (입고: WAIT→RECOGNIZE→APPROACH→LOAD→RETREAT→DRIVE→PARK→UNLOAD→RETURN→WAIT)
+# 테스트 미션 (입고: WAIT→RECOGNIZE→LOAD→DRIVE→PARK→UNLOAD→RETURN→WAIT)
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'WAIT'"
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'PLATE 12가3456'"
 ros2 topic pub --once /mission/test_cmd std_msgs/String "data: 'VERIFY 17 0,1,5'"
