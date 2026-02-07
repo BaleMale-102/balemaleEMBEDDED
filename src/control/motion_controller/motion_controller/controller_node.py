@@ -121,6 +121,7 @@ class MotionControllerNode(Node):
         self.declare_parameter('park_max_vy', 0.01)
         self.declare_parameter('park_min_speed', 0.003)
         self.declare_parameter('park_marker_threshold', 0.05)  # ~3deg
+        self.declare_parameter('park_parallel_threshold', 0.05)  # ~3deg for parallel alignment
         self.declare_parameter('park_center_threshold', 0.01)  # 1cm
         self.declare_parameter('park_side_camera_offset_x', 0.0)  # camera offset
         self.declare_parameter('park_distance_threshold', 0.02)  # 2cm
@@ -183,6 +184,7 @@ class MotionControllerNode(Node):
         self.park_max_vy = self.get_parameter('park_max_vy').value
         self.park_min_speed = self.get_parameter('park_min_speed').value
         self.park_marker_threshold = self.get_parameter('park_marker_threshold').value
+        self.park_parallel_threshold = self.get_parameter('park_parallel_threshold').value
         self.park_center_threshold = self.get_parameter('park_center_threshold').value
         self.park_side_camera_offset_x = self.get_parameter('park_side_camera_offset_x').value
         self.park_distance_threshold = self.get_parameter('park_distance_threshold').value
@@ -485,7 +487,7 @@ class MotionControllerNode(Node):
             self._mode = self.MODE_PARK_ALIGN_MARKER
             if prev_mode != self.MODE_PARK_ALIGN_MARKER:
                 self._park_align_marker_done_sent = False
-                self._park_align_phase = 'ANGLE'  # Phase 1: angle, Phase 2: center
+                self._park_align_phase = 'PARALLEL'  # Phase 1: parallel, Phase 2: angle, Phase 3: center
                 self._park_action = 'MOVE'
                 self._park_action_start_time = 0.0
                 # Reset parking stall detection
@@ -494,7 +496,7 @@ class MotionControllerNode(Node):
                 self._park_stall_pulse_mode = False
                 self._park_last_stall_check_time = 0.0
                 self._park_prev_stall_value = 0.0
-                self.get_logger().info('PARK_ALIGN_MARKER: Phase 1 (ANGLE) → Phase 2 (CENTER)')
+                self.get_logger().info('PARK_ALIGN_MARKER: Phase 1 (PARALLEL) → Phase 2 (ANGLE) → Phase 3 (CENTER)')
         elif state == 'PARK_FINAL':
             self._mode = self.MODE_PARK_FINAL
             if prev_mode != self.MODE_PARK_FINAL:
@@ -1348,14 +1350,20 @@ class MotionControllerNode(Node):
 
     def _park_align_marker_control(self):
         """
-        PARK_ALIGN_MARKER: 2단계 정렬 (Side camera 기준).
+        PARK_ALIGN_MARKER: 3단계 정렬 (Side camera 기준).
 
-        Phase 1 (ANGLE): marker.angle 기반 대략적 정렬
+        Phase 1 (PARALLEL): 마커와 평행하게 정렬 (heading error 기반 wz 제어)
+        - 좌측 side_cam으로 마커를 봄
+        - heading_error > 0: 로봇 앞이 마커쪽으로 기울어짐 → CW 회전 (-wz)
+        - heading_error < 0: 로봇 뒤가 마커쪽으로 기울어짐 → CCW 회전 (+wz)
+        - park_parallel_threshold 이하이면 Phase 2로 전환
+
+        Phase 2 (ANGLE): marker.angle 기반 대략적 전후 정렬
         - angle > 0: 마커가 카메라 왼쪽 = 로봇이 앞에 → 후진
         - angle < 0: 마커가 카메라 오른쪽 = 로봇이 뒤에 → 전진
-        - park_marker_threshold 이하이면 Phase 2로 전환
+        - park_marker_threshold 이하이면 Phase 3로 전환
 
-        Phase 2 (CENTER): pose.position.x (tvec[0]) 기반 미세 중앙 정렬
+        Phase 3 (CENTER): pose.position.x (tvec[0]) 기반 미세 중앙 정렬
         - offset_x > 0: 마커가 카메라 오른쪽 = 로봇 앞 → 후진
         - offset_x < 0: 마커가 카메라 왼쪽 = 로봇 뒤 → 전진
         - park_center_threshold 이하이면 완료
@@ -1376,14 +1384,92 @@ class MotionControllerNode(Node):
         now = self.get_clock().now().nanoseconds / 1e9
         angle = marker.angle
         offset_x = marker.pose.position.x - self.park_side_camera_offset_x
+        heading_error = self._get_marker_heading_error(marker)
 
         # ========================================
-        # Phase 1: ANGLE 기반 대략적 정렬
+        # Phase 1: PARALLEL - 마커와 평행 정렬 (wz 제어)
+        # ========================================
+        if self._park_align_phase == 'PARALLEL':
+            error_yaw = heading_error
+
+            # heading이 threshold 이하이면 Phase 2로 전환
+            if abs(heading_error) < self.park_parallel_threshold:
+                self._park_align_phase = 'ANGLE'
+                self._park_action = 'MOVE'
+                self._park_action_start_time = 0.0
+                # Phase 전환: stall 추적값 리셋 (heading → angle)
+                self._park_stall_boost = 0.0
+                self._park_consecutive_stalls = 0
+                self._park_stall_pulse_mode = False
+                self._park_prev_stall_value = angle
+                if hasattr(self, '_park_align_stable_start'):
+                    delattr(self, '_park_align_stable_start')
+                self.get_logger().info(
+                    f'Phase 1 (PARALLEL) done: heading={math.degrees(heading_error):.1f}deg, '
+                    f'switching to Phase 2 (ANGLE), angle={math.degrees(angle):.1f}deg'
+                )
+                # Fall through to ANGLE phase below
+            else:
+                # Move-pause-observe pattern
+                if self._park_action_start_time == 0.0:
+                    self._park_action = 'MOVE'
+                    self._park_action_start_time = now
+
+                action_elapsed = now - self._park_action_start_time
+
+                if self._park_action == 'SETTLE':
+                    if action_elapsed >= self.align_settle_duration:
+                        self._park_action = 'MOVE'
+                        self._park_action_start_time = now
+                    detail = f'[PARALLEL] SETTLE {action_elapsed:.2f}s, h={math.degrees(heading_error):.1f}deg'
+                    return cmd, error_x, error_y, error_yaw, detail
+
+                if action_elapsed >= self.align_move_duration:
+                    self._park_action = 'SETTLE'
+                    self._park_action_start_time = now
+                    detail = f'[PARALLEL] → SETTLE, h={math.degrees(heading_error):.1f}deg'
+                    return cmd, error_x, error_y, error_yaw, detail
+
+                # Stall check (heading 변화 추적)
+                self._check_park_stall(heading_error, 0.003)  # ~0.17deg
+
+                # Control: heading_error -> wz
+                # heading_error > 0 → 로봇 앞이 마커쪽 → CW 회전 필요 → -wz
+                wz = -self.park_heading_kp * heading_error
+                wz = self._clamp(wz, -self.park_max_wz, self.park_max_wz)
+
+                # 최소 속도 보장
+                if abs(wz) < 0.01 and abs(heading_error) > self.park_parallel_threshold * 0.5:
+                    wz = -0.015 if heading_error > 0 else 0.015
+
+                wz = self._apply_park_stall_boost(wz)
+                cmd.angular.z = wz
+                detail = f'[PARALLEL] MOVE: h={math.degrees(heading_error):.1f}deg, wz={wz:.3f}'
+                return cmd, error_x, error_y, error_yaw, detail
+
+        # ========================================
+        # Phase 2: ANGLE 기반 대략적 정렬
         # ========================================
         if self._park_align_phase == 'ANGLE':
             error_yaw = angle
 
-            # angle이 threshold 이하이면 Phase 2로 전환
+            # heading이 크게 벗어나면 Phase 1 (PARALLEL)로 복귀
+            if abs(heading_error) > self.park_parallel_threshold * 3.0:
+                self._park_align_phase = 'PARALLEL'
+                self._park_action = 'MOVE'
+                self._park_action_start_time = 0.0
+                self._park_stall_boost = 0.0
+                self._park_consecutive_stalls = 0
+                self._park_stall_pulse_mode = False
+                self._park_prev_stall_value = heading_error
+                if hasattr(self, '_park_align_stable_start'):
+                    delattr(self, '_park_align_stable_start')
+                self.get_logger().info(
+                    f'Heading drifted ({math.degrees(heading_error):.1f}deg), back to Phase 1 (PARALLEL)'
+                )
+                return cmd, error_x, error_y, error_yaw, f'[ANGLE] → PARALLEL (heading drift)'
+
+            # angle이 threshold 이하이면 Phase 3로 전환
             if abs(angle) < self.park_marker_threshold:
                 self._park_align_phase = 'CENTER'
                 self._park_action = 'MOVE'
@@ -1396,8 +1482,8 @@ class MotionControllerNode(Node):
                 if hasattr(self, '_park_align_stable_start'):
                     delattr(self, '_park_align_stable_start')
                 self.get_logger().info(
-                    f'Phase 1 (ANGLE) done: angle={math.degrees(angle):.1f}deg, '
-                    f'switching to Phase 2 (CENTER), offset={offset_x*100:.1f}cm'
+                    f'Phase 2 (ANGLE) done: angle={math.degrees(angle):.1f}deg, '
+                    f'switching to Phase 3 (CENTER), offset={offset_x*100:.1f}cm'
                 )
                 # Fall through to CENTER phase below
 
@@ -1413,7 +1499,7 @@ class MotionControllerNode(Node):
                     if action_elapsed >= self.align_settle_duration:
                         self._park_action = 'MOVE'
                         self._park_action_start_time = now
-                    detail = f'[ANGLE] SETTLE {action_elapsed:.2f}s, a={math.degrees(angle):.1f}deg'
+                    detail = f'[ANGLE] SETTLE {action_elapsed:.2f}s, a={math.degrees(angle):.1f}deg, h={math.degrees(heading_error):.1f}deg'
                     return cmd, error_x, error_y, error_yaw, detail
 
                 if action_elapsed >= self.align_move_duration:
@@ -1435,17 +1521,38 @@ class MotionControllerNode(Node):
 
                 vx = self._apply_park_stall_boost(vx)
                 cmd.linear.x = vx
-                wz, h_err = self._apply_heading_correction(cmd, marker)
-                detail = f'[ANGLE] MOVE: a={math.degrees(angle):.1f}deg, vx={vx:.3f}, wz={wz:.3f}, h={math.degrees(h_err):.1f}deg'
+
+                # 약한 heading 보정 (ANGLE phase에서도 평행 유지)
+                wz = -self.park_heading_kp * 0.5 * heading_error
+                wz = self._clamp(wz, -self.park_max_wz * 0.5, self.park_max_wz * 0.5)
+                cmd.angular.z = wz
+
+                detail = f'[ANGLE] MOVE: a={math.degrees(angle):.1f}deg, vx={vx:.3f}, wz={wz:.3f}, h={math.degrees(heading_error):.1f}deg'
                 return cmd, error_x, error_y, error_yaw, detail
 
         # ========================================
-        # Phase 2: CENTER 기반 미세 정렬
+        # Phase 3: CENTER 기반 미세 정렬
         # ========================================
         if self._park_align_phase == 'CENTER':
             error_x = offset_x
 
-            # angle이 크게 벗어나면 Phase 1로 복귀
+            # heading이 크게 벗어나면 Phase 1 (PARALLEL)로 복귀
+            if abs(heading_error) > self.park_parallel_threshold * 3.0:
+                self._park_align_phase = 'PARALLEL'
+                self._park_action = 'MOVE'
+                self._park_action_start_time = 0.0
+                self._park_stall_boost = 0.0
+                self._park_consecutive_stalls = 0
+                self._park_stall_pulse_mode = False
+                self._park_prev_stall_value = heading_error
+                if hasattr(self, '_park_align_stable_start'):
+                    delattr(self, '_park_align_stable_start')
+                self.get_logger().info(
+                    f'Heading drifted ({math.degrees(heading_error):.1f}deg), back to Phase 1 (PARALLEL)'
+                )
+                return cmd, error_x, error_y, error_yaw, f'[CENTER] → PARALLEL (heading drift)'
+
+            # angle이 크게 벗어나면 Phase 2로 복귀
             if abs(angle) > self.park_marker_threshold * 3.0:
                 self._park_align_phase = 'ANGLE'
                 self._park_action = 'MOVE'
@@ -1458,7 +1565,7 @@ class MotionControllerNode(Node):
                 if hasattr(self, '_park_align_stable_start'):
                     delattr(self, '_park_align_stable_start')
                 self.get_logger().info(
-                    f'Angle drifted ({math.degrees(angle):.1f}deg), back to Phase 1 (ANGLE)'
+                    f'Angle drifted ({math.degrees(angle):.1f}deg), back to Phase 2 (ANGLE)'
                 )
                 return cmd, error_x, error_y, error_yaw, f'[CENTER] → ANGLE (drift)'
 
@@ -1471,7 +1578,7 @@ class MotionControllerNode(Node):
                         delattr(self, '_park_align_stable_start')
                     self._publish_park_align_marker_done()
                     self._park_align_marker_done_sent = True
-                    detail = f'Centered! off={offset_x*100:.1f}cm'
+                    detail = f'Centered! off={offset_x*100:.1f}cm, h={math.degrees(heading_error):.1f}deg'
                     return cmd, error_x, error_y, error_yaw, detail
                 detail = f'[CENTER] stable: off={offset_x*100:.1f}cm, {now - self._park_align_stable_start:.1f}/0.5s'
                 return cmd, error_x, error_y, error_yaw, detail
@@ -1490,7 +1597,7 @@ class MotionControllerNode(Node):
                 if action_elapsed >= self.align_settle_duration:
                     self._park_action = 'MOVE'
                     self._park_action_start_time = now
-                detail = f'[CENTER] SETTLE {action_elapsed:.2f}s, off={offset_x*100:.1f}cm'
+                detail = f'[CENTER] SETTLE {action_elapsed:.2f}s, off={offset_x*100:.1f}cm, h={math.degrees(heading_error):.1f}deg'
                 return cmd, error_x, error_y, error_yaw, detail
 
             if action_elapsed >= self.align_move_duration:
@@ -1512,8 +1619,13 @@ class MotionControllerNode(Node):
 
             vx = self._apply_park_stall_boost(vx)
             cmd.linear.x = vx
-            wz, h_err = self._apply_heading_correction(cmd, marker)
-            detail = f'[CENTER] MOVE: off={offset_x*100:.1f}cm, vx={vx:.3f}, wz={wz:.3f}, h={math.degrees(h_err):.1f}deg'
+
+            # 약한 heading 보정 (CENTER phase에서도 평행 유지)
+            wz = -self.park_heading_kp * 0.5 * heading_error
+            wz = self._clamp(wz, -self.park_max_wz * 0.5, self.park_max_wz * 0.5)
+            cmd.angular.z = wz
+
+            detail = f'[CENTER] MOVE: off={offset_x*100:.1f}cm, vx={vx:.3f}, wz={wz:.3f}, h={math.degrees(heading_error):.1f}deg'
             return cmd, error_x, error_y, error_yaw, detail
 
         detail = f'No side marker, waiting...'

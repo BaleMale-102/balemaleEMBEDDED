@@ -189,6 +189,7 @@
     park_max_vy: 0.028            # +10% (7.4V: 0.025)
     park_min_speed: 0.009         # +10% (7.4V: 0.008)
     park_marker_threshold: 0.02   # 마커 정렬 완료 임계값 (rad, ~1.1도) - 더 정밀하게
+    park_parallel_threshold: 0.05 # 마커와 평행 정렬 임계값 (rad, ~3도) - PARALLEL phase 완료 기준
     park_center_threshold: 0.01  # 중앙정렬 완료 임계값 (m, 1cm)
     park_side_camera_offset_x: 0.0  # side camera→로봇 중앙 전방 오프셋 (m, 양수=카메라가 앞에)
     park_distance_threshold: 0.02 # 최종 거리 완료 임계값 (m, 2cm)
