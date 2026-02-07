@@ -9,7 +9,10 @@
       "Bash(git worktree add:*)",
       "Bash(git -C /home/a102/balemaleEMBEDDED branch:*)",
       "Bash(git -C /home/a102/balemaleEMBEDDED_parking branch:*)",
-      "Bash(wc:*)"
+      "Bash(wc:*)",
+      "Bash(dir:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfeat: Motion control improvements with orientation-based alignment\n\n주요 변경사항:\n- Strict Cardinal Turning: 정확한 90도 단위 회전 \\(0, ±90, ±180도\\)\n- Orientation-based Alignment: 마커 방향 기반 heading 정렬\n- Straight Drive Compensation: 직진 주행 중 heading/lateral 보정\n- Parking orientation: 주차 시에도 동일한 heading 정렬 적용\n\n세부 구현:\n- TrackedMarker.msg: marker_yaw 필드 추가\n- tracker_node.py: 마커 orientation에서 yaw 추출 및 Kalman 필터링\n- controller_node.py: snap_to_cardinal, wrap_angle 헬퍼 함수 추가\n  - _turn_control: 절대 각도 기반 cardinal 회전\n  - _align_to_marker: HEADING→LATERAL 2단계 정렬\n  - _drive_with_marker_only: heading/lateral lock 보정\n  - _park_*_control: 주차 시 heading 유지 보정\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\"`)"
     ]
   }
 }
