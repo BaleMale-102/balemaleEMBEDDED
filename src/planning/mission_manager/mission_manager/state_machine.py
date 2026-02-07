@@ -29,6 +29,7 @@ class MissionState(Enum):
     RETREAT_FROM_VEHICLE = auto()  # Move back after loading
     UNLOAD = auto()              # Unloading vehicle at slot
     RETURN_HOME = auto()         # Returning to home (marker 0)
+    RETREAT_FROM_SLOT = auto()   # Move laterally back to road from parking slot
 
     # Navigation states
     DRIVE = auto()               # Lane following + marker approach
@@ -215,7 +216,7 @@ class MissionContext:
     @property
     def current_target_marker(self) -> int:
         """Get current target marker ID."""
-        if self.current_waypoint_idx < len(self.waypoint_ids):
+        if 0 <= self.current_waypoint_idx < len(self.waypoint_ids):
             return self.waypoint_ids[self.current_waypoint_idx]
         return self.final_goal_id
 
@@ -296,6 +297,7 @@ class StateMachine:
             MissionState.RETREAT_FROM_VEHICLE: self._retreat_from_vehicle_transition,
             MissionState.UNLOAD: self._unload_transition,
             MissionState.RETURN_HOME: self._return_home_transition,
+            MissionState.RETREAT_FROM_SLOT: self._retreat_from_slot_transition,
             # Navigation states
             MissionState.DRIVE: self._drive_transition,
             MissionState.STOP_AT_MARKER: self._stop_at_marker_transition,
@@ -490,20 +492,31 @@ class StateMachine:
         elif new_state == MissionState.RECOGNIZE:
             self._context.recognition.query_sent = False
             self._context.recognition.response_received = False
-        elif new_state in (MissionState.APPROACH_VEHICLE, MissionState.RETREAT_FROM_VEHICLE):
+        elif new_state in (MissionState.APPROACH_VEHICLE, MissionState.RETREAT_FROM_VEHICLE,
+                           MissionState.RETREAT_FROM_SLOT):
             self._context.approach_start_time = time.time()
+            if new_state == MissionState.RETREAT_FROM_SLOT:
+                self._context.align_complete = False  # 마커 기반 정렬 완료 대기
         elif new_state == MissionState.LOAD:
             self._context.loader.load_complete = False
         elif new_state == MissionState.UNLOAD:
             self._context.loader.unload_complete = False
         elif new_state == MissionState.RETURN_HOME:
             # 왔던 길 역순으로 복귀
-            # 갈 때: [1, 5] → slot 17
-            # 올 때: [5, 1] → home 0
+            # 갈 때: [0, 1, 5] → slot 17 (current_marker_id=5)
+            # 올 때: RETREAT_FROM_SLOT → TURNING(180°) → DRIVE [1] → 0(home)
             original_waypoints = self._context.waypoint_ids.copy()
-            self._context.waypoint_ids = list(reversed(original_waypoints))
+            reversed_wps = list(reversed(original_waypoints))
+            # 현재 위치 마커와 같은 첫 waypoint 스킵 (이미 그 마커에 있음)
+            if reversed_wps and reversed_wps[0] == self._context.current_marker_id:
+                reversed_wps = reversed_wps[1:]
+            # Home marker는 final_goal이므로 waypoints에서 제거 (중복 방지)
             self._context.final_goal_id = HOME_MARKER_ID
-            self._context.current_waypoint_idx = 0
+            if reversed_wps and reversed_wps[-1] == HOME_MARKER_ID:
+                reversed_wps = reversed_wps[:-1]
+            self._context.waypoint_ids = reversed_wps
+            # idx=-1: RETREAT_FROM_SLOT 후 TURNING에서 _setup_turn(next_idx=0) 사용
+            self._context.current_waypoint_idx = -1
             self._context.marker_reached = False
         # Parking state resets
         elif new_state == MissionState.PARK_DETECT:
@@ -609,7 +622,8 @@ class StateMachine:
                 self._context.final_goal_id = ctx.assigned_slot_id
                 self._context.parking.target_slot_id = ctx.assigned_slot_id
                 self._context.task_type = 'PARK'
-                return MissionState.APPROACH_VEHICLE
+                # return MissionState.APPROACH_VEHICLE  # 주석처리: 접근 이동 비활성화
+                return MissionState.LOAD
             else:
                 # Not verified - back to waiting
                 self._context.recognition = RecognitionContext()
@@ -634,7 +648,8 @@ class StateMachine:
             if self._context.task_type == 'EXIT':
                 return MissionState.RETURN_HOME  # 출차: 슬롯에서 적재 후 홈으로
             if self._context.is_full_mission:
-                return MissionState.RETREAT_FROM_VEHICLE  # 입고: 적재 후 후퇴 → 출발
+                # return MissionState.RETREAT_FROM_VEHICLE  # 주석처리: 후퇴 이동 비활성화
+                return MissionState.DRIVE  # 입고: 적재 후 바로 출발
             return MissionState.DRIVE  # 단순 미션: 바로 출발
 
         return None
@@ -663,8 +678,15 @@ class StateMachine:
         return None
 
     def _return_home_transition(self) -> Optional[MissionState]:
-        """Immediately start driving - waypoints already reversed in _change_state."""
-        return MissionState.DRIVE
+        """Start retreat from slot, then turn and drive home."""
+        return MissionState.RETREAT_FROM_SLOT
+
+    def _retreat_from_slot_transition(self) -> Optional[MissionState]:
+        """고정 거리 +vy 평행이동 완료 시 TURNING."""
+        elapsed = time.time() - self._context.approach_start_time
+        if elapsed >= self._context.approach_duration:
+            return MissionState.TURNING
+        return None
 
     def _drive_transition(self) -> Optional[MissionState]:
         if self._context.marker_reached:
@@ -707,9 +729,12 @@ class StateMachine:
                     return MissionState.PARK_DETECT
                 else:
                     return MissionState.FINISH
-            elif not has_more_waypoints and self._context.task_type in ('PARK', 'DROPOFF', 'EXIT'):
+            elif (not has_more_waypoints and
+                  self._context.final_goal_id != HOME_MARKER_ID and
+                  self._context.task_type in ('PARK', 'DROPOFF', 'EXIT')):
                 # 마지막 waypoint 도착, 다음이 주차 슬롯 → 턴 없이 바로 PARK_DETECT
                 # (주차 마커는 사이드 카메라로 탐지, 전방 카메라 턴 불필요)
+                # (복귀 중일 때는 final_goal=HOME이므로 이 조건에 걸리지 않음)
                 self._context.advance_waypoint()
                 return MissionState.PARK_DETECT
             else:
@@ -717,12 +742,25 @@ class StateMachine:
                 return MissionState.TURNING
         return None
 
+    # 먼 거리 전환 (마커가 카메라 범위 밖 → ALIGN 건너뛰고 DRIVE로 전진 탐색)
+    _LONG_DISTANCE_PAIRS = {(4, 10), (9, 15), (10, 4), (15, 9)}
+
     def _turning_transition(self) -> Optional[MissionState]:
         if self._context.turn_complete:
             self._context.advance_waypoint()
             # If next target is a parking slot, go directly to PARK_DETECT
-            if self._context.is_last_waypoint and self._context.task_type in ('PARK', 'DROPOFF', 'EXIT'):
+            # (복귀 중일 때는 final_goal=HOME이므로 PARK_DETECT 안 함)
+            if (self._context.is_last_waypoint and
+                    self._context.final_goal_id != HOME_MARKER_ID and
+                    self._context.task_type in ('PARK', 'DROPOFF', 'EXIT')):
                 return MissionState.PARK_DETECT
+
+            # 먼 거리 전환: ALIGN 건너뛰고 바로 DRIVE (전진하며 마커 탐색)
+            from_m = self._context.current_marker_id
+            to_m = self._context.current_target_marker
+            if (from_m, to_m) in self._LONG_DISTANCE_PAIRS:
+                return MissionState.DRIVE
+
             return MissionState.ALIGN_TO_MARKER
         return None
 

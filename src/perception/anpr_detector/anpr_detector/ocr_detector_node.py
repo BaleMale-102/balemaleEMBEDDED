@@ -99,6 +99,9 @@ class OCRDetectorNode(Node):
         self.pub_detections = self.create_publisher(
             DetectionArray, '/perception/ocr/detections', 10
         )
+        self.pub_side_anomaly = self.create_publisher(
+            DetectionArray, '/perception/side_anomaly/detections', 10
+        )
         self.pub_plate = self.create_publisher(
             String, '/perception/ocr/plate', 10
         )
@@ -160,17 +163,24 @@ class OCRDetectorNode(Node):
                 self._connect_to_server()
                 return
 
-            detections = result.get('detections', [])
+            # 모든 검출 결과 (디버그 이미지용)
+            all_detections = result.get('all_detections', [])
             plate_text = result.get('plate_text')
             has_sticker = result.get('has_sticker', False)
 
-            # DetectionArray 메시지 생성
-            det_array_msg = DetectionArray()
-            det_array_msg.header = msg.header
-            det_array_msg.num_plates = result.get('num_plates', 0)
-            det_array_msg.num_obstacles = 0
+            # 1. OCR Detections (Plate, Sticker)
+            ocr_msg = DetectionArray()
+            ocr_msg.header = msg.header
+            ocr_msg.num_plates = result.get('num_plates', 0)
+            ocr_msg.num_obstacles = 0
 
-            for det in detections:
+            # 2. Side Anomaly Detections (Person, Box, Cone)
+            anomaly_msg = DetectionArray()
+            anomaly_msg.header = msg.header
+            anomaly_msg.num_plates = 0
+            anomaly_msg.num_obstacles = 0
+
+            for det in all_detections:
                 detection_msg = Detection()
                 detection_msg.class_id = det['class']
                 detection_msg.class_name = self.CLASS_NAMES.get(det['class'], 'unknown')
@@ -179,14 +189,22 @@ class OCRDetectorNode(Node):
                 detection_msg.y1 = int(det['box'][1])
                 detection_msg.x2 = int(det['box'][2])
                 detection_msg.y2 = int(det['box'][3])
+                detection_msg.distance = float(det.get('distance', 0.0))
 
-                if det['class'] == 0 and plate_text:  # Plate
-                    detection_msg.text = plate_text
-                    detection_msg.has_sticker = has_sticker
+                # Class 구분
+                if det['class'] in (0, 1):  # Plate, Sticker
+                    if det['class'] == 0 and plate_text:
+                        detection_msg.text = plate_text
+                        detection_msg.has_sticker = has_sticker
+                    ocr_msg.detections.append(detection_msg)
+                
+                elif det['class'] in (2, 3, 4):  # Person, Box, Cone
+                    anomaly_msg.detections.append(detection_msg)
+                    anomaly_msg.num_obstacles += 1
 
-                det_array_msg.detections.append(detection_msg)
-
-            self.pub_detections.publish(det_array_msg)
+            # Publish topics
+            self.pub_detections.publish(ocr_msg)
+            self.pub_side_anomaly.publish(anomaly_msg)
 
             # Plate/Sticker 퍼블리시
             if plate_text:
@@ -203,9 +221,9 @@ class OCRDetectorNode(Node):
                 sticker_msg.data = str(has_sticker)
                 self.pub_sticker.publish(sticker_msg)
 
-            # 디버그 이미지
+            # 디버그 이미지 (모든 검출 결과 표시)
             if self.publish_debug or self.show_debug_window:
-                debug_image = self._draw_detections(frame, detections, plate_text)
+                debug_image = self._draw_detections(frame, all_detections, plate_text)
 
                 if self.publish_debug:
                     debug_msg = self.bridge.cv2_to_imgmsg(debug_image, 'bgr8')
@@ -228,21 +246,33 @@ class OCRDetectorNode(Node):
         colors = {
             0: (0, 255, 0),    # Plate - Green
             1: (255, 0, 0),    # Sticker - Blue
+            2: (0, 0, 255),    # Person - Red
+            3: (255, 255, 0),  # Box - Cyan
+            4: (0, 165, 255),  # Cone - Orange
         }
 
         for det in detections:
             x1, y1, x2, y2 = map(int, det['box'])
             cls = det['class']
             conf = det['confidence']
+            dist = det.get('distance', 0.0)
             color = colors.get(cls, (255, 255, 255))
             label = self.CLASS_NAMES.get(cls, f'Class{cls}')
 
             cv2.rectangle(result, (x1, y1), (x2, y2), color, 2)
 
+            text_parts = []
             if cls == 0 and plate_text:  # Plate
-                display_text = f'{label} {conf:.2f}: {plate_text}'
+                text_parts.append(f'{plate_text}')
             else:
-                display_text = f'{label} {conf:.2f}'
+                text_parts.append(f'{label}')
+            
+            text_parts.append(f'{conf:.2f}')
+            
+            if dist > 0:
+                text_parts.append(f'{dist:.1f}cm')
+
+            display_text = ' '.join(text_parts)
 
             cv2.putText(
                 result, display_text,

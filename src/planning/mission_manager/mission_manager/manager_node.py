@@ -66,6 +66,10 @@ class MissionManagerNode(Node):
         # Approach/retreat parameters (hardcoded movement)
         self.declare_parameter('approach_distance', 0.30)   # Distance to vehicle (m)
         self.declare_parameter('approach_speed', 0.01)       # Movement speed (m/s)
+        self.declare_parameter('retreat_from_slot_distance', 0.25)  # 주차 슬롯→길 복귀 거리 (m)
+        # Anomaly detection parameters
+        self.declare_parameter('anomaly_stop_distance', 30.0)   # Stop if obstacle closer than this (cm)
+        self.declare_parameter('anomaly_clear_timeout', 3.0)    # Resume after N seconds without detection
 
         # State timeout parameters
         self.declare_parameter('timeout_stop_at_marker', 2.0)
@@ -99,15 +103,18 @@ class MissionManagerNode(Node):
         auto_start_waiting = self.get_parameter('auto_start_waiting').value
         self.approach_distance = self.get_parameter('approach_distance').value
         self.approach_speed = self.get_parameter('approach_speed').value
+        self.retreat_from_slot_distance = self.get_parameter('retreat_from_slot_distance').value
+        self.anomaly_stop_distance = self.get_parameter('anomaly_stop_distance').value
+        self.anomaly_clear_timeout = self.get_parameter('anomaly_clear_timeout').value
 
         # Build timeout/delay configs for state machine
         # 테스트용: 주행/주차 관련 타임아웃 비활성화 (0 = 무제한)
         timeouts = {
             'STOP_AT_MARKER': self.get_parameter('timeout_stop_at_marker').value,
             'ADVANCE_TO_CENTER': self.get_parameter('timeout_advance_to_center').value,
-            'ALIGN_TO_MARKER': 0,  # 비활성화
+            'ALIGN_TO_MARKER': self.get_parameter('timeout_align_to_marker').value,
             'STOP_BUMP': self.get_parameter('timeout_stop_bump').value,
-            'TURNING': 0,  # 비활성화
+            'TURNING': self.get_parameter('timeout_turning').value,
             'PARK': 0,  # 비활성화
             'PARK_DETECT': 0,  # 비활성화
             'PARK_RECOVERY': 0,  # 비활성화
@@ -147,6 +154,11 @@ class MissionManagerNode(Node):
         # ANPR detection tracking
         self._last_plate_number = ''
         self._plate_query_pending = False
+
+        # Anomaly detection tracking
+        self._anomaly_paused = False
+        self._anomaly_type = ''
+        self._anomaly_last_detection_time = 0.0
 
         # Import custom interfaces
         try:
@@ -192,6 +204,9 @@ class MissionManagerNode(Node):
                 self._LoaderCommand, '/loader/command', 10
             )
 
+        # Anomaly report publisher (JSON string for server_bridge)
+        self.pub_anomaly_report = self.create_publisher(String, '/server/anomaly_report', 10)
+
         # Subscribers
         if self._has_interface:
             self.sub_task_cmd = self.create_subscription(
@@ -207,6 +222,16 @@ class MissionManagerNode(Node):
             self.sub_anpr_detections = self.create_subscription(
                 self._DetectionArray, '/perception/anpr/detections',
                 self._anpr_detections_callback, qos_profile_sensor_data
+            )
+            # Anomaly detections (person/box/cone)
+            self.sub_anomaly_detections = self.create_subscription(
+                self._DetectionArray, '/perception/anomaly/detections',
+                self._anomaly_detections_callback, qos_profile_sensor_data
+            )
+            # Side anomaly detections (for slot blocking)
+            self.sub_side_anomaly_detections = self.create_subscription(
+                self._DetectionArray, '/perception/side_anomaly/detections',
+                self._side_anomaly_detections_callback, qos_profile_sensor_data
             )
             # Plate response from server
             self.sub_plate_response = self.create_subscription(
@@ -318,55 +343,62 @@ class MissionManagerNode(Node):
 
     def _side_markers_callback(self, msg):
         """Handle side camera marker detections for parking."""
-        if self.fsm.state not in (
+        # Parking logic using markers (existing logic)
+        if self.fsm.state in (
             MissionState.PARK_DETECT,
             MissionState.PARK_ALIGN_MARKER,
             MissionState.PARK_FINAL
         ):
-            return
+            if not msg.markers:
+                return
 
-        if not msg.markers:
-            return
+            target_slot = self.fsm.context.parking.target_slot_id
+            if target_slot < 0:
+                return
 
-        target_slot = self.fsm.context.parking.target_slot_id
-        if target_slot < 0:
-            return
+            best_marker = None
+            best_score = -1
 
-        best_marker = None
-        best_score = -1
+            for marker in msg.markers:
+                if marker.id < 16 or marker.id > 27:
+                    continue
 
-        for marker in msg.markers:
-            if marker.id < 16 or marker.id > 27:
-                continue
+                score = 0
+                if marker.id == target_slot:
+                    score = 100
+                elif is_same_zone(marker.id, target_slot):
+                    score = 50
+                else:
+                    score = 10
 
-            score = 0
-            if marker.id == target_slot:
-                score = 100
-            elif is_same_zone(marker.id, target_slot):
-                score = 50
-            else:
-                score = 10
+                score += max(0, 10 - marker.distance * 10)
 
-            score += max(0, 10 - marker.distance * 10)
+                if score > best_score:
+                    best_score = score
+                    best_marker = marker
 
-            if score > best_score:
-                best_score = score
-                best_marker = marker
+            if best_marker:
+                self._side_marker = best_marker
+                self._side_marker_time = self.get_clock().now().nanoseconds / 1e9
 
-        if best_marker:
-            self._side_marker = best_marker
-            self._side_marker_time = self.get_clock().now().nanoseconds / 1e9
+                if self.fsm.state == MissionState.PARK_DETECT:
+                    self.fsm.notify_park_detect_done(
+                        best_marker.id,
+                        best_marker.distance,
+                        best_marker.angle
+                    )
+                    self.get_logger().info(
+                        f'Side marker detected: id={best_marker.id}, '
+                        f'd={best_marker.distance:.2f}m, a={math.degrees(best_marker.angle):.1f}deg'
+                    )
 
-            if self.fsm.state == MissionState.PARK_DETECT:
-                self.fsm.notify_park_detect_done(
-                    best_marker.id,
-                    best_marker.distance,
-                    best_marker.angle
-                )
-                self.get_logger().info(
-                    f'Side marker detected: id={best_marker.id}, '
-                    f'd={best_marker.distance:.2f}m, a={math.degrees(best_marker.angle):.1f}deg'
-                )
+        # Also just track the last seen side marker in general for anomaly association
+        if msg.markers:
+            # Just take the closest one
+            closest = min(msg.markers, key=lambda m: m.distance)
+            if 16 <= closest.id <= 27:
+                self._side_marker = closest
+                self._side_marker_time = self.get_clock().now().nanoseconds / 1e9
 
     def _anpr_detections_callback(self, msg):
         """Handle ANPR detections for plate recognition."""
@@ -424,6 +456,139 @@ class MissionManagerNode(Node):
                 self.get_logger().error(f'Loader error: {msg.message}')
                 self.fsm.notify_loader_error()
 
+    def _anomaly_detections_callback(self, msg):
+        """Handle anomaly detections for emergency stop."""
+        # Only process during active movement states
+        active_states = {
+            MissionState.DRIVE,
+            MissionState.ADVANCE_TO_CENTER,
+            MissionState.ALIGN_TO_MARKER,
+            MissionState.TURNING,
+            MissionState.PARK_DETECT,
+            MissionState.PARK_RECOVERY,
+            MissionState.PARK_ALIGN_MARKER,
+            MissionState.PARK_FINAL,
+            MissionState.APPROACH_VEHICLE,
+            MissionState.RETREAT_FROM_VEHICLE,
+            MissionState.RETREAT_FROM_SLOT,
+        }
+        if self.fsm.state not in active_states:
+            return
+
+        now = self.get_clock().now().nanoseconds / 1e9
+
+        # Find closest obstacle (person=2, box=3, cone=4)
+        closest_distance = float('inf')
+        closest_class = ''
+        for det in msg.detections:
+            if det.class_id in (2, 3, 4) and det.distance > 0:
+                if det.distance < closest_distance:
+                    closest_distance = det.distance
+                    closest_class = det.class_name
+
+        if closest_distance < self.anomaly_stop_distance:
+            self._anomaly_last_detection_time = now
+
+            if not self._anomaly_paused:
+                self._anomaly_paused = True
+                self._anomaly_type = 'HUMAN' if closest_class == 'person' else 'OBSTACLE'
+                self.get_logger().warn(
+                    f'EMERGENCY STOP: {closest_class} at {closest_distance:.1f}cm')
+                self._disable_drive()
+                self._send_anomaly_report(
+                    anomaly_type=self._anomaly_type,
+                    distance=closest_distance,
+                    event_type='ESTOP'
+                )
+
+    # Parking states where side anomaly should trigger emergency stop
+    _PARKING_STATES = {
+        MissionState.PARK_DETECT,
+        MissionState.PARK_RECOVERY,
+        MissionState.PARK_ALIGN_MARKER,
+        MissionState.PARK_ALIGN_RECT,
+        MissionState.PARK_FINAL,
+    }
+
+    def _side_anomaly_detections_callback(self, msg):
+        """Handle side anomaly detections for slot blocking reporting.
+
+        During PARKING states: stop parking + send ESTOP to server.
+        Otherwise: log + send WARNING only.
+        """
+        if not msg.detections:
+            return
+
+        now = self.get_clock().now().nanoseconds / 1e9
+
+        # Check for any valid side anomaly (person/box/cone)
+        closest_dist = float('inf')
+        anomaly_detected = False
+        for det in msg.detections:
+            if det.class_id in (2, 3, 4) and det.distance > 0:
+                if det.distance < closest_dist:
+                    closest_dist = det.distance
+                    anomaly_detected = True
+
+        if not anomaly_detected:
+            return
+
+        # Determine marker_id for report
+        marker_id = -1
+        if self._side_marker is not None and (now - self._side_marker_time) <= 2.0:
+            marker_id = self._side_marker.id
+
+        # PARKING states: emergency stop + ESTOP report
+        if self.fsm.state in self._PARKING_STATES:
+            self._anomaly_last_detection_time = now
+
+            if not self._anomaly_paused:
+                self._anomaly_paused = True
+                self._anomaly_type = 'SLOT_BLOCKED'
+                self.get_logger().warn(
+                    f'PARKING ESTOP: obstacle at {closest_dist:.1f}cm during {self.fsm.state.name}')
+                self._disable_drive()
+                self._send_anomaly_report(
+                    anomaly_type='SLOT_BLOCKED',
+                    distance=closest_dist,
+                    event_type='ESTOP',
+                    marker_id=marker_id if marker_id >= 0 else self.fsm.context.parking.target_slot_id
+                )
+            return
+
+        # Non-parking states: WARNING only (no stop)
+        if marker_id >= 0:
+            self.get_logger().info(
+                f'Slot Blocked: Slot {marker_id} blocked by obstacle at {closest_dist:.1f}cm'
+            )
+            self._send_anomaly_report(
+                anomaly_type='SLOT_BLOCKED',
+                distance=closest_dist,
+                event_type='WARNING',
+                marker_id=marker_id
+            )
+
+    def _send_anomaly_report(self, anomaly_type: str, distance: float, 
+                             event_type: str = 'ESTOP', marker_id: int = -1):
+        """Send anomaly report to server bridge via ROS topic."""
+        import json
+        
+        # Use provided marker_id if valid, else current context marker
+        target_marker = marker_id if marker_id >= 0 else self.fsm.context.current_marker_id
+
+        report = json.dumps({
+            'anomaly_type': anomaly_type,
+            'distance_cm': distance,
+            'event_type': event_type,
+            'state': self.fsm.state.name,
+            'marker_id': target_marker,
+            'next_marker': self.fsm.context.current_target_marker,
+        })
+        report_msg = String()
+        report_msg.data = report
+        self.pub_anomaly_report.publish(report_msg)
+        self.get_logger().info(f'Anomaly report sent: {anomaly_type} (Event: {event_type})')
+
     def _park_align_marker_done_callback(self, msg: Bool):
         """Handle parking marker alignment complete."""
         if msg.data:
@@ -457,7 +622,8 @@ class MissionManagerNode(Node):
                 waypoints = [int(x) for x in parts[1].split(',')]
                 slot_id = int(parts[2])
                 self.fsm.start_mission(waypoints, slot_id, 'test_full', 'PARK')
-                self.get_logger().info(f'Full mission started: {waypoints} -> slot {slot_id}')
+                self.fsm.context.is_full_mission = True
+                self.get_logger().info(f'Full mission started: {waypoints} -> slot {slot_id} (is_full_mission=True)')
         elif cmd.startswith('START_PARK'):
             parts = cmd.split()
             if len(parts) > 1:
@@ -520,6 +686,26 @@ class MissionManagerNode(Node):
 
     def _update_callback(self):
         """Periodic FSM update."""
+        import time as _time
+
+        # Handle anomaly pause
+        if self._anomaly_paused:
+            self._disable_drive()
+            now = self.get_clock().now().nanoseconds / 1e9
+            if now - self._anomaly_last_detection_time > self.anomaly_clear_timeout:
+                self._anomaly_paused = False
+                self._anomaly_type = ''
+                self.get_logger().info('Obstacle cleared, resuming mission')
+                # Reset state enter time to prevent timeout from pause duration
+                self.fsm.context.state_enter_time = _time.time()
+                self._enable_drive()
+            else:
+                # Still paused - publish current state but skip FSM update
+                state_msg = String()
+                state_msg.data = self.fsm.state.name
+                self.pub_state.publish(state_msg)
+                return
+
         self.fsm.update()
 
         # Handle state-specific actions
@@ -582,6 +768,7 @@ class MissionManagerNode(Node):
             MissionState.TURNING,
             MissionState.APPROACH_VEHICLE,
             MissionState.RETREAT_FROM_VEHICLE,
+            MissionState.RETREAT_FROM_SLOT,
             MissionState.PARK,
             MissionState.PARK_DETECT,
             MissionState.PARK_RECOVERY,
@@ -627,10 +814,24 @@ class MissionManagerNode(Node):
                 self.get_logger().info('Starting unload operation')
             self._send_loader_command('UNLOAD')
         elif new_state == MissionState.RETURN_HOME:
-            if self.fsm.context.task_type == 'EXIT':
-                self.get_logger().info('Returning to home with vehicle (출차)')
+            ctx = self.fsm.context
+            if ctx.task_type == 'EXIT':
+                self.get_logger().info(
+                    f'Returning home (출차): waypoints={ctx.waypoint_ids}, '
+                    f'current_marker={ctx.current_marker_id}'
+                )
             else:
-                self.get_logger().info('Returning to home position')
+                self.get_logger().info(
+                    f'Returning home: waypoints={ctx.waypoint_ids}, '
+                    f'current_marker={ctx.current_marker_id}'
+                )
+        elif new_state == MissionState.RETREAT_FROM_SLOT:
+            retreat_vy = 0.02  # 하드코딩 (controller와 동일)
+            duration = self.retreat_from_slot_distance / retreat_vy
+            self.fsm.context.approach_duration = duration
+            self.get_logger().info(
+                f'Retreat from slot: +vy=0.02, {self.retreat_from_slot_distance:.2f}m, {duration:.1f}s'
+            )
         elif new_state == MissionState.PARK_DETECT:
             self.get_logger().info(
                 f'Starting parking detection for slot {self.fsm.context.parking.target_slot_id}'

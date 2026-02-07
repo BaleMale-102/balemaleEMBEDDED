@@ -63,6 +63,7 @@ class MotionControllerNode(Node):
     # Approach/retreat modes (hardcoded movement)
     MODE_APPROACH_VEHICLE = 'APPROACH_VEHICLE'
     MODE_RETREAT_FROM_VEHICLE = 'RETREAT_FROM_VEHICLE'
+    MODE_RETREAT_FROM_SLOT = 'RETREAT_FROM_SLOT'
 
     def __init__(self):
         super().__init__('motion_controller_node')
@@ -134,6 +135,10 @@ class MotionControllerNode(Node):
         self.declare_parameter('stall_threshold_vy', 0.01)   # rad (marker angle change)
         self.declare_parameter('stall_pulse_duration', 0.15)
 
+        # Parameters - drive search creep (마커 안 보일 때 전진 탐색)
+        self.declare_parameter('drive_search_creep_vx', 0.004)
+        self.declare_parameter('drive_search_creep_delay', 1.0)
+
         # Parameters - post-turn marker search
         self.declare_parameter('post_turn_search_timeout', 3.0)
 
@@ -179,6 +184,12 @@ class MotionControllerNode(Node):
 
         # Approach/retreat speed
         self.approach_speed = self.get_parameter('approach_speed').value
+
+        # Drive search creep (긴 구간에서 마커 안 보일 때 전진 탐색)
+        self._drive_search_creep_vx = self.get_parameter('drive_search_creep_vx').value
+        self._drive_search_creep_delay = self.get_parameter('drive_search_creep_delay').value
+        self._drive_search_creep_pairs = {(4, 10), (9, 15), (10, 4), (15, 9)}
+        self._drive_search_start_time = 0.0
 
         # Stall detection parameters
         self._stall_check_interval = self.get_parameter('stall_check_interval').value
@@ -233,6 +244,7 @@ class MotionControllerNode(Node):
         # Marker tracking state
         self._last_marker_distance = float('inf')
         self._last_marker_id = -1
+        self._drive_from_marker_id = -1  # DRIVE 진입 시 출발 마커 (creep pair용)
 
         # ADVANCE_TO_CENTER state
         self._advance_target_distance = 0.0
@@ -276,6 +288,14 @@ class MotionControllerNode(Node):
         self._stall_pulse_mode = False
         self._stall_pulse_start_time = 0.0
         self._stall_pulse_duration = 0.15  # 150ms pulse
+
+        # Parking stall detection and power boost
+        self._park_stall_boost = 0.0
+        self._park_consecutive_stalls = 0
+        self._park_stall_pulse_mode = False
+        self._park_stall_pulse_start_time = 0.0
+        self._park_last_stall_check_time = 0.0
+        self._park_prev_stall_value = 0.0
 
         # Log output interval
         self._last_log_time = 0.0
@@ -375,6 +395,12 @@ class MotionControllerNode(Node):
         if state == 'IDLE':
             self._mode = self.MODE_IDLE
         elif state in ('DRIVE', 'LANE_FOLLOW', 'MARKER_APPROACH', 'APPROACH'):
+            if prev_mode != self.MODE_DRIVE:
+                self._drive_from_marker_id = self._last_marker_id
+                self._drive_search_start_time = 0.0
+                self.get_logger().info(
+                    f'DRIVE started: from_marker={self._drive_from_marker_id}, target={self._target_marker_id}'
+                )
             self._mode = self.MODE_DRIVE
         elif state == 'STOP_AT_MARKER':
             self._mode = self.MODE_STOP_AT_MARKER
@@ -402,6 +428,12 @@ class MotionControllerNode(Node):
                 self._post_turn_search_mode = False
                 self._turn_last_target = self._turn_target_rad  # 변경 감지용
                 self._turn_log_count = 0  # 초기 반복 로깅용
+                # Reset stall detection for turn
+                self._stall_wz_boost = 0.0
+                self._consecutive_stalls = 0
+                self._stall_pulse_mode = False
+                self._last_stall_check_time = 0.0
+                self._prev_yaw_for_stall = self._current_yaw
                 # 레이스 컨디션 진단: 턴 시작 시 target_marker_id 확인
                 tracker_id = self._tracked_marker.id if self._tracked_marker else -1
                 tracker_conf = self._tracked_marker.prediction_confidence if self._tracked_marker else 0.0
@@ -430,6 +462,10 @@ class MotionControllerNode(Node):
             self._mode = self.MODE_APPROACH_VEHICLE
         elif state == 'RETREAT_FROM_VEHICLE':
             self._mode = self.MODE_RETREAT_FROM_VEHICLE
+        elif state == 'RETREAT_FROM_SLOT':
+            self._mode = self.MODE_RETREAT_FROM_SLOT
+            if prev_mode != self.MODE_RETREAT_FROM_SLOT:
+                self.get_logger().info('RETREAT_FROM_SLOT: fixed +vy lateral movement')
         elif state in ('STOP', 'FINISH', 'STOP_BUMP'):
             self._mode = self.MODE_STOP
         # Parking states
@@ -446,6 +482,12 @@ class MotionControllerNode(Node):
                 self._park_align_phase = 'ANGLE'  # Phase 1: angle, Phase 2: center
                 self._park_action = 'MOVE'
                 self._park_action_start_time = 0.0
+                # Reset parking stall detection
+                self._park_stall_boost = 0.0
+                self._park_consecutive_stalls = 0
+                self._park_stall_pulse_mode = False
+                self._park_last_stall_check_time = 0.0
+                self._park_prev_stall_value = 0.0
                 self.get_logger().info('PARK_ALIGN_MARKER: Phase 1 (ANGLE) → Phase 2 (CENTER)')
         elif state == 'PARK_ALIGN_RECT':
             self._mode = self.MODE_PARK_ALIGN_RECT
@@ -460,6 +502,12 @@ class MotionControllerNode(Node):
                 self._park_action_start_time = 0.0
                 self._park_final_last_distance = -1.0
                 self._park_final_lost_start = 0.0
+                # Reset parking stall detection
+                self._park_stall_boost = 0.0
+                self._park_consecutive_stalls = 0
+                self._park_stall_pulse_mode = False
+                self._park_last_stall_check_time = 0.0
+                self._park_prev_stall_value = 0.0
         elif state == 'PARK':
             # Legacy PARK state - treat as PARK_DETECT
             self._mode = self.MODE_PARK_DETECT
@@ -587,13 +635,18 @@ class MotionControllerNode(Node):
         elif self._mode == self.MODE_PARK_FINAL:
             cmd, error_x, error_y, error_yaw, detail = self._park_final_control()
 
-        # Approach/retreat (hardcoded forward/backward movement)
-        elif self._mode == self.MODE_APPROACH_VEHICLE:
-            cmd.linear.x = self.approach_speed
-            detail = 'Approaching vehicle'
-        elif self._mode == self.MODE_RETREAT_FROM_VEHICLE:
-            cmd.linear.x = -self.approach_speed
-            detail = 'Retreating from vehicle'
+        # Approach/retreat (hardcoded forward/backward movement) - 주석처리: 접근/후퇴 이동 비활성화
+        # elif self._mode == self.MODE_APPROACH_VEHICLE:
+        #     cmd.linear.x = self.approach_speed
+        #     detail = 'Approaching vehicle'
+        # elif self._mode == self.MODE_RETREAT_FROM_VEHICLE:
+        #     cmd.linear.x = -self.approach_speed
+        #     detail = 'Retreating from vehicle'
+
+        # Retreat from parking slot: 슬롯→도로 복귀 (side cam 왼쪽, +vy=오른쪽)
+        elif self._mode == self.MODE_RETREAT_FROM_SLOT:
+            cmd.linear.y = 0.02  # 하드코딩: max_vy로 복귀
+            detail = 'Retreat from slot: +vy=0.020'
 
         # Apply velocity limits
         cmd.linear.x = self._clamp(cmd.linear.x, -self.max_vx, self.max_vx)
@@ -633,76 +686,33 @@ class MotionControllerNode(Node):
 
             self._last_marker_distance = distance
             self._last_marker_id = marker.id
+            self._drive_search_start_time = 0.0  # Reset search creep timer
 
             error_x = distance
             error_yaw = angle
 
             if distance < self.marker_reach_dist:
-                # Reset stall boost on reaching marker
-                self._stall_vy_boost = 0.0
-                self._consecutive_stalls = 0
                 self._publish_marker_reached(marker.id)
                 return cmd, error_x, error_y, error_yaw, f'Reached marker {marker.id}'
 
             pred = 'pred' if not marker.is_detected else 'det'
 
-            # Stall detection during alignment
-            if abs(angle) > self.marker_align_threshold:
-                # Check for stall
-                if now - self._last_stall_check_time >= self._stall_check_interval:
-                    angle_change = abs(angle - self._prev_marker_angle_for_stall)
-                    if angle_change < self._stall_threshold_vy:
-                        self._consecutive_stalls += 1
-                        self._stall_vy_boost = min(
-                            self._stall_vy_boost + self._stall_boost_increment,
-                            self._stall_max_boost
-                        )
-                        # Pulse mode after several stalls
-                        if self._consecutive_stalls >= 3 and not self._stall_pulse_mode:
-                            self._stall_pulse_mode = True
-                            self._stall_pulse_start_time = now
-                            self.get_logger().info(f'DRIVE stall: boost={self._stall_vy_boost:.3f}')
-                    else:
-                        self._consecutive_stalls = max(0, self._consecutive_stalls - 1)
-                        if self._consecutive_stalls == 0:
-                            self._stall_vy_boost = max(0, self._stall_vy_boost - self._stall_boost_increment * 0.5)
+            # Always move forward (vx) + correct laterally (vy) + gentle steer (wz)
+            # Slow down slightly when off-center, but keep moving
+            angle_factor = max(0.5, 1.0 - abs(angle) / (math.pi / 3))
+            vx = self.marker_vx_kp * (distance - self.marker_min_dist) * angle_factor
+            vx = max(0.0, vx)
 
-                    self._prev_marker_angle_for_stall = angle
-                    self._last_stall_check_time = now
+            # Lateral correction
+            vy = -self.marker_vy_kp * angle
 
-                # Calculate vy with boost
-                vy = -self.marker_vy_kp * angle * 2.0
+            # Gentle steering: 30% of full wz gain for tracking
+            wz = self.marker_wz_kp * angle * 0.3
+            cmd.angular.z = -wz  # 모터 부호 반전
 
-                # Apply stall boost
-                if self._stall_pulse_mode:
-                    pulse_elapsed = now - self._stall_pulse_start_time
-                    if pulse_elapsed < self._stall_pulse_duration:
-                        boost = self._stall_vy_boost * 2.0
-                        vy = vy + (boost if vy > 0 else -boost)
-                    else:
-                        self._stall_pulse_mode = False
-                else:
-                    vy = vy + (self._stall_vy_boost if vy > 0 else -self._stall_vy_boost)
-
-                # Minimum speed with boost
-                min_speed = 0.01 + self._stall_vy_boost
-                if abs(vy) < min_speed and abs(angle) > 0.05:
-                    vy = min_speed if angle < 0 else -min_speed
-
-                cmd.linear.y = vy
-                boost_str = f' boost={self._stall_vy_boost:.3f}' if self._stall_vy_boost > 0 else ''
-                detail = f'[ALIGN] d={distance:.2f}m, a={math.degrees(angle):.1f}deg{boost_str} [{pred}]'
-            else:
-                # Normal driving - reset stall detection
-                self._stall_vy_boost = max(0, self._stall_vy_boost - self._stall_boost_increment)
-                self._consecutive_stalls = 0
-
-                vx = self.marker_vx_kp * (distance - self.marker_min_dist)
-                vx = max(0.0, vx)
-                vy = -self.marker_vy_kp * angle
-                cmd.linear.x = vx
-                cmd.linear.y = vy
-                detail = f'[DRIVE] d={distance:.2f}m, a={math.degrees(angle):.1f}deg [{pred}]'
+            cmd.linear.x = vx
+            cmd.linear.y = vy
+            detail = f'[DRIVE] d={distance:.2f}m, a={math.degrees(angle):.1f}deg, wz={-wz:.3f} [{pred}]'
 
             return cmd, error_x, error_y, error_yaw, detail
 
@@ -713,6 +723,17 @@ class MotionControllerNode(Node):
                 f'Marker {self._last_marker_id} lost at {self._last_marker_distance:.2f}m - counted as reached'
             )
             return cmd, error_x, error_y, error_yaw, f'Marker lost but reached'
+
+        # 긴 구간(4→10, 9→15 등)에서 마커 안 보이면 전진하며 탐색
+        transition = (self._drive_from_marker_id, self._target_marker_id)
+        if transition in self._drive_search_creep_pairs:
+            if self._drive_search_start_time == 0.0:
+                self._drive_search_start_time = now
+            search_elapsed = now - self._drive_search_start_time
+            if search_elapsed > self._drive_search_creep_delay:
+                cmd.linear.x = self._drive_search_creep_vx
+                detail = f'No marker {self._target_marker_id}, creeping forward ({search_elapsed:.1f}s)'
+                return cmd, error_x, error_y, error_yaw, detail
 
         detail = f'No marker {self._target_marker_id}, waiting...'
         return cmd, error_x, error_y, error_yaw, detail
@@ -1054,6 +1075,8 @@ class MotionControllerNode(Node):
         if self._turn_done_sent:
             return cmd, 0.0, 0.0, 0.0, 'Turn done, waiting for state change'
 
+        now = self.get_clock().now().nanoseconds / 1e9
+
         # 초기 반복 진단 카운터
         self._turn_log_count = getattr(self, '_turn_log_count', 0) + 1
 
@@ -1075,31 +1098,175 @@ class MotionControllerNode(Node):
                 f'yaw={math.degrees(self._current_yaw):.1f}'
             )
 
+        # ========================================
+        # Stall detection for TURN
+        # ========================================
+        if now - self._last_stall_check_time >= self._stall_check_interval:
+            yaw_change = abs(self._current_yaw - self._prev_yaw_for_stall)
+            if yaw_change > math.pi:
+                yaw_change = 2 * math.pi - yaw_change
+
+            if yaw_change < self._stall_threshold_wz:
+                self._consecutive_stalls += 1
+                self._stall_wz_boost = min(
+                    self._stall_wz_boost + self._stall_boost_increment,
+                    self._stall_max_boost
+                )
+                if self._consecutive_stalls >= 3 and not self._stall_pulse_mode:
+                    self._stall_pulse_mode = True
+                    self._stall_pulse_start_time = now
+                    self.get_logger().info(
+                        f'TURN stall pulse: stalls={self._consecutive_stalls}, '
+                        f'boost={self._stall_wz_boost:.3f}'
+                    )
+                elif self._consecutive_stalls == 1:
+                    self.get_logger().info(
+                        f'TURN stall detected: yaw_change={math.degrees(yaw_change):.2f}deg, '
+                        f'boost={self._stall_wz_boost:.3f}'
+                    )
+            else:
+                self._consecutive_stalls = max(0, self._consecutive_stalls - 1)
+                if self._consecutive_stalls == 0:
+                    self._stall_wz_boost = max(0, self._stall_wz_boost - self._stall_boost_increment * 0.5)
+
+            self._prev_yaw_for_stall = self._current_yaw
+            self._last_stall_check_time = now
+
         if marker_ok:
-            # 마커 발견 - 즉시 턴 종료
-            self._marker_visible_at_turn_end = True
-            self._publish_turn_done()
-            self._turn_done_sent = True
             marker_angle = self._tracked_marker.angle
-            self.get_logger().info(
-                f'Turn stopped: target marker {self._target_marker_id} detected! '
-                f'angle={math.degrees(marker_angle):.1f}deg, switching to ALIGN mode'
-            )
-            return cmd, 0.0, 0.0, 0.0, f'Marker {self._target_marker_id} found, stopping turn'
+
+            # 마커 발견 후: angle이 충분히 작으면 턴 완료
+            if abs(marker_angle) < self.marker_align_threshold:
+                self._marker_visible_at_turn_end = True
+                self._publish_turn_done()
+                self._turn_done_sent = True
+                self.get_logger().info(
+                    f'Turn complete: marker {self._target_marker_id} centered! '
+                    f'angle={math.degrees(marker_angle):.1f}deg'
+                )
+                return cmd, 0.0, 0.0, 0.0, f'Marker {self._target_marker_id} centered, turn done'
+
+            # 마커 발견했지만 아직 중앙이 아님 → 마커 각도 기반으로 천천히 회전
+            wz = self.marker_wz_kp * marker_angle
+            # 최소 속도 보장
+            if abs(wz) < self.turn_wz_min:
+                wz = self.turn_wz_min if marker_angle > 0 else -self.turn_wz_min
+            # 최대 속도 제한
+            wz = max(-self.turn_wz, min(self.turn_wz, wz))
+
+            # Apply stall boost
+            if self._stall_pulse_mode:
+                pulse_elapsed = now - self._stall_pulse_start_time
+                if pulse_elapsed < self._stall_pulse_duration:
+                    boost = self._stall_wz_boost * 3.0
+                    wz = wz + (boost if wz > 0 else -boost)
+                else:
+                    self._stall_pulse_mode = False
+            else:
+                wz = wz + (self._stall_wz_boost if wz > 0 else -self._stall_wz_boost)
+
+            cmd.angular.z = -wz  # 모터 부호 반전
+
+            detail = (f'Turn: marker found, aligning '
+                      f'a={math.degrees(marker_angle):.1f}deg, wz={-wz:.3f}, boost={self._stall_wz_boost:.3f}')
+            return cmd, 0.0, 0.0, 0.0, detail
+
+        # ========================================
+        # IMU fallback: 마커 한 번도 안 보인 경우 각도 기반 턴 완료
+        # (9→15, 4→10 등 먼 거리에서 마커가 카메라 범위 밖)
+        # ========================================
+        if not self._marker_seen_during_turn:
+            diff = self._current_yaw - self._turn_start_yaw
+            while diff > math.pi: diff -= 2 * math.pi
+            while diff < -math.pi: diff += 2 * math.pi
+            total_rotation = abs(diff)
+            target_rotation = abs(self._turn_target_rad)
+            if target_rotation > 0.1 and total_rotation >= target_rotation * 0.9:
+                self._publish_turn_done()
+                self._turn_done_sent = True
+                self.get_logger().info(
+                    f'Turn complete (IMU fallback): rotated {math.degrees(total_rotation):.1f}deg, '
+                    f'target {math.degrees(self._turn_target_rad):.1f}deg (marker never seen)'
+                )
+                return cmd, 0.0, 0.0, 0.0, 'Turn done (IMU, marker not found)'
 
         # 마커 미발견 → 일정 속도로 계속 회전
         # _turn_direction: +1 = CCW (좌회전), -1 = CW (우회전)
         wz = self.turn_wz * self._turn_direction
+
+        # Apply stall boost
+        if self._stall_pulse_mode:
+            pulse_elapsed = now - self._stall_pulse_start_time
+            if pulse_elapsed < self._stall_pulse_duration:
+                boost = self._stall_wz_boost * 3.0
+                wz = wz + (boost if wz > 0 else -boost)
+            else:
+                self._stall_pulse_mode = False
+        else:
+            wz = wz + (self._stall_wz_boost if wz > 0 else -self._stall_wz_boost)
+
         cmd.angular.z = -wz  # 모터 부호 반전
 
         detail = (f'Turn: rotating dir={self._turn_direction}, '
-                  f'wz={-wz:.3f}, yaw={math.degrees(self._current_yaw):.1f}')
+                  f'wz={-wz:.3f}, boost={self._stall_wz_boost:.3f}, yaw={math.degrees(self._current_yaw):.1f}')
 
         return cmd, 0.0, 0.0, 0.0, detail
 
     # ==========================================
     # Parking Control Methods
     # ==========================================
+
+    def _check_park_stall(self, current_value: float, threshold: float):
+        """
+        주차 상태 스톨 감지 및 파워 부스트.
+        current_value: 현재 추적 값 (angle, offset_x, distance 등)
+        threshold: 변화량 임계값 (이하이면 스톨)
+        """
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self._park_last_stall_check_time < self._stall_check_interval:
+            return
+
+        change = abs(current_value - self._park_prev_stall_value)
+
+        if change < threshold:
+            self._park_consecutive_stalls += 1
+            self._park_stall_boost = min(
+                self._park_stall_boost + self._stall_boost_increment,
+                self._stall_max_boost
+            )
+            if self._park_consecutive_stalls >= 3 and not self._park_stall_pulse_mode:
+                self._park_stall_pulse_mode = True
+                self._park_stall_pulse_start_time = now
+                self.get_logger().info(
+                    f'PARK stall pulse: stalls={self._park_consecutive_stalls}, '
+                    f'boost={self._park_stall_boost:.3f}'
+                )
+            elif self._park_consecutive_stalls == 1:
+                self.get_logger().info(
+                    f'PARK stall detected: change={change:.4f}, '
+                    f'boost={self._park_stall_boost:.3f}'
+                )
+        else:
+            self._park_consecutive_stalls = max(0, self._park_consecutive_stalls - 1)
+            if self._park_consecutive_stalls == 0:
+                self._park_stall_boost = max(0, self._park_stall_boost - self._stall_boost_increment * 0.5)
+
+        self._park_prev_stall_value = current_value
+        self._park_last_stall_check_time = now
+
+    def _apply_park_stall_boost(self, speed: float) -> float:
+        """스톨 부스트를 속도에 적용 (방향 유지)."""
+        now = self.get_clock().now().nanoseconds / 1e9
+        if self._park_stall_pulse_mode:
+            pulse_elapsed = now - self._park_stall_pulse_start_time
+            if pulse_elapsed < self._stall_pulse_duration:
+                boost = self._park_stall_boost * 3.0
+                return speed + (boost if speed > 0 else -boost)
+            else:
+                self._park_stall_pulse_mode = False
+        if self._park_stall_boost > 0:
+            return speed + (self._park_stall_boost if speed > 0 else -self._park_stall_boost)
+        return speed
 
     def _park_detect_control(self):
         """
@@ -1185,6 +1352,11 @@ class MotionControllerNode(Node):
                 self._park_align_phase = 'CENTER'
                 self._park_action = 'MOVE'
                 self._park_action_start_time = 0.0
+                # Phase 전환: stall 추적값 리셋 (angle → offset_x)
+                self._park_stall_boost = 0.0
+                self._park_consecutive_stalls = 0
+                self._park_stall_pulse_mode = False
+                self._park_prev_stall_value = offset_x
                 if hasattr(self, '_park_align_stable_start'):
                     delattr(self, '_park_align_stable_start')
                 self.get_logger().info(
@@ -1214,6 +1386,9 @@ class MotionControllerNode(Node):
                     detail = f'[ANGLE] → SETTLE, a={math.degrees(angle):.1f}deg'
                     return cmd, error_x, error_y, error_yaw, detail
 
+                # Stall check (angle 변화 추적)
+                self._check_park_stall(angle, 0.003)  # ~0.17deg
+
                 # Control: angle -> vx
                 # angle > 0 → 마커가 뒤에 → 후진 필요 → -vx
                 vx = -self.park_align_kp * angle
@@ -1222,8 +1397,9 @@ class MotionControllerNode(Node):
                 if abs(vx) < self.park_min_speed and abs(angle) > self.park_marker_threshold * 0.5:
                     vx = -self.park_min_speed if angle > 0 else self.park_min_speed
 
+                vx = self._apply_park_stall_boost(vx)
                 cmd.linear.x = vx
-                detail = f'[ANGLE] MOVE: a={math.degrees(angle):.1f}deg, vx={vx:.3f}'
+                detail = f'[ANGLE] MOVE: a={math.degrees(angle):.1f}deg, vx={vx:.3f}, boost={self._park_stall_boost:.3f}'
                 return cmd, error_x, error_y, error_yaw, detail
 
         # ========================================
@@ -1237,6 +1413,11 @@ class MotionControllerNode(Node):
                 self._park_align_phase = 'ANGLE'
                 self._park_action = 'MOVE'
                 self._park_action_start_time = 0.0
+                # Phase 전환: stall 추적값 리셋 (offset_x → angle)
+                self._park_stall_boost = 0.0
+                self._park_consecutive_stalls = 0
+                self._park_stall_pulse_mode = False
+                self._park_prev_stall_value = angle
                 if hasattr(self, '_park_align_stable_start'):
                     delattr(self, '_park_align_stable_start')
                 self.get_logger().info(
@@ -1281,6 +1462,9 @@ class MotionControllerNode(Node):
                 detail = f'[CENTER] → SETTLE, off={offset_x*100:.1f}cm'
                 return cmd, error_x, error_y, error_yaw, detail
 
+            # Stall check (offset_x 변화 추적)
+            self._check_park_stall(offset_x, 0.001)  # 1mm
+
             # Control: offset_x -> vx (미터 단위 직접 제어)
             # offset_x > 0 → 마커가 앞에 → 후진 (-vx)
             vx = -self.park_align_kp * offset_x
@@ -1289,8 +1473,9 @@ class MotionControllerNode(Node):
             if abs(vx) < self.park_min_speed and abs(offset_x) > self.park_center_threshold * 0.5:
                 vx = -self.park_min_speed if offset_x > 0 else self.park_min_speed
 
+            vx = self._apply_park_stall_boost(vx)
             cmd.linear.x = vx
-            detail = f'[CENTER] MOVE: off={offset_x*100:.1f}cm, vx={vx:.3f}'
+            detail = f'[CENTER] MOVE: off={offset_x*100:.1f}cm, vx={vx:.3f}, boost={self._park_stall_boost:.3f}'
             return cmd, error_x, error_y, error_yaw, detail
 
         detail = f'No side marker, waiting...'
@@ -1459,6 +1644,9 @@ class MotionControllerNode(Node):
             detail = f'Final → SETTLE, d={distance*100:.1f}cm'
             return cmd, error_x, error_y, error_yaw, detail
 
+        # Stall check (distance 변화 추적)
+        self._check_park_stall(distance, 0.001)  # 1mm
+
         # Control: distance error -> vy (좌측 카메라, 마커가 왼쪽에 있음)
         # error > 0 = too far from marker = need to move left (toward marker, -vy)
         # error < 0 = too close to marker = need to move right (away, +vy)
@@ -1469,9 +1657,10 @@ class MotionControllerNode(Node):
         if abs(vy) < self.park_min_speed and abs(error) > self.park_distance_threshold * 0.5:
             vy = -self.park_min_speed if error > 0 else self.park_min_speed
 
+        vy = self._apply_park_stall_boost(vy)
         cmd.linear.y = vy
 
-        detail = f'Final MOVE: d={distance*100:.1f}cm, target={self.park_target_distance*100:.1f}cm, vy={vy:.3f}'
+        detail = f'Final MOVE: d={distance*100:.1f}cm, target={self.park_target_distance*100:.1f}cm, vy={vy:.3f}, boost={self._park_stall_boost:.3f}'
 
         return cmd, error_x, error_y, error_yaw, detail
 
@@ -1543,6 +1732,7 @@ class MotionControllerNode(Node):
     @staticmethod
     def _clamp(value: float, min_val: float, max_val: float) -> float:
         return max(min_val, min(max_val, value))
+
 
 
 def main(args=None):

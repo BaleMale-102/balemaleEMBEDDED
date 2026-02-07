@@ -20,7 +20,9 @@
       "Bash(ls:*)",
       "Bash(conda env:*)",
       "Bash(tmux has-session:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(chmod:*)",
+      "Bash(source:*)"
     ]
   }
 }
