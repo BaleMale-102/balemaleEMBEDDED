@@ -110,16 +110,19 @@ class MotionControllerNode(Node):
 
         # Parameters - parking
         self.declare_parameter('park_creep_vx', 0.003)
+        self.declare_parameter('park_search_forward_dist', 0.08)   # 전진 탐색 거리 (8cm)
+        self.declare_parameter('park_search_backward_dist', 0.04)  # 후진 탐색 거리 (4cm)
+        self.declare_parameter('park_search_vx', 0.005)            # 탐색 속도 (느리게)
         self.declare_parameter('park_align_kp', 0.02)
-        self.declare_parameter('park_rect_kp', 0.015)
         self.declare_parameter('park_final_kp', 0.02)
+        self.declare_parameter('park_heading_kp', 0.3)          # heading 보정 게인
+        self.declare_parameter('park_max_wz', 0.03)             # heading 보정 최대 wz
         self.declare_parameter('park_max_vx', 0.008)
         self.declare_parameter('park_max_vy', 0.01)
         self.declare_parameter('park_min_speed', 0.003)
         self.declare_parameter('park_marker_threshold', 0.05)  # ~3deg
         self.declare_parameter('park_center_threshold', 0.01)  # 1cm
         self.declare_parameter('park_side_camera_offset_x', 0.0)  # camera offset
-        self.declare_parameter('park_rect_threshold', 0.015)   # 1.5cm
         self.declare_parameter('park_distance_threshold', 0.02)  # 2cm
         self.declare_parameter('park_target_distance', 0.15)   # 15cm
         self.declare_parameter('park_align_forward', 0.03)   # 정렬 후 전진 거리 (3cm)
@@ -169,16 +172,19 @@ class MotionControllerNode(Node):
 
         # Parking parameters
         self.park_creep_vx = self.get_parameter('park_creep_vx').value
+        self.park_search_forward_dist = self.get_parameter('park_search_forward_dist').value
+        self.park_search_backward_dist = self.get_parameter('park_search_backward_dist').value
+        self.park_search_vx = self.get_parameter('park_search_vx').value
         self.park_align_kp = self.get_parameter('park_align_kp').value
-        self.park_rect_kp = self.get_parameter('park_rect_kp').value
         self.park_final_kp = self.get_parameter('park_final_kp').value
+        self.park_heading_kp = self.get_parameter('park_heading_kp').value
+        self.park_max_wz = self.get_parameter('park_max_wz').value
         self.park_max_vx = self.get_parameter('park_max_vx').value
         self.park_max_vy = self.get_parameter('park_max_vy').value
         self.park_min_speed = self.get_parameter('park_min_speed').value
         self.park_marker_threshold = self.get_parameter('park_marker_threshold').value
         self.park_center_threshold = self.get_parameter('park_center_threshold').value
         self.park_side_camera_offset_x = self.get_parameter('park_side_camera_offset_x').value
-        self.park_rect_threshold = self.get_parameter('park_rect_threshold').value
         self.park_distance_threshold = self.get_parameter('park_distance_threshold').value
         self.park_target_distance = self.get_parameter('park_target_distance').value
         self.park_align_forward = self.get_parameter('park_align_forward').value
@@ -240,7 +246,6 @@ class MotionControllerNode(Node):
         # Perception data
         self._tracked_marker = None
         self._side_marker = None
-        self._slot_rect = None
         self._imu_data = None
 
         # Marker tracking state
@@ -253,9 +258,13 @@ class MotionControllerNode(Node):
         self._advance_start_time = 0.0
         self._advance_done_sent = False
 
+        # PARK_DETECT search oscillation state
+        self._park_search_dir = 'FORWARD'  # 'FORWARD' or 'BACKWARD'
+        self._park_search_start_time = 0.0
+        self._park_search_traveled = 0.0  # 이동 거리 추적 (시간 기반)
+
         # Parking done flags
         self._park_align_marker_done_sent = False
-        self._park_align_rect_done_sent = False
         self._park_final_done_sent = False
 
         # ALIGN_TO_MARKER two-phase state (wz → vy)
@@ -307,13 +316,12 @@ class MotionControllerNode(Node):
         try:
             from robot_interfaces.msg import (
                 TrackedMarker, DrivingState,
-                MarkerArray, SlotLineStatus
+                MarkerArray
             )
             self._has_interface = True
             self._TrackedMarker = TrackedMarker
             self._DrivingState = DrivingState
             self._MarkerArray = MarkerArray
-            self._SlotLineStatus = SlotLineStatus
         except ImportError:
             self.get_logger().warn('robot_interfaces not found')
             self._has_interface = False
@@ -337,9 +345,6 @@ class MotionControllerNode(Node):
         # Parking event publishers
         self.pub_park_align_marker_done = self.create_publisher(
             Bool, '/parking/align_marker_done', 10
-        )
-        self.pub_park_align_rect_done = self.create_publisher(
-            Bool, '/parking/align_rect_done', 10
         )
         self.pub_park_final_done = self.create_publisher(
             Bool, '/parking/final_done', 10
@@ -372,12 +377,6 @@ class MotionControllerNode(Node):
                 self._MarkerArray, '/perception/side_markers',
                 self._side_markers_callback, qos_profile_sensor_data
             )
-            # Slot rectangle for parking
-            self.sub_slot_rect = self.create_subscription(
-                self._SlotLineStatus, '/perception/slot_rect',
-                self._slot_rect_callback, qos_profile_sensor_data
-            )
-
         # IMU subscription
         self.sub_imu = self.create_subscription(
             Imu, '/imu/data',
@@ -473,6 +472,11 @@ class MotionControllerNode(Node):
         # Parking states
         elif state == 'PARK_DETECT':
             self._mode = self.MODE_PARK_DETECT
+            if prev_mode != self.MODE_PARK_DETECT:
+                self._park_search_dir = 'FORWARD'
+                self._park_search_start_time = self.get_clock().now().nanoseconds / 1e9
+                self._park_search_traveled = 0.0
+                self.get_logger().info('PARK_DETECT: search oscillation start (FORWARD)')
         elif state == 'PARK_RECOVERY':
             self._mode = self.MODE_PARK_RECOVERY
             if prev_mode != self.MODE_PARK_RECOVERY:
@@ -491,10 +495,6 @@ class MotionControllerNode(Node):
                 self._park_last_stall_check_time = 0.0
                 self._park_prev_stall_value = 0.0
                 self.get_logger().info('PARK_ALIGN_MARKER: Phase 1 (ANGLE) → Phase 2 (CENTER)')
-        elif state == 'PARK_ALIGN_RECT':
-            self._mode = self.MODE_PARK_ALIGN_RECT
-            if prev_mode != self.MODE_PARK_ALIGN_RECT:
-                self._park_align_rect_done_sent = False
         elif state == 'PARK_FINAL':
             self._mode = self.MODE_PARK_FINAL
             if prev_mode != self.MODE_PARK_FINAL:
@@ -578,10 +578,6 @@ class MotionControllerNode(Node):
 
         self._side_marker = best_marker
 
-    def _slot_rect_callback(self, msg):
-        """Handle slot rectangle detection updates."""
-        self._slot_rect = msg
-
     def _imu_callback(self, msg: Imu):
         """Handle IMU data updates."""
         self._imu_data = msg
@@ -630,9 +626,6 @@ class MotionControllerNode(Node):
 
         elif self._mode == self.MODE_PARK_ALIGN_MARKER:
             cmd, error_x, error_y, error_yaw, detail = self._park_align_marker_control()
-
-        elif self._mode == self.MODE_PARK_ALIGN_RECT:
-            cmd, error_x, error_y, error_yaw, detail = self._park_align_rect_control()
 
         elif self._mode == self.MODE_PARK_FINAL:
             cmd, error_x, error_y, error_yaw, detail = self._park_final_control()
@@ -1218,6 +1211,26 @@ class MotionControllerNode(Node):
     # Parking Control Methods
     # ==========================================
 
+    def _get_marker_heading_error(self, marker):
+        """사이드 마커 quaternion에서 heading 에러 추출.
+        카메라 Y축 기준 마커 normal 회전 = 로봇 heading 에러.
+        parallel일 때 ~0, 틀어지면 ±값 (rad)."""
+        q = marker.pose.orientation
+        # 마커 normal의 카메라 XZ 평면 투영에서 heading 추출
+        # R[0][2] = 2(xz + wy), R[2][2] = 1 - 2(x² + y²)
+        r02 = 2.0 * (q.x * q.z + q.w * q.y)
+        r22 = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+        heading_error = math.atan2(r02, -r22)
+        return heading_error
+
+    def _apply_heading_correction(self, cmd, marker):
+        """사이드 마커 기반 heading(wz) 보정 적용."""
+        heading_error = self._get_marker_heading_error(marker)
+        wz = -self.park_heading_kp * heading_error
+        wz = self._clamp(wz, -self.park_max_wz, self.park_max_wz)
+        cmd.angular.z = wz
+        return wz, heading_error
+
     def _check_park_stall(self, current_value: float, threshold: float):
         """
         주차 상태 스톨 감지 및 파워 부스트.
@@ -1272,8 +1285,9 @@ class MotionControllerNode(Node):
 
     def _park_detect_control(self):
         """
-        PARK_DETECT: Creep forward to find slot marker with side camera.
-        Side camera looks right, so marker.angle indicates front/back offset.
+        PARK_DETECT: 전진/후진 왕복하며 slot marker 탐색 (side camera).
+        전진 → forward_dist 도달 → 후진 → backward_dist 도달 → 반복
+        순 이동은 전진 방향이므로 점진적으로 탐색 범위 확장.
         """
         cmd = Twist()
         error_x = 0.0
@@ -1281,9 +1295,29 @@ class MotionControllerNode(Node):
         error_yaw = 0.0
 
         if self._side_marker is None:
-            # No marker - creep forward slowly
-            cmd.linear.x = self.park_creep_vx
-            detail = f'Searching for slot {self._target_slot_id}, creeping forward'
+            # 왕복 탐색: 시간 기반 거리 추적
+            now = self.get_clock().now().nanoseconds / 1e9
+            dt = now - self._park_search_start_time if self._park_search_start_time > 0 else 0.05
+            self._park_search_start_time = now
+
+            speed = self.park_search_vx
+            self._park_search_traveled += speed * dt
+
+            if self._park_search_dir == 'FORWARD':
+                cmd.linear.x = speed
+                if self._park_search_traveled >= self.park_search_forward_dist:
+                    self._park_search_dir = 'BACKWARD'
+                    self._park_search_traveled = 0.0
+                    self.get_logger().info('PARK_DETECT: search direction → BACKWARD')
+            else:  # BACKWARD
+                cmd.linear.x = -speed
+                if self._park_search_traveled >= self.park_search_backward_dist:
+                    self._park_search_dir = 'FORWARD'
+                    self._park_search_traveled = 0.0
+                    self.get_logger().info('PARK_DETECT: search direction → FORWARD')
+
+            detail = (f'Searching slot {self._target_slot_id}, '
+                      f'{self._park_search_dir} {self._park_search_traveled*100:.1f}cm')
         else:
             # Marker found - manager_node will handle state transition
             marker = self._side_marker
@@ -1401,7 +1435,8 @@ class MotionControllerNode(Node):
 
                 vx = self._apply_park_stall_boost(vx)
                 cmd.linear.x = vx
-                detail = f'[ANGLE] MOVE: a={math.degrees(angle):.1f}deg, vx={vx:.3f}, boost={self._park_stall_boost:.3f}'
+                wz, h_err = self._apply_heading_correction(cmd, marker)
+                detail = f'[ANGLE] MOVE: a={math.degrees(angle):.1f}deg, vx={vx:.3f}, wz={wz:.3f}, h={math.degrees(h_err):.1f}deg'
                 return cmd, error_x, error_y, error_yaw, detail
 
         # ========================================
@@ -1477,59 +1512,11 @@ class MotionControllerNode(Node):
 
             vx = self._apply_park_stall_boost(vx)
             cmd.linear.x = vx
-            detail = f'[CENTER] MOVE: off={offset_x*100:.1f}cm, vx={vx:.3f}, boost={self._park_stall_boost:.3f}'
+            wz, h_err = self._apply_heading_correction(cmd, marker)
+            detail = f'[CENTER] MOVE: off={offset_x*100:.1f}cm, vx={vx:.3f}, wz={wz:.3f}, h={math.degrees(h_err):.1f}deg'
             return cmd, error_x, error_y, error_yaw, detail
 
         detail = f'No side marker, waiting...'
-        return cmd, error_x, error_y, error_yaw, detail
-
-    def _park_align_rect_control(self):
-        """
-        PARK_ALIGN_RECT: Align left/right using yellow rectangle center offset.
-
-        Rectangle offset mapping (side camera):
-        - offset_x > 0: rectangle center to the right = car too far left = move right (+vy)
-        - offset_x < 0: rectangle center to the left = car too far right = move left (-vy)
-
-        Control: rect offset -> vy (lateral movement)
-        """
-        cmd = Twist()
-        error_x = 0.0
-        error_y = 0.0
-        error_yaw = 0.0
-
-        if self._park_align_rect_done_sent:
-            return cmd, error_x, error_y, error_yaw, 'Rect align done, waiting'
-
-        if self._slot_rect is None or not self._slot_rect.valid:
-            detail = 'No rectangle detected, waiting...'
-            return cmd, error_x, error_y, error_yaw, detail
-
-        rect = self._slot_rect
-        offset = rect.center_offset_x  # Already in meters
-        error_y = offset
-
-        # Check if aligned
-        if abs(offset) < self.park_rect_threshold:
-            self._publish_park_align_rect_done()
-            self._park_align_rect_done_sent = True
-            detail = f'Rect aligned, offset={offset*100:.1f}cm'
-            return cmd, error_x, error_y, error_yaw, detail
-
-        # Control: offset -> vy
-        # For side camera: positive offset means rect center is right of image center
-        # This means car needs to move right (positive vy in our convention)
-        vy = self.park_rect_kp * offset
-        vy = self._clamp(vy, -self.park_max_vy, self.park_max_vy)
-
-        # Minimum speed
-        if abs(vy) < self.park_min_speed and abs(offset) > self.park_rect_threshold * 0.5:
-            vy = self.park_min_speed if offset > 0 else -self.park_min_speed
-
-        cmd.linear.y = vy
-
-        detail = f'Align rect: offset={offset*100:.1f}cm, vy={vy:.3f}'
-
         return cmd, error_x, error_y, error_yaw, detail
 
     def _park_final_control(self):
@@ -1661,8 +1648,9 @@ class MotionControllerNode(Node):
 
         vy = self._apply_park_stall_boost(vy)
         cmd.linear.y = vy
+        wz, h_err = self._apply_heading_correction(cmd, marker)
 
-        detail = f'Final MOVE: d={distance*100:.1f}cm, target={self.park_target_distance*100:.1f}cm, vy={vy:.3f}, boost={self._park_stall_boost:.3f}'
+        detail = f'Final MOVE: d={distance*100:.1f}cm, vy={vy:.3f}, wz={wz:.3f}, h={math.degrees(h_err):.1f}deg'
 
         return cmd, error_x, error_y, error_yaw, detail
 
@@ -1672,13 +1660,6 @@ class MotionControllerNode(Node):
         msg.data = True
         self.pub_park_align_marker_done.publish(msg)
         self.get_logger().info('Parking marker alignment complete')
-
-    def _publish_park_align_rect_done(self):
-        """Notify parking rectangle alignment complete."""
-        msg = Bool()
-        msg.data = True
-        self.pub_park_align_rect_done.publish(msg)
-        self.get_logger().info('Parking rectangle alignment complete')
 
     def _publish_park_final_done(self):
         """Notify parking final positioning complete."""

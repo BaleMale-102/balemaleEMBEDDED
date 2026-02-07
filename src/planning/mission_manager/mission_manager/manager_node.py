@@ -67,6 +67,7 @@ class MissionManagerNode(Node):
         self.declare_parameter('approach_distance', 0.30)   # Distance to vehicle (m)
         self.declare_parameter('approach_speed', 0.01)       # Movement speed (m/s)
         self.declare_parameter('retreat_from_slot_distance', 0.25)  # 주차 슬롯→길 복귀 거리 (m)
+        self.declare_parameter('retreat_from_slot_speed', 0.02)     # 주차 슬롯→길 복귀 속도 (m/s)
         # Anomaly detection parameters
         self.declare_parameter('anomaly_stop_distance', 30.0)   # Stop if obstacle closer than this (cm)
         self.declare_parameter('anomaly_clear_timeout', 3.0)    # Resume after N seconds without detection
