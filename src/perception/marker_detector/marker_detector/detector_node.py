@@ -164,12 +164,14 @@ class MarkerDetectorNode(Node):
             marker_msg.pose.position.y = float(m.tvec[1])
             marker_msg.pose.position.z = float(m.tvec[2])
 
-            # 쿼터니언 (rvec에서 변환)
-            q = self._rvec_to_quaternion(m.rvec)
-            marker_msg.pose.orientation.x = q[0]
-            marker_msg.pose.orientation.y = q[1]
-            marker_msg.pose.orientation.z = q[2]
-            marker_msg.pose.orientation.w = q[3]
+            # 쿼터니언: 2D yaw 기반 (카메라 pitch 영향 최소화)
+            # m.yaw는 이제 2D 이미지 기반 회전 (마커 코너에서 계산)
+            # Z축 회전만 있는 단순 quaternion으로 변환
+            yaw = m.yaw
+            marker_msg.pose.orientation.x = 0.0
+            marker_msg.pose.orientation.y = 0.0
+            marker_msg.pose.orientation.z = math.sin(yaw / 2.0)
+            marker_msg.pose.orientation.w = math.cos(yaw / 2.0)
 
             marker_msg.distance = float(m.distance)
             marker_msg.angle = float(m.angle)
