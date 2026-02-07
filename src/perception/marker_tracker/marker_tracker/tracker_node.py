@@ -57,6 +57,7 @@ class MarkerTrackerNode(Node):
         self._last_detection_time = 0.0
         self._tracking_start_time = 0.0
         self._is_tracking = False
+        self._last_orientation = None
 
         # Import interfaces
         try:
@@ -140,6 +141,7 @@ class MarkerTrackerNode(Node):
         # Kalman 업데이트
         state = self.kf_position.update(x, z, current_time)
         angle = self.kf_angle.update(marker.angle)
+        self._last_orientation = marker.pose.orientation
 
         # 추적 시작 시간 기록
         if not self._is_tracking:
@@ -221,6 +223,14 @@ class MarkerTrackerNode(Node):
         msg.predicted_pose.position.y = 0.0
         msg.predicted_pose.position.z = state.z + state.vz * 0.5
         msg.predicted_pose.orientation.w = 1.0
+
+        # Orientation (Use last detected if available)
+        if self._last_orientation is not None:
+            msg.pose.orientation = self._last_orientation
+            msg.predicted_pose.orientation = self._last_orientation
+        else:
+            msg.pose.orientation.w = 1.0
+            msg.predicted_pose.orientation.w = 1.0
 
         # 속도
         msg.velocity.x = state.vx

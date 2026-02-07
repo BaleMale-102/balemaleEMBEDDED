@@ -1012,17 +1012,26 @@ class MissionManagerNode(Node):
             return 0.0
 
         target_direction = math.atan2(dy, dx)
+        
+        # Snap target direction to nearest 90 degrees (Grid World)
+        # This ensures we always command exact 0, 90, 180, -90 deg turns
+        target_direction = round(target_direction / (math.pi / 2)) * (math.pi / 2)
+        
         turn_angle = wrap_angle(target_direction - self._current_heading)
 
         self.get_logger().info(
             f'[TURN_ANALYSIS] From:{current_marker} To:{target_marker} | '
             f'CurrHdg:{math.degrees(self._current_heading):.1f}deg | '
-            f'TgtDir:{math.degrees(target_direction):.1f}deg | '
+            f'TgtDir:{math.degrees(target_direction):.1f}deg (Snapped) | '
             f'FinalTurn:{math.degrees(turn_angle):.1f}deg'
         )
 
+        # Handle 180 degree turns (ambiguous) - prefer positive (Left) turn
+        if abs(abs(turn_angle) - math.pi) < 0.1:
+             turn_angle = math.pi
+
         # ±π 경계 경고: turn_angle이 ±170° 초과 시 방향 불안정 위험
-        if abs(turn_angle) > math.radians(170):
+        if abs(turn_angle) > math.radians(170) and abs(turn_angle) < math.radians(179):
             self.get_logger().warn(
                 f'[TURN_ANALYSIS] WARNING: turn_angle={math.degrees(turn_angle):.1f}deg near ±180° boundary! '
                 f'Direction may be unstable. Check heading accuracy.'

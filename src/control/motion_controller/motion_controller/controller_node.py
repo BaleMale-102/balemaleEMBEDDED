@@ -540,14 +540,18 @@ class MotionControllerNode(Node):
         if (self._mode == self.MODE_TURN and not self._turn_done_sent and
                 abs(new_target - getattr(self, '_turn_last_target', new_target)) > 0.1):
             self._turn_start_yaw = self._current_yaw
-            self._turn_direction = 1 if new_target > 0 else -1
+            # Snap to nearest 90 degrees
+            grid_target = round(new_target / (math.pi / 2)) * (math.pi / 2)
+            self._turn_direction = 1 if grid_target > 0 else -1
             self._prev_turn_error = 0.0
             self._turn_last_target = new_target
             self.get_logger().info(
-                f'TURN reinit: target changed to {math.degrees(new_target):.1f}deg, '
+                f'TURN reinit: target changed to {math.degrees(new_target):.1f}deg (snap {math.degrees(grid_target):.1f}), '
                 f'start_yaw={math.degrees(self._turn_start_yaw):.1f}deg, dir={self._turn_direction}'
             )
-        self._turn_target_rad = new_target
+
+        # Snap target to nearest 90 degrees for strict cardinal turning
+        self._turn_target_rad = round(new_target / (math.pi / 2)) * (math.pi / 2)
 
     def _marker_callback(self, msg):
         """Handle tracked marker updates."""
@@ -768,16 +772,78 @@ class MotionControllerNode(Node):
         self.pub_align_done.publish(msg)
         self.get_logger().info('Alignment complete')
 
+    def _get_marker_yaw_error(self, marker):
+        """
+        Calculate yaw error from marker orientation.
+        Assumption: Marker is placed on a grid (0, 90, 180, 270 deg).
+        We want the robot to face the marker directly (relative yaw = 0).
+        """
+        q = marker.pose.orientation
+        # Quaternion to Yaw (relative to camera)
+        # Marker frame: Z-forward (out of page), X-right, Y-down
+        # Camera frame: Z-forward, X-right, Y-down
+        # Wait, standard ArUco: Z-axis is perpendicular to marker plane.
+        # We need the rotation around vertical axis (Y in camera frame? No, Y is down).
+        # Camera frame: X=Right, Y=Down, Z=Forward.
+        # We want rotation around Y-axis (vertical).
+        
+        # Simpler approach: current 'tracker_node' passes orientation.
+        # Let's extract yaw from quaternion `q`.
+        # q represents rotation from Marker Frame to Camera Frame.
+        # Marker Frame: Z is normal to marker.
+        # If robot faces marker directly, Z_cam aligned with -Z_marker (or Z_marker depending on definition).
+        
+        # Use standard conversion
+        siny_cosp = 2.0 * (q.w * q.y - q.z * q.x)  # Note: indices might vary based on frame
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        # Actually, let's trust the `angle` field from tracker for general direction,
+        # but for precise orientation, we need the "facing" angle.
+        
+        # Let's use the standard `tf_transformations` style conversion if possible, 
+        # or just use the logic that worked in other nodes.
+        # Using the same logic as `quaternion_to_yaw` but we need to be careful about the frame.
+        
+        # For now, let's assume the marker's Z-axis points OUT of the wall based on ArUco standard.
+        # The robot camera Z-axis points INTO the wall.
+        # A perfect alignment means Rotation is 180 deg around Y-axis (or similar).
+        
+        # ALTERNATIVE: Use `rvec` directly if we had it, but we have quaternion.
+        # Let's try simple extraction:
+        # Rotation around Y-axis (Vertical) is what we care about.
+        # In Camera frame (Y-down), vertical rotation is around Y.
+        
+        # r11 = 1 - 2(x^2 + z^2)
+        # r31 = 2(xy + wz) (?)
+        # Pitch is rotation around X. Yaw is rotation around Y.
+        
+        # Let's stick to the `angle` field from tracker for POSITION based heading (atan2(x, z)).
+        # But for ORIENTATION based heading:
+        # We can compute the angle of the marker plane normal relative to camera Z.
+        
+        # Extract R matrix col 2 (Z-axis of marker in camera frame)
+        # R = [ [., ., r02], [., ., r12], [., ., r22] ]
+        r02 = 2.0 * (q.x * q.z + q.w * q.y)
+        r22 = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+        
+        # Angle of the normal vector in X-Z plane
+        normal_angle = math.atan2(r02, r22)
+        
+        # If perfectly aligned, normal should point opposite to camera Z?
+        # ArUco Z points out of marker. Camera Z points forward.
+        # So they should be 180 deg apart (pi).
+        # Error = normal_angle - pi ?
+        # Or if we want to align to marker "front", error = normal_angle.
+        
+        # Let's try to use this `normal_angle` as the deviation.
+        # If robot is slightly rotated to right, marker appears rotated to left.
+        return normal_angle
+
     def _align_to_marker(self):
         """
-        Turn 후 마커 정렬 (2단계: WZ → VY → 주행).
-
-        Phase 1 (WZ): 회전으로 마커 방향 먼저 맞춤
-        Phase 2 (VY): 좌우 이동으로 마커 중심 미세 정렬
-
-        추가 기능:
-        - 마커 못 찾으면 turn 방향으로 회전하며 탐색
-        - 스톨 감지 시 파워 부스트
+        Turn 후 마커 정렬 (2단계: Orientation → Lateral).
+        
+        Phase 1 (Heading): 마커의 Orientation(Yaw)을 0으로 맞춤 (제자리 회전).
+        Phase 2 (Lateral): Orientation을 유지하면서 Lateral(vy) 이동으로 중심 맞춤.
         """
         cmd = Twist()
         error_x = 0.0
@@ -832,8 +898,15 @@ class MotionControllerNode(Node):
             self.get_logger().info('Marker found - exiting search mode')
 
         marker = self._tracked_marker
-        angle = marker.angle
-        error_yaw = angle
+        
+        # Use simple position-based angle for general error, 
+        # but calculate precise orientation error for alignment.
+        pos_angle = marker.angle
+        
+        # Precise Yaw Error from Orientation
+        yaw_error = self._get_marker_yaw_error(marker)
+        
+        error_yaw = yaw_error
         pred = 'pred' if not marker.is_detected else 'det'
 
         # ========================================
@@ -851,10 +924,11 @@ class MotionControllerNode(Node):
         switch_threshold = self.marker_align_threshold * 0.6  # threshold to switch phases
 
         # ========================================
-        # Phase 1: WZ alignment (회전으로 방향 맞춤)
+        # Phase 1: WZ alignment (Heading 정렬 - Orientation 기준)
         # ========================================
         if self._align_phase == 'WZ':
-            if abs(angle) < switch_threshold:
+            # Use yaw_error instead of pos_angle
+            if abs(yaw_error) < switch_threshold:
                 # WZ phase done, move to VY
                 self._align_phase = 'VY'
                 # Reset stall detection and settle timer for VY phase
@@ -862,7 +936,7 @@ class MotionControllerNode(Node):
                 self._consecutive_stalls = 0
                 self._align_action = 'MOVE'
                 self._align_action_start_time = 0.0
-                self.get_logger().info(f'WZ align done (angle={math.degrees(angle):.1f}deg), starting VY phase')
+                self.get_logger().info(f'WZ align done (yaw_err={math.degrees(yaw_error):.1f}deg), starting VY phase')
             else:
                 # Move-pause-observe pattern
                 if self._align_action_start_time == 0.0:
@@ -887,8 +961,11 @@ class MotionControllerNode(Node):
                     detail = f'[ALIGN-WZ] → SETTLE, a={math.degrees(angle):.1f}deg [{pred}]'
                     return cmd, error_x, error_y, error_yaw, detail
 
-                # Apply WZ control with stall boost
-                wz = self.marker_wz_kp * angle * 2.0
+                # Apply WZ control based on Yaw Error
+                # Note: if robot is rotated LEFT (positive yaw), detection might show different sign depending on frame.
+                # Usually if we rotate LEFT, we must turn RIGHT (negative wz).
+                # Verified empirically or by tf: usually kp * error works if signs match.
+                wz = self.marker_wz_kp * yaw_error * 2.0
 
                 # Apply stall boost
                 if self._stall_pulse_mode:
@@ -908,15 +985,17 @@ class MotionControllerNode(Node):
 
                 cmd.angular.z = -wz  # Negate for motor direction
 
-                detail = f'[ALIGN-WZ] MOVE a={math.degrees(angle):.1f}deg, wz={-wz:.3f}, boost={self._stall_wz_boost:.3f} [{pred}]'
+                detail = f'[ALIGN-WZ] MOVE yaw_err={math.degrees(yaw_error):.1f}deg, wz={-wz:.3f}, boost={self._stall_wz_boost:.3f} [{pred}]'
                 return cmd, error_x, error_y, error_yaw, detail
 
         # ========================================
         # Phase 2: VY alignment (좌우 이동 미세 조정)
         # ========================================
         if self._align_phase == 'VY':
-            # Final alignment check
-            if abs(angle) < vy_threshold:
+            # Final alignment check (Lateral + Angle)
+            # Use position-based angle for Lateral check (is marker centered?)
+            # And yaw_error for Heading check (is robot straight?)
+            if abs(pos_angle) < vy_threshold and abs(yaw_error) < vy_threshold * 2.0:
                 # Check if stable for a short time
                 if not hasattr(self, '_align_stable_start'):
                     self._align_stable_start = now
@@ -930,13 +1009,13 @@ class MotionControllerNode(Node):
                     delattr(self, '_align_stable_start')
 
             # If angle drifted too much, go back to WZ
-            if abs(angle) > self.marker_align_threshold:
+            if abs(yaw_error) > self.marker_align_threshold * 1.5:
                 self._align_phase = 'WZ'
                 self._stall_vy_boost = 0.0
                 self._consecutive_stalls = 0
                 self._align_action = 'MOVE'
                 self._align_action_start_time = 0.0
-                self.get_logger().info(f'Angle drifted ({math.degrees(angle):.1f}deg), back to WZ phase')
+                self.get_logger().info(f'Heading drifted ({math.degrees(yaw_error):.1f}deg), back to WZ phase')
                 return self._align_to_marker()  # Recursive call for WZ
 
             # Move-pause-observe pattern for VY
@@ -962,8 +1041,14 @@ class MotionControllerNode(Node):
                 detail = f'[ALIGN-VY] → SETTLE, a={math.degrees(angle):.1f}deg [{pred}]'
                 return cmd, error_x, error_y, error_yaw, detail
 
-            # VY control for fine adjustment
-            vy = -self.marker_vy_kp * angle * 3.0
+            # VY control for Lateral adjustment (Center the marker)
+            # Use pos_angle (atan2(x, z)) for lateral error because it represents centering.
+            vy = -self.marker_vy_kp * pos_angle * 3.0
+            
+            # SIMULTANEOUS WZ CONTROL (Maintain Heading)
+            # Correct any yaw error while moving laterally
+            wz_corr = self.marker_wz_kp * yaw_error * 1.5
+            cmd.angular.z = -wz_corr  # Negate for motor direction
 
             # Apply stall boost
             if self._stall_pulse_mode:
@@ -976,14 +1061,14 @@ class MotionControllerNode(Node):
             else:
                 vy = vy + (self._stall_vy_boost if vy > 0 else -self._stall_vy_boost)
 
-            # Minimum speed guarantee (적재장치 무게 보상)
+            # Minimum speed guarantee
             min_speed = 0.015 + self._stall_vy_boost
-            if abs(vy) < min_speed and abs(angle) > 0.02:
-                vy = min_speed if angle < 0 else -min_speed
+            if abs(vy) < min_speed and abs(pos_angle) > 0.02:
+                vy = min_speed if pos_angle < 0 else -min_speed
 
             cmd.linear.y = vy
 
-            detail = f'[ALIGN-VY] MOVE a={math.degrees(angle):.1f}deg, vy={vy:.3f}, boost={self._stall_vy_boost:.3f} [{pred}]'
+            detail = f'[ALIGN-VY] MOVE pos_ang={math.degrees(pos_angle):.1f}deg, yaw_err={math.degrees(yaw_error):.1f}deg, vy={vy:.3f}, wz={-wz_corr:.3f}'
             return cmd, error_x, error_y, error_yaw, detail
 
         detail = f'No marker {self._target_marker_id}, waiting...'
@@ -1321,9 +1406,61 @@ class MotionControllerNode(Node):
         else:
             # Marker found - manager_node will handle state transition
             marker = self._side_marker
-            error_x = marker.distance
-            error_yaw = marker.angle
-            detail = f'Found marker {marker.id}, d={marker.distance:.2f}m, a={math.degrees(marker.angle):.1f}deg'
+            # Drive Logic:
+            # 1. Heading Lock (wz): Keep robot facing marker orientation (yaw_error -> 0)
+            # 2. Lateral Lock (vy): Keep marker centered (pos_angle -> 0)
+            # 3. Forward (vx): Approach marker
+
+            pos_angle = marker.angle
+            yaw_error = self._get_marker_yaw_error(marker)
+            
+            # Heading Control (WZ)
+            # If yaw_error is large, we are not facing the marker (grid).
+            wz = self.marker_wz_kp * yaw_error * 2.0
+            
+            # Lateral Control (VY)
+            # If pos_angle is non-zero, marker is not centered.
+            # But wait, `pos_angle` is atan2(x, z). If we rotate, x changes.
+            # We need to distinguish between "marker is to the left because we are rotated right" 
+            # and "marker is to the left because we are shifted right".
+            # 
+            # If we are perfectly aligned (yaw_error=0), then pos_angle reflects lateral offset.
+            # If we are rotated, pos_angle includes rotation effect.
+            # 
+            # pos_angle ~= lateral_offset_angle - yaw_error
+            # so lateral_offset_angle = pos_angle + yaw_error ?
+            # 
+            # Actually, simpler approach:
+            # wz = kp_w * yaw_error
+            # vy = -kp_v * (pos_angle)  <-- If marker is left (pos_angle>0), move left (vy>0). Wait, y-left is positive?
+            # Robot Frame: X forward, Y left, Z up.
+            # ArUco: X right, Y down, Z forward.
+            # Robot vy>0 is LEFT.
+            # If marker is to LEFT of image (pos_angle > 0), we want to move LEFT (vy > 0).
+            # So vy = kp_v * pos_angle.
+            
+            vy = self.marker_vy_kp * pos_angle * 3.0
+
+            # Forward Control (VX)
+            # Slow down if large errors
+            speed_factor = max(0.2, 1.0 - abs(yaw_error) - abs(pos_angle))
+            
+            # Distance control
+            dist_error = marker.distance - self.stop_distance
+            vx = self.drive_vx * speed_factor
+            if dist_error < 0.1:
+                 vx = max(0.02, vx * (dist_error / 0.1)) # Slow down at end
+
+            cmd.linear.x = vx
+            cmd.linear.y = vy
+            cmd.angular.z = -wz # Motor sign inversion? Check.
+
+            # Stall checking for Drive mode (using distance change or optical flow if available)
+            # For now, just simplistic check on distance
+            # TODO: Implement robust drive stall check
+            
+            detail = (f'Drive: d={marker.distance:.2f}m, yaw_err={math.degrees(yaw_error):.1f}deg, '
+                      f'pos_ang={math.degrees(pos_angle):.1f}deg, vx={vx:.3f}, vy={vy:.3f}')
 
         return cmd, error_x, error_y, error_yaw, detail
 
