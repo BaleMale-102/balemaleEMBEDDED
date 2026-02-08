@@ -319,8 +319,9 @@ class MotionControllerNode(Node):
         self._park_align_marker_done_sent = False
         self._park_final_done_sent = False
 
-        # ALIGN_TO_MARKER two-phase state (wz → vy)
-        self._align_phase = 'WZ'  # 'WZ' first, then 'VY'
+        # ALIGN_TO_MARKER two-phase state
+        # 'VY' = HEADING phase (marker_yaw → wz), 'WZ' = LATERAL phase (angle → vy)
+        self._align_phase = 'VY'  # HEADING first, then LATERAL
         self._align_wz_done = False
         # Move-pause-observe pattern for alignment
         self._align_action = 'MOVE'  # 'MOVE' or 'SETTLE'
@@ -515,8 +516,8 @@ class MotionControllerNode(Node):
         elif state == 'ALIGN_TO_MARKER':
             self._mode = self.MODE_ALIGN
             if prev_mode != self.MODE_ALIGN:
-                # Reset two-phase alignment state (WZ first, then VY)
-                self._align_phase = 'WZ'
+                # Reset: HEADING phase ('VY') first, then LATERAL ('WZ')
+                self._align_phase = 'VY'
                 self._align_wz_done = False
                 # Reset stall detection
                 self._stall_vy_boost = 0.0
@@ -1053,11 +1054,10 @@ class MotionControllerNode(Node):
         # Phase 1: HEADING alignment (wz 제어)
         # 마커의 marker_yaw가 0이 되도록 로봇을 회전
         # ========================================
-        if self._align_phase == 'VY':  # 레거시 이름 유지, 실제로는 HEADING phase
+        if self._align_phase == 'VY':  # HEADING phase
             if abs(marker_yaw) < heading_threshold:
                 # Heading 정렬 완료, LATERAL phase로 전환
-                self._align_phase = 'WZ'  # 레거시 이름 유지, 실제로는 LATERAL phase
-                self._align_vy_done = True
+                self._align_phase = 'WZ'  # LATERAL phase로 전환
                 # Heading lock 설정
                 self._heading_locked = True
                 self._locked_heading = self._current_yaw
@@ -1100,7 +1100,7 @@ class MotionControllerNode(Node):
         # 마커가 카메라 중앙에 오도록 vy 이동
         # 동시에 heading이 틀어지지 않도록 wz 보정
         # ========================================
-        if self._align_phase == 'WZ':  # 레거시 이름 유지, 실제로는 LATERAL phase
+        if self._align_phase == 'WZ':  # LATERAL phase
             # 최종 정렬 확인 (heading + lateral 모두 정렬)
             if abs(angle) < final_threshold and abs(marker_yaw) < final_threshold:
                 # Check if stable for a short time
@@ -1274,9 +1274,7 @@ class MotionControllerNode(Node):
         d_error = error_yaw - self._prev_turn_error
         self._prev_turn_error = error_yaw
 
-        wz = self.turn_kp * error_yaw + self.turn_kd * d_error
-
-        # Apply stall boost
+        # Stall detection (boost 값 업데이트, wz에는 아래에서 적용)
         if now - self._last_stall_check_time >= self._stall_check_interval:
             yaw_change = abs(self._current_yaw - self._prev_yaw_for_stall)
             if yaw_change > math.pi:
@@ -1557,71 +1555,6 @@ class MotionControllerNode(Node):
 
         detail = (f'Align marker: angle={math.degrees(angle):.1f}deg, '
                   f'yaw={math.degrees(marker_yaw):.1f}deg, vx={cmd.linear.x:.3f}, wz={cmd.angular.z:.3f}')
-
-        return cmd, error_x, error_y, error_yaw, detail
-
-    def _park_align_rect_control(self):
-        """
-        PARK_ALIGN_RECT: Align left/right using yellow rectangle with heading lock.
-
-        Orientation-based Rect Alignment:
-        - rect offset → vy (좌우 정렬)
-        - marker_yaw → wz (heading 유지)
-
-        Rectangle offset mapping (side camera):
-        - offset_x > 0: rectangle center to the right = car too far left = move right (+vy)
-        - offset_x < 0: rectangle center to the left = car too far right = move left (-vy)
-        """
-        cmd = Twist()
-        error_x = 0.0
-        error_y = 0.0
-        error_yaw = 0.0
-
-        if self._park_align_rect_done_sent:
-            return cmd, error_x, error_y, error_yaw, 'Rect align done, waiting'
-
-        if self._slot_rect is None or not self._slot_rect.valid:
-            detail = 'No rectangle detected, waiting...'
-            return cmd, error_x, error_y, error_yaw, detail
-
-        rect = self._slot_rect
-        offset = rect.center_offset_x  # Already in meters
-        error_y = offset
-
-        # 마커가 있으면 heading 정보 사용
-        marker_yaw = self._side_marker_yaw if self._side_marker is not None else 0.0
-        error_yaw = marker_yaw
-
-        # Check if aligned
-        if abs(offset) < self.park_rect_threshold:
-            self._publish_park_align_rect_done()
-            self._park_align_rect_done_sent = True
-            detail = f'Rect aligned, offset={offset*100:.1f}cm'
-            return cmd, error_x, error_y, error_yaw, detail
-
-        # ========================================
-        # 좌우 정렬 (vy 제어)
-        # ========================================
-        vy = self.park_rect_kp * offset
-        vy = self._clamp(vy, -self.park_max_vy, self.park_max_vy)
-
-        # Minimum speed
-        if abs(vy) < self.park_min_speed and abs(offset) > self.park_rect_threshold * 0.5:
-            vy = self.park_min_speed if offset > 0 else -self.park_min_speed
-
-        cmd.linear.y = vy
-
-        # ========================================
-        # Heading 유지 (wz 보정)
-        # ========================================
-        if abs(marker_yaw) > self.park_marker_threshold * 0.5:
-            wz = self.park_align_kp * marker_yaw * 0.8
-            wz = self._clamp(wz, -self.max_wz * 0.3, self.max_wz * 0.3)
-            cmd.angular.z = -wz  # 모터 방향 반전
-
-        detail = (f'Align rect: offset={offset*100:.1f}cm, yaw={math.degrees(marker_yaw):.1f}deg, '
-                  f'vy={vy:.3f}, wz={cmd.angular.z:.3f}')
-
 
         return cmd, error_x, error_y, error_yaw, detail
 
