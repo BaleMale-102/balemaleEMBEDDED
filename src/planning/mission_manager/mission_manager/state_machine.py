@@ -2,9 +2,14 @@
 """
 state_machine.py - Mission State Machine
 
+서버에서 전체 경로 제공 (origin → parking area → home).
+parking_road_marker에서 경로를 분할하여 주차 미션 수행 후 남은 경로로 복귀.
+
 Full mission FSM for autonomous parking robot:
-  입고(PARK): WAIT_VEHICLE -> RECOGNIZE -> LOAD -> DRIVE -> PARK_* -> UNLOAD -> RETURN_HOME -> WAIT_VEHICLE
-  출차(EXIT): DRIVE -> PARK_* -> LOAD -> RETURN_HOME -> UNLOAD -> WAIT_VEHICLE
+  입고(PARK): WAIT_VEHICLE -> RECOGNIZE -> LOAD -> DRIVE(pre) -> PARK_* -> UNLOAD
+              -> RETURN_HOME -> RETREAT_FROM_SLOT -> TURNING -> DRIVE(post) -> WAIT_VEHICLE
+  출차(EXIT): DRIVE(pre) -> PARK_* -> LOAD -> RETURN_HOME -> RETREAT_FROM_SLOT
+              -> TURNING -> DRIVE(post) -> UNLOAD -> WAIT_VEHICLE
 
 Parking sub-states:
   PARK_DETECT -> PARK_ALIGN_MARKER -> PARK_ALIGN_RECT -> PARK_FINAL
@@ -146,7 +151,8 @@ class RecognitionContext:
     plate_number: str = ''            # Detected plate number
     plate_verified: bool = False      # Server verified the plate
     assigned_slot_id: int = -1        # Server-assigned parking slot
-    assigned_waypoints: List[int] = None  # Waypoints to reach slot
+    assigned_waypoints: List[int] = None  # Full path from server
+    assigned_parking_road_marker: int = -1  # Computed parking road marker
     query_sent: bool = False          # Query sent to server
     response_received: bool = False   # Response received from server
 
@@ -164,6 +170,12 @@ class MissionContext:
     current_waypoint_idx: int = 0
     task_id: str = ''
     task_type: str = ''
+
+    # Full path (server round-trip: origin → destination → home)
+    full_path: List[int] = None                    # Complete server path
+    parking_road_marker: int = -1                  # Road marker where parking happens
+    post_parking_waypoints: List[int] = None       # Waypoints after parking (return path)
+    pre_parking_heading: float = 0.0               # Heading saved before parking
 
     # State tracking
     current_marker_id: int = -1
@@ -191,6 +203,10 @@ class MissionContext:
     def __post_init__(self):
         if self.waypoint_ids is None:
             self.waypoint_ids = []
+        if self.full_path is None:
+            self.full_path = []
+        if self.post_parking_waypoints is None:
+            self.post_parking_waypoints = []
 
     def reset(self):
         """Reset context for new mission."""
@@ -199,6 +215,10 @@ class MissionContext:
         self.current_waypoint_idx = 0
         self.task_id = ''
         self.task_type = ''
+        self.full_path = []
+        self.parking_road_marker = -1
+        self.post_parking_waypoints = []
+        self.pre_parking_heading = 0.0
         self.current_marker_id = -1
         self.turn_target_rad = 0.0
         self.state_enter_time = 0.0
@@ -335,19 +355,34 @@ class StateMachine:
         self._change_state(MissionState.WAIT_VEHICLE)
 
     def start_mission(self, waypoint_ids: List[int], final_goal_id: int,
-                      task_id: str = '', task_type: str = ''):
-        """Start a navigation mission (from server command or manual)."""
+                      task_id: str = '', task_type: str = '',
+                      parking_road_marker: int = -1):
+        """Start a navigation mission (from server command or manual).
+
+        For parking missions, waypoint_ids is the full round-trip path from server
+        (origin → parking area → home). The path is split at parking_road_marker:
+          - pre-parking: drive to parking road marker
+          - post-parking: drive from parking road marker to home (after parking mission)
+
+        Args:
+            waypoint_ids: Full path (road markers only) or legacy waypoints
+            final_goal_id: Target parking slot ID (16-27) or final marker
+            task_id: Unique task identifier
+            task_type: 'PARK', 'EXIT', 'REROUTE', etc.
+            parking_road_marker: Road marker where parking happens (computed by manager)
+        """
         # 재할당 시 현재 위치 보존 (초기 TURNING 용)
         prev_marker_id = self._context.current_marker_id
 
         self._context.reset()
-        self._context.waypoint_ids = waypoint_ids
+        self._context.full_path = list(waypoint_ids) if waypoint_ids else []
         self._context.final_goal_id = final_goal_id
         self._context.task_id = task_id
         self._context.task_type = task_type
 
         # If final goal is a parking slot, store it and set task_type
-        if get_slot_zone(final_goal_id) is not None:
+        is_parking_slot = get_slot_zone(final_goal_id) is not None
+        if is_parking_slot:
             self._context.parking.target_slot_id = final_goal_id
             if not task_type:
                 self._context.task_type = 'PARK'
@@ -356,10 +391,33 @@ class StateMachine:
         if task_type == 'EXIT':
             self._context.is_full_mission = True
 
+        # Full-path splitting for parking missions
+        if is_parking_slot and parking_road_marker >= 0 and waypoint_ids:
+            self._context.parking_road_marker = parking_road_marker
+
+            # Find parking road marker in full path
+            try:
+                parking_idx = waypoint_ids.index(parking_road_marker)
+            except ValueError:
+                parking_idx = len(waypoint_ids) - 1
+
+            # Split: pre-parking includes parking marker (skip first = current position)
+            # post-parking: markers after parking marker leading home
+            pre_parking = list(waypoint_ids[1:parking_idx + 1])
+            post_parking = list(waypoint_ids[parking_idx + 1:])
+
+            self._context.waypoint_ids = pre_parking
+            self._context.post_parking_waypoints = post_parking
+            # final_goal_id stays as slot ID (existing PARK_DETECT logic uses it)
+        else:
+            # Non-parking mission or legacy format: use waypoints directly
+            self._context.waypoint_ids = list(waypoint_ids) if waypoint_ids else []
+
         # waypoint 없는 PARK/EXIT → 바로 PARK_DETECT (side camera 사용)
-        if not waypoint_ids and self._context.task_type in ('PARK', 'DROPOFF', 'EXIT'):
+        effective_waypoints = self._context.waypoint_ids
+        if not effective_waypoints and self._context.task_type in ('PARK', 'DROPOFF', 'EXIT'):
             self._change_state(MissionState.PARK_DETECT)
-        elif prev_marker_id >= 0 and waypoint_ids:
+        elif prev_marker_id >= 0 and effective_waypoints:
             # 이전 위치 알고 있음 → 첫 waypoint 방향으로 TURNING 후 DRIVE
             # (RETURN_HOME과 동일한 idx=-1 패턴)
             self._context.current_marker_id = prev_marker_id
@@ -369,14 +427,34 @@ class StateMachine:
             self._change_state(MissionState.DRIVE)
 
     def start_full_mission(self, plate_number: str, assigned_slot_id: int,
-                           waypoint_ids: List[int], task_id: str = ''):
-        """Start full mission after plate verification (called after RECOGNIZE)."""
-        self._context.waypoint_ids = waypoint_ids
+                           waypoint_ids: List[int], task_id: str = '',
+                           parking_road_marker: int = -1):
+        """Start full mission after plate verification (called after RECOGNIZE).
+
+        waypoint_ids is the full round-trip path from server.
+        """
+        self._context.full_path = list(waypoint_ids) if waypoint_ids else []
         self._context.final_goal_id = assigned_slot_id
         self._context.parking.target_slot_id = assigned_slot_id
         self._context.task_id = task_id
         self._context.task_type = 'PARK'
         self._context.is_full_mission = True
+
+        # Full-path splitting at parking road marker
+        if parking_road_marker >= 0 and waypoint_ids:
+            self._context.parking_road_marker = parking_road_marker
+            try:
+                parking_idx = waypoint_ids.index(parking_road_marker)
+            except ValueError:
+                parking_idx = len(waypoint_ids) - 1
+
+            pre_parking = list(waypoint_ids[1:parking_idx + 1])
+            post_parking = list(waypoint_ids[parking_idx + 1:])
+            self._context.waypoint_ids = pre_parking
+            self._context.post_parking_waypoints = post_parking
+        else:
+            # Legacy: use waypoints directly
+            self._context.waypoint_ids = list(waypoint_ids) if waypoint_ids else []
 
         # Move to LOAD state
         self._change_state(MissionState.LOAD)
@@ -439,12 +517,14 @@ class StateMachine:
         """Notify that plate query was sent to server."""
         self._context.recognition.query_sent = True
 
-    def notify_plate_response(self, verified: bool, slot_id: int, waypoints: List[int], message: str = ''):
+    def notify_plate_response(self, verified: bool, slot_id: int, waypoints: List[int],
+                              message: str = '', parking_road_marker: int = -1):
         """Notify plate verification response from server."""
         self._context.recognition.response_received = True
         self._context.recognition.plate_verified = verified
         self._context.recognition.assigned_slot_id = slot_id
         self._context.recognition.assigned_waypoints = waypoints
+        self._context.recognition.assigned_parking_road_marker = parking_road_marker
         if not verified:
             self._context.error_message = message if message else 'Plate not verified'
 
@@ -511,19 +591,30 @@ class StateMachine:
         elif new_state == MissionState.UNLOAD:
             self._context.loader.unload_complete = False
         elif new_state == MissionState.RETURN_HOME:
-            # 왔던 길 역순으로 복귀
-            # 갈 때: [0, 1, 5] → slot 17 (current_marker_id=5)
-            # 올 때: RETREAT_FROM_SLOT → TURNING(180°) → DRIVE [1] → 0(home)
-            original_waypoints = self._context.waypoint_ids.copy()
-            reversed_wps = list(reversed(original_waypoints))
-            # 현재 위치 마커와 같은 첫 waypoint 스킵 (이미 그 마커에 있음)
-            if reversed_wps and reversed_wps[0] == self._context.current_marker_id:
-                reversed_wps = reversed_wps[1:]
-            # Home marker는 final_goal이므로 waypoints에서 제거 (중복 방지)
-            self._context.final_goal_id = HOME_MARKER_ID
-            if reversed_wps and reversed_wps[-1] == HOME_MARKER_ID:
-                reversed_wps = reversed_wps[:-1]
-            self._context.waypoint_ids = reversed_wps
+            # 서버에서 준 전체 경로의 post-parking 부분으로 복귀
+            if self._context.post_parking_waypoints:
+                # 새 방식: 서버가 전체 경로를 줌 (origin → slot → home)
+                return_wps = list(self._context.post_parking_waypoints)
+                # 현재 위치 마커(parking_road_marker)와 같은 첫 waypoint 스킵
+                if return_wps and return_wps[0] == self._context.current_marker_id:
+                    return_wps = return_wps[1:]
+                if return_wps and return_wps[0] == self._context.parking_road_marker:
+                    return_wps = return_wps[1:]
+                # Home marker는 final_goal이므로 waypoints에서 제거 (중복 방지)
+                self._context.final_goal_id = HOME_MARKER_ID
+                if return_wps and return_wps[-1] == HOME_MARKER_ID:
+                    return_wps = return_wps[:-1]
+                self._context.waypoint_ids = return_wps
+            else:
+                # Fallback: 왔던 길 역순으로 복귀 (기존 방식)
+                original_waypoints = self._context.waypoint_ids.copy()
+                reversed_wps = list(reversed(original_waypoints))
+                if reversed_wps and reversed_wps[0] == self._context.current_marker_id:
+                    reversed_wps = reversed_wps[1:]
+                self._context.final_goal_id = HOME_MARKER_ID
+                if reversed_wps and reversed_wps[-1] == HOME_MARKER_ID:
+                    reversed_wps = reversed_wps[:-1]
+                self._context.waypoint_ids = reversed_wps
             # idx=-1: RETREAT_FROM_SLOT 후 TURNING에서 _setup_turn(next_idx=0) 사용
             self._context.current_waypoint_idx = -1
             self._context.marker_reached = False
@@ -626,11 +717,32 @@ class StateMachine:
 
         if ctx.response_received:
             if ctx.plate_verified and ctx.assigned_slot_id >= 0:
-                # Server verified - approach vehicle then load
-                self._context.waypoint_ids = ctx.assigned_waypoints
-                self._context.final_goal_id = ctx.assigned_slot_id
-                self._context.parking.target_slot_id = ctx.assigned_slot_id
+                # Server verified - setup path and load
+                full_path = list(ctx.assigned_waypoints)
+                slot_id = ctx.assigned_slot_id
+                prm = ctx.assigned_parking_road_marker
+
+                self._context.full_path = full_path
+                self._context.final_goal_id = slot_id
+                self._context.parking.target_slot_id = slot_id
                 self._context.task_type = 'PARK'
+                self._context.is_full_mission = True
+
+                # Full-path splitting at parking road marker
+                if prm >= 0 and full_path:
+                    self._context.parking_road_marker = prm
+                    try:
+                        parking_idx = full_path.index(prm)
+                    except ValueError:
+                        parking_idx = len(full_path) - 1
+                    pre_parking = list(full_path[1:parking_idx + 1])
+                    post_parking = list(full_path[parking_idx + 1:])
+                    self._context.waypoint_ids = pre_parking
+                    self._context.post_parking_waypoints = post_parking
+                else:
+                    # Legacy fallback
+                    self._context.waypoint_ids = full_path
+
                 # return MissionState.APPROACH_VEHICLE  # 주석처리: 접근 이동 비활성화
                 return MissionState.LOAD
             else:
@@ -687,8 +799,8 @@ class StateMachine:
         return None
 
     def _return_home_transition(self) -> Optional[MissionState]:
-        """Start turning and drive home (RETREAT_FROM_SLOT disabled)."""
-        return MissionState.TURNING
+        """RETREAT_FROM_SLOT로 슬롯에서 빠져나온 후 TURNING → DRIVE로 복귀."""
+        return MissionState.RETREAT_FROM_SLOT
 
     def _retreat_from_slot_transition(self) -> Optional[MissionState]:
         """고정 거리 +vy 평행이동 완료 시 TURNING."""

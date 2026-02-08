@@ -36,7 +36,7 @@ from std_msgs.msg import String, Int32, Bool, Float32
 
 from .state_machine import (
     StateMachine, MissionState, HOME_MARKER_ID,
-    get_slot_zone, is_same_zone, get_slot_direction
+    get_slot_zone, is_same_zone, get_slot_direction,
 )
 
 
@@ -137,11 +137,15 @@ class MissionManagerNode(Node):
         # Load marker map
         self._marker_positions = {}
         self._marker_yaw = {}
+        self._slot_road_markers = {}  # slot_id -> [road_marker_ids] (x좌표 매칭)
         self._load_marker_map()
 
         # State machine
         self.fsm = StateMachine(timeouts=timeouts, delays=delays)
         self.fsm.set_state_change_callback(self._on_state_change)
+
+        # 로봇은 항상 marker 0에서 부팅 → 초기 위치 설정
+        self.fsm.context.current_marker_id = HOME_MARKER_ID
 
         # Heading tracking
         self._previous_marker_id = -1
@@ -292,14 +296,20 @@ class MissionManagerNode(Node):
     def _task_cmd_callback(self, msg):
         """Handle mission command from server."""
         if msg.command.upper() == 'START':
+            waypoints = list(msg.waypoint_ids)
+            goal = msg.final_goal_id
+            # Compute parking road marker for slot goals
+            prm = self._find_parking_road_marker(waypoints, goal)
             self.get_logger().info(
-                f'Starting mission: waypoints={msg.waypoint_ids}, goal={msg.final_goal_id}'
+                f'Starting mission: path={waypoints}, goal={goal}, '
+                f'parking_marker={prm}'
             )
             self.fsm.start_mission(
-                waypoint_ids=list(msg.waypoint_ids),
-                final_goal_id=msg.final_goal_id,
+                waypoint_ids=waypoints,
+                final_goal_id=goal,
                 task_id=msg.task_id,
-                task_type=msg.task_type
+                task_type=msg.task_type,
+                parking_road_marker=prm,
             )
         elif msg.command.upper() == 'STOP':
             self.fsm.cancel_mission()
@@ -425,15 +435,21 @@ class MissionManagerNode(Node):
         if self.fsm.state != MissionState.RECOGNIZE:
             return
 
+        waypoints = list(msg.waypoint_ids)
+        slot_id = msg.assigned_slot_id
+        prm = self._find_parking_road_marker(waypoints, slot_id)
+
         self.get_logger().info(
-            f'Plate response: verified={msg.verified}, slot={msg.assigned_slot_id}'
+            f'Plate response: verified={msg.verified}, slot={slot_id}, '
+            f'path={waypoints}, parking_marker={prm}'
         )
 
         self.fsm.notify_plate_response(
             verified=msg.verified,
-            slot_id=msg.assigned_slot_id,
-            waypoints=list(msg.waypoint_ids),
-            message=msg.message
+            slot_id=slot_id,
+            waypoints=waypoints,
+            message=msg.message,
+            parking_road_marker=prm,
         )
 
         self._plate_query_pending = False
@@ -620,14 +636,19 @@ class MissionManagerNode(Node):
             self.fsm.start_waiting()
             self.get_logger().info('Started waiting for vehicle')
         elif cmd.startswith('START_FULL'):
-            # START_FULL 1,3,9 17 - waypoints then slot
+            # START_FULL 0,1,5,1,0 17 - full round-trip path + slot ID
             parts = cmd.split()
             if len(parts) >= 3:
                 waypoints = [int(x) for x in parts[1].split(',')]
                 slot_id = int(parts[2])
-                self.fsm.start_mission(waypoints, slot_id, 'test_full', 'PARK')
+                prm = self._find_parking_road_marker(waypoints, slot_id)
+                self.fsm.start_mission(waypoints, slot_id, 'test_full', 'PARK',
+                                       parking_road_marker=prm)
                 self.fsm.context.is_full_mission = True
-                self.get_logger().info(f'Full mission started: {waypoints} -> slot {slot_id} (is_full_mission=True)')
+                self.get_logger().info(
+                    f'Full mission started: path={waypoints}, slot={slot_id}, '
+                    f'parking_marker={prm} (is_full_mission=True)'
+                )
         elif cmd.startswith('START_PARK'):
             parts = cmd.split()
             if len(parts) > 1:
@@ -663,23 +684,33 @@ class MissionManagerNode(Node):
                 self.fsm.notify_plate_detected(plate)
                 self.get_logger().info(f'Simulated plate: {plate}')
         elif cmd.startswith('VERIFY'):
-            # Simulate server response: VERIFY 17 or VERIFY 17 1,5,6
+            # Simulate server response: VERIFY 17 0,1,5,1,0 (slot + full path)
             parts = cmd.split()
             if len(parts) >= 2:
                 slot_id = int(parts[1])
                 waypoints = []
                 if len(parts) > 2:
                     waypoints = [int(x) for x in parts[2].split(',')]
-                self.fsm.notify_plate_response(True, slot_id, waypoints)
-                self.get_logger().info(f'Simulated verify: slot={slot_id}, waypoints={waypoints}')
+                prm = self._find_parking_road_marker(waypoints, slot_id)
+                self.fsm.notify_plate_response(True, slot_id, waypoints,
+                                               parking_road_marker=prm)
+                self.get_logger().info(
+                    f'Simulated verify: slot={slot_id}, path={waypoints}, '
+                    f'parking_marker={prm}'
+                )
         elif cmd.startswith('EXIT'):
-            # 출차: EXIT 1,5 17 (waypoints then slot) or EXIT 17 (direct)
+            # 출차: EXIT 0,1,5,1,0 17 (full round-trip path + slot) or EXIT 17 (direct)
             parts = cmd.split()
             if len(parts) >= 3:
                 waypoints = [int(x) for x in parts[1].split(',')]
                 slot_id = int(parts[2])
-                self.fsm.start_mission(waypoints, slot_id, 'test_exit', 'EXIT')
-                self.get_logger().info(f'Exit mission started: {waypoints} -> slot {slot_id}')
+                prm = self._find_parking_road_marker(waypoints, slot_id)
+                self.fsm.start_mission(waypoints, slot_id, 'test_exit', 'EXIT',
+                                       parking_road_marker=prm)
+                self.get_logger().info(
+                    f'Exit mission started: path={waypoints}, slot={slot_id}, '
+                    f'parking_marker={prm}'
+                )
             elif len(parts) == 2:
                 slot_id = int(parts[1])
                 self.fsm.start_mission([], slot_id, 'test_exit', 'EXIT')
@@ -791,6 +822,17 @@ class MissionManagerNode(Node):
 
         # Handle specific state entries
         if new_state == MissionState.TURNING:
+            # RETREAT_FROM_SLOT 후 TURNING 진입 시 pre-parking heading 복원
+            if old_state == MissionState.RETREAT_FROM_SLOT:
+                old_heading = self._current_heading
+                self._current_heading = self.fsm.context.pre_parking_heading
+                self.get_logger().info(
+                    f'[HEADING] Restored pre-parking heading: '
+                    f'{math.degrees(old_heading):.1f}deg -> {math.degrees(self._current_heading):.1f}deg'
+                )
+                heading_msg = Float32()
+                heading_msg.data = self._current_heading
+                self.pub_heading.publish(heading_msg)
             self._setup_turn()
         elif new_state == MissionState.WAIT_VEHICLE:
             self._last_plate_number = ''
@@ -843,8 +885,11 @@ class MissionManagerNode(Node):
                 f'Retreat from slot: +vy={retreat_vy}, {self.retreat_from_slot_distance:.2f}m, {duration:.1f}s'
             )
         elif new_state == MissionState.PARK_DETECT:
+            # 주차 진입 전 heading 저장 (복귀 시 TURNING 계산에 필요)
+            self.fsm.context.pre_parking_heading = self._current_heading
             self.get_logger().info(
-                f'Starting parking detection for slot {self.fsm.context.parking.target_slot_id}'
+                f'Starting parking detection for slot {self.fsm.context.parking.target_slot_id} '
+                f'(saved heading={math.degrees(self._current_heading):.1f}deg)'
             )
         elif new_state == MissionState.PARK_RECOVERY:
             ctx = self.fsm.context.parking
@@ -958,9 +1003,71 @@ class MissionManagerNode(Node):
             self.get_logger().info(
                 f'Loaded {len(self._marker_positions)} markers from {yaml_path}'
             )
+            # Compute slot-to-road-marker mapping after loading
+            self._compute_slot_road_markers()
 
         except Exception as e:
             self.get_logger().error(f'Failed to load marker map: {e}')
+
+    def _compute_slot_road_markers(self):
+        """Compute slot_id -> [road_marker_ids] mapping by x-coordinate matching."""
+        self._slot_road_markers = {}
+        road_markers = {m: p for m, p in self._marker_positions.items() if 0 <= m <= 15}
+        slot_markers = {m: p for m, p in self._marker_positions.items() if 16 <= m <= 27}
+
+        x_tolerance = 0.02  # 2cm tolerance (positions are in meters after unit_scale)
+
+        for slot_id, slot_pos in slot_markers.items():
+            matches = []
+            for road_id, road_pos in road_markers.items():
+                if abs(road_pos[0] - slot_pos[0]) < x_tolerance:
+                    matches.append(road_id)
+            # Sort by y-distance to slot (closest first)
+            matches.sort(key=lambda m: abs(road_markers[m][1] - slot_pos[1]))
+            self._slot_road_markers[slot_id] = matches
+
+        self.get_logger().info(
+            f'Slot-road marker mapping computed: {self._slot_road_markers}'
+        )
+
+    def _find_parking_road_marker(self, full_path: list, target_slot_id: int) -> int:
+        """Find the road marker in the path where the robot should stop for parking.
+
+        Uses pre-computed x-coordinate matching. Returns the first matched road marker
+        found in the path, or -1 if not found.
+        """
+        possible = self._slot_road_markers.get(target_slot_id, [])
+        path_set = set(full_path)
+
+        # Primary: x-coordinate matched markers
+        for m in possible:
+            if m in path_set:
+                return m
+
+        # Fallback: closest road marker in path to slot position (by distance)
+        slot_pos = self._marker_positions.get(target_slot_id)
+        if not slot_pos:
+            return -1
+
+        best = -1
+        best_dist = float('inf')
+        for m_id in path_set:
+            if 16 <= m_id <= 27:
+                continue  # Skip slot markers
+            if m_id not in self._marker_positions:
+                continue
+            pos = self._marker_positions[m_id]
+            dist = math.sqrt((pos[0] - slot_pos[0])**2 + (pos[1] - slot_pos[1])**2)
+            if dist < best_dist:
+                best_dist = dist
+                best = m_id
+
+        if best >= 0:
+            self.get_logger().warn(
+                f'No x-matched road marker for slot {target_slot_id}, '
+                f'using closest: marker {best}'
+            )
+        return best
 
     def _map_updated_callback(self, msg: Bool):
         """Handle map update notification from server_bridge."""
