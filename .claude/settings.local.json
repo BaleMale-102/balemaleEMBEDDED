@@ -22,8 +22,7 @@
       "Bash(tmux has-session:*)",
       "Bash(grep:*)",
       "Bash(chmod:*)",
-      "Bash(source:*)",
-      "Bash(dir:*)"
+      "Bash(source:*)"
     ]
   }
 }

@@ -6,8 +6,7 @@ geometry_msgs/Pose pose           # Current/filtered pose
 geometry_msgs/Pose predicted_pose # Predicted pose (0.5s ahead)
 geometry_msgs/Vector3 velocity    # Estimated velocity (m/s)
 float32 distance                  # Current distance (m)
-float32 angle                     # Current angle (rad) - marker position relative to camera center
-float32 marker_yaw                # Marker's own orientation/yaw (rad) - for heading alignment
+float32 angle                     # Current angle (rad)
 bool is_detected                  # Currently detected
 float32 prediction_confidence     # Prediction confidence (0-1)
 float32 tracking_duration         # How long we've been tracking (s)

@@ -21,18 +21,9 @@ import math
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Int32
-from geometry_msgs.msg import Pose, Vector3, Quaternion
+from geometry_msgs.msg import Pose, Vector3
 
 from .kalman_filter import KalmanFilter2D, SimpleKalman1D
-
-
-def quaternion_to_yaw(q) -> float:
-    """Quaternion에서 yaw(z축 회전) 추출 - 카메라 좌표계 기준"""
-    # 카메라 좌표계: X-right, Y-down, Z-forward
-    # 마커의 yaw는 카메라 광축(Z) 기준 좌우 회전
-    siny_cosp = 2.0 * (q.w * q.y - q.z * q.x)
-    cosy_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
-    return math.atan2(siny_cosp, cosy_cosp)
 
 
 class MarkerTrackerNode(Node):
@@ -118,7 +109,6 @@ class MarkerTrackerNode(Node):
         self._is_tracking = False
         self._last_detection_time = 0.0
         self._tracking_start_time = 0.0
-        self._last_marker_orientation = None
 
     def _markers_callback(self, msg):
         """마커 배열 수신 콜백"""
@@ -151,13 +141,6 @@ class MarkerTrackerNode(Node):
         state = self.kf_position.update(x, z, current_time)
         angle = self.kf_angle.update(marker.angle)
 
-        # 마커 orientation에서 yaw 추출 및 Kalman 필터링
-        marker_yaw_raw = quaternion_to_yaw(marker.pose.orientation)
-        marker_yaw = self.kf_yaw.update(marker_yaw_raw)
-
-        # 마커의 orientation 저장 (passthrough)
-        self._last_marker_orientation = marker.pose.orientation
-
         # 추적 시작 시간 기록
         if not self._is_tracking:
             self._tracking_start_time = current_time
@@ -169,7 +152,6 @@ class MarkerTrackerNode(Node):
         self._publish_tracked(
             state=state,
             angle=angle,
-            marker_yaw=marker_yaw,
             is_detected=True,
             confidence=marker.confidence,
             current_time=current_time
@@ -196,7 +178,6 @@ class MarkerTrackerNode(Node):
         # 예측 모드
         state = self.kf_position.predict(0.05)  # 50ms 예측
         angle = self.kf_angle.predict()
-        marker_yaw = self.kf_yaw.predict()  # yaw도 예측
 
         # 신뢰도 감소
         decay = 1.0 - (time_since_detection / self.prediction_timeout)
@@ -209,7 +190,6 @@ class MarkerTrackerNode(Node):
         self._publish_tracked(
             state=state,
             angle=angle,
-            marker_yaw=marker_yaw,
             is_detected=False,
             confidence=confidence,
             current_time=current_time
@@ -219,7 +199,6 @@ class MarkerTrackerNode(Node):
         self,
         state,
         angle: float,
-        marker_yaw: float,
         is_detected: bool,
         confidence: float,
         current_time: float
@@ -235,11 +214,7 @@ class MarkerTrackerNode(Node):
         msg.pose.position.x = state.x
         msg.pose.position.y = 0.0
         msg.pose.position.z = state.z
-        # orientation: 마커의 실제 방향 전달 (있으면)
-        if hasattr(self, '_last_marker_orientation') and self._last_marker_orientation is not None:
-            msg.pose.orientation = self._last_marker_orientation
-        else:
-            msg.pose.orientation.w = 1.0
+        msg.pose.orientation.w = 1.0
 
         # 예측 포즈 (미래)
         msg.predicted_pose.position.x = state.x + state.vx * 0.5
@@ -255,8 +230,7 @@ class MarkerTrackerNode(Node):
         # 거리, 각도 (base_link 기준: z에 카메라 오프셋 추가)
         z_base = state.z + self.camera_offset_x
         msg.distance = math.sqrt(state.x**2 + z_base**2)
-        msg.angle = math.atan2(-state.x, z_base)  # base_link 기준 각도 (위치)
-        msg.marker_yaw = marker_yaw  # 마커 자체의 방향 (heading 정렬용)
+        msg.angle = math.atan2(-state.x, z_base)  # base_link 기준 각도
 
         # 상태
         msg.is_detected = is_detected

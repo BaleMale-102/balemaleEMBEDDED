@@ -152,9 +152,8 @@ class ArucoDetector:
             distance = np.linalg.norm(tvec)
             angle = math.atan2(-tvec[0], tvec[2])  # 양수=왼쪽
 
-            # 마커의 yaw (2D 회전 기반 - 카메라 pitch에 덜 민감)
-            # 카메라가 비스듬히 아래를 봐도 마커의 이미지 상 기울기로 heading 판단
-            yaw = self._compute_2d_rotation(corner)
+            # 마커의 yaw (회전 행렬에서 추출)
+            yaw = self._extract_yaw(rvec)
 
             # 신뢰도 계산 (마커 크기 기반)
             perimeter = cv2.arcLength(corner, True)
@@ -201,40 +200,13 @@ class ArucoDetector:
         return tvec.flatten(), rvec.flatten()
 
     def _extract_yaw(self, rvec: np.ndarray) -> float:
-        """회전 벡터에서 yaw 추출 (레거시 - 3D pose 기반)"""
+        """회전 벡터에서 yaw 추출"""
         R, _ = cv2.Rodrigues(rvec)
 
         # Yaw (Z축 회전)
         yaw = math.atan2(R[1, 0], R[0, 0])
 
         return yaw
-
-    def _compute_2d_rotation(self, corners: np.ndarray) -> float:
-        """마커 코너에서 2D 회전 각도 계산 (이미지 평면 기준)
-
-        카메라가 비스듬히 내려다봐도 이 값은 영향을 덜 받음.
-        마커가 이미지에서 수평이면 0, 왼쪽으로 기울면 양수.
-
-        Args:
-            corners: 마커의 4개 코너 (4, 2) - [top-left, top-right, bottom-right, bottom-left]
-
-        Returns:
-            회전 각도 (rad) - 양수=CCW (마커가 왼쪽으로 기울어짐 = 로봇이 CW로 돌아있음)
-        """
-        # 상단 두 코너를 이용 (top-left, top-right)
-        top_left = corners[0]
-        top_right = corners[1]
-
-        # 상단 가장자리의 기울기 (이미지 좌표계: Y 아래로 증가)
-        dx = top_right[0] - top_left[0]
-        dy = top_right[1] - top_left[1]
-
-        # 회전 각도: 수평 기준
-        # 마커가 정면이면 dx > 0, dy ≈ 0 → rotation ≈ 0
-        # 마커가 왼쪽으로 기울면 (로봇이 CW) → dy > 0 → rotation > 0
-        rotation = math.atan2(dy, dx)
-
-        return rotation
 
     def draw_markers(
         self,
