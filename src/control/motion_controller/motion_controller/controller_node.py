@@ -428,6 +428,7 @@ class MotionControllerNode(Node):
                 self._turn_direction = 1 if self._turn_target_rad > 0 else -1
                 self._marker_seen_during_turn = False
                 self._marker_visible_at_turn_end = False
+                self._marker_last_seen_time = 0.0  # 마커 마지막 감지 시각
                 self._post_turn_search_mode = False
                 self._turn_last_target = self._turn_target_rad  # 변경 감지용
                 self._turn_log_count = 0  # 초기 반복 로깅용
@@ -1130,6 +1131,7 @@ class MotionControllerNode(Node):
             self._last_stall_check_time = now
 
         if marker_ok:
+            self._marker_last_seen_time = now
             marker_angle = self._tracked_marker.angle
 
             # 마커 발견 후: angle이 충분히 작으면 턴 완료
@@ -1169,23 +1171,28 @@ class MotionControllerNode(Node):
             return cmd, 0.0, 0.0, 0.0, detail
 
         # ========================================
-        # IMU fallback: 마커 한 번도 안 보인 경우 각도 기반 턴 완료
-        # (9→15, 4→10 등 먼 거리에서 마커가 카메라 범위 밖)
+        # IMU fallback: 마커 안 보이는 경우 각도 기반 턴 완료
+        # - 마커 한 번도 안 본 경우 (9→15, 4→10 등 먼 거리)
+        # - 마커 봤다가 3초 이상 놓친 경우 (잠깐 prediction 후 소실)
         # ========================================
-        if not self._marker_seen_during_turn:
+        marker_lost_long = (self._marker_seen_during_turn and
+                            self._marker_last_seen_time > 0 and
+                            now - self._marker_last_seen_time > 3.0)
+        if not self._marker_seen_during_turn or marker_lost_long:
             diff = self._current_yaw - self._turn_start_yaw
             while diff > math.pi: diff -= 2 * math.pi
             while diff < -math.pi: diff += 2 * math.pi
             total_rotation = abs(diff)
             target_rotation = abs(self._turn_target_rad)
             if target_rotation > 0.1 and total_rotation >= target_rotation * 0.9:
+                fallback_reason = 'marker lost >3s' if marker_lost_long else 'marker never seen'
                 self._publish_turn_done()
                 self._turn_done_sent = True
                 self.get_logger().info(
                     f'Turn complete (IMU fallback): rotated {math.degrees(total_rotation):.1f}deg, '
-                    f'target {math.degrees(self._turn_target_rad):.1f}deg (marker never seen)'
+                    f'target {math.degrees(self._turn_target_rad):.1f}deg ({fallback_reason})'
                 )
-                return cmd, 0.0, 0.0, 0.0, 'Turn done (IMU, marker not found)'
+                return cmd, 0.0, 0.0, 0.0, f'Turn done (IMU, {fallback_reason})'
 
         # 마커 미발견 → 일정 속도로 계속 회전
         # _turn_direction: +1 = CCW (좌회전), -1 = CW (우회전)

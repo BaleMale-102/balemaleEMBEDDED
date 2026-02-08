@@ -106,6 +106,9 @@ class MqttRosBridge(Node):
         self.declare_parameter("mqtt.pub.anomaly", "balemale/robot/{robotId}/anomaly")
         self.declare_parameter("mqtt.pub.ack", "balemale/robot/{robotId}/ack")
         self.declare_parameter("mqtt.pub.heartbeat", "balemale/robot/{robotId}/heartbeat")
+        self.declare_parameter("mqtt.pub.reassign_request", "balemale/robot/{robotId}/request/reassign")
+
+
 
         # ====================================================================
         # ROS Parameters - ROS Topics (DO NOT CHANGE - used by other nodes)
@@ -115,6 +118,9 @@ class MqttRosBridge(Node):
         self.declare_parameter("ros.sub.task_status", "/server/task_status")
         self.declare_parameter("ros.sub.plate_query", "/plate/query")
         self.declare_parameter("ros.sub.mission_state", "/mission/state")
+        self.declare_parameter("ros.sub.anomaly_report", "/server/anomaly_report")
+        self.declare_parameter("ros.sub.task_cmd", "/server/task_cmd")
+
 
         # ====================================================================
         # ROS Parameters - Behavior
@@ -148,6 +154,13 @@ class MqttRosBridge(Node):
         self.keepalive = int(self.get_parameter("mqtt.keepalive").value)
         self.robot_id = str(int(self.get_parameter("robot_id").value))
         self.simulation = bool(self.get_parameter("simulation").value)
+        self._last_anomaly_key = ""
+        self._last_anomaly_ts = 0.0
+        self.anom_thr = 1.0
+        self._anomaly_active = False
+        self._anomaly_active_until = 0.0
+        self.declare_parameter("anomaly_suppress_sec", 2.0)
+        self.anom_suppress_sec = float(self.get_parameter("anomaly_suppress_sec").value)
 
         self.hb_hz = float(self.get_parameter("heartbeat_hz").value)
         self.log_thr = float(self.get_parameter("log_throttle_sec").value)
@@ -165,6 +178,9 @@ class MqttRosBridge(Node):
         self.t_pub_anomaly = self._fmt_topic("mqtt.pub.anomaly")
         self.t_pub_ack = self._fmt_topic("mqtt.pub.ack")
         self.t_pub_heartbeat = self._fmt_topic("mqtt.pub.heartbeat")
+        self.t_pub_reassign = self._fmt_topic("mqtt.pub.reassign_request")
+
+
 
         # ROS topics
         self.ros_pub_task_cmd = self.get_parameter("ros.pub.task_cmd").value
@@ -172,6 +188,9 @@ class MqttRosBridge(Node):
         self.ros_sub_task_status = self.get_parameter("ros.sub.task_status").value
         self.ros_sub_plate_query = self.get_parameter("ros.sub.plate_query").value
         self.ros_sub_mission_state = self.get_parameter("ros.sub.mission_state").value
+        self.ros_sub_anomaly_report = self.get_parameter("ros.sub.anomaly_report").value
+        self.ros_sub_task_cmd = self.get_parameter("ros.sub.task_cmd").value
+
 
         # Map file
         self.map_file_path = self.get_parameter("map_file_path").value
@@ -216,6 +235,22 @@ class MqttRosBridge(Node):
             String, self.ros_sub_mission_state,
             self._cb_mission_state, 10
         )
+
+        self.sub_anomaly_report = self.create_subscription(
+            String,
+            self.ros_sub_anomaly_report,
+            self._cb_anomaly_report,
+            10
+        )
+
+        self.sub_task_cmd = self.create_subscription(
+            MissionCommand,
+            self.ros_sub_task_cmd,
+            self._cb_task_cmd,
+            10
+        )
+
+
 
         # ====================================================================
         # MQTT Client Setup
@@ -440,6 +475,11 @@ class MqttRosBridge(Node):
                     f"[EXIT] vehicle={vehicle_id} target={target_node_id} path={clean_path}"
                 )
                 self._handle_exit_result(vehicle_id, target_node_id, clean_path)
+            elif cmd_type == "5":
+                self.get_logger().info(
+                    f"[REASSIGN] req={req_id} vehicle={vehicle_id} target={target_node_id} path={clean_path}"
+                )
+                self._handle_reassign_result(req_id, vehicle_id, target_node_id, clean_path, task_type="PARK")
 
             else:
                 self.get_logger().warn(f"Unknown server cmd type: {cmd_type}")
@@ -504,6 +544,45 @@ class MqttRosBridge(Node):
 
         self.pub_task_cmd.publish(cmd)
         self.get_logger().info(f"Exit command published: drive to {target_node_id}")
+
+    def _handle_reassign_result(self, req_id: str, vehicle_id: int,
+                            target_node_id: int, path: list,
+                            task_type: str = "PARK"):
+        
+        try:
+            if target_node_id < 0:
+                self.get_logger().warn(f"[REASSIGN] invalid targetNodeId={target_node_id} (skip)")
+                return
+
+            clean_path = []
+            if isinstance(path, list):
+                for x in path:
+                    try:
+                        clean_path.append(int(x))
+                    except (ValueError, TypeError):
+                        pass
+
+            self._current_req_id = str(req_id or self._current_req_id or str(uuid.uuid4())[:8])
+            self._current_vehicle_id = int(vehicle_id) if vehicle_id is not None else self._current_vehicle_id
+
+            cmd = MissionCommand()
+            cmd.header.stamp = self.get_clock().now().to_msg()
+            cmd.command = "START"
+            cmd.waypoint_ids = list(clean_path)
+            cmd.final_goal_id = int(target_node_id)
+            cmd.task_type = task_type
+            cmd.task_id = self._current_req_id
+
+            self.pub_task_cmd.publish(cmd)
+
+            self.get_logger().info(
+                f"[REASSIGN] START published req={self._current_req_id} "
+                f"vehicle={self._current_vehicle_id} target={target_node_id} path={clean_path}"
+            )
+
+        except Exception as e:
+            self.get_logger().error(f"Reassign handling error: {e}")
+
 
     def _handle_server_map(self, p: Dict[str, Any]):
         """
@@ -620,22 +699,45 @@ class MqttRosBridge(Node):
     # ROS -> MQTT Callbacks (Modify these for communication changes)
     # ========================================================================
 
+    def _cb_task_cmd(self, msg: MissionCommand):
+        cmd = (msg.command or "").upper()
+        ttype = (msg.task_type or "").upper()
+
+        if cmd == "RESUME" and ttype == "DROPOFF":
+            now_node_id = self._current_node_id
+            req_id = self._current_req_id
+            vehicle_id = self._current_vehicle_id
+
+            if not req_id or vehicle_id < 0:
+                self.get_logger().warn(
+                    f"[REASSIGN] skip (missing req_id/vehicle_id) "
+                    f"req_id='{req_id}' vehicle_id={vehicle_id}"
+                )
+                return
+
+            self._publish_reassign_request(req_id=req_id, vehicle_id=vehicle_id, now_node_id=now_node_id)
+            self.get_logger().warn(f"[REASSIGN] sent reqId={req_id} vehicleId={vehicle_id} nowNodeId={now_node_id}")
+
+
     def _cb_task_status(self, msg: MissionStatus):
-        """
-        Handle task status update from mission_manager.
-        Forward as event to MQTT only when event type changes.
-        """
         if not self._connected:
             return
 
-        # Update current node tracking
+        now_t = time.time()
+        if self._anomaly_active and now_t >= self._anomaly_active_until:
+            self._anomaly_active = False
+
         if msg.current_marker_id >= 0:
             self._current_node_id = msg.current_marker_id
 
-        # Map to event type
         event_type = self._map_status_to_event(msg.status, msg.current_state)
 
-        # Only send if changed
+        now_t = time.time()
+        if self._anomaly_active and now_t < self._anomaly_active_until:
+            if event_type:
+                self._last_event_type = event_type
+            return
+
         if event_type and event_type != self._last_event_type:
             if self._current_req_id and self._current_vehicle_id >= 0:
                 self._publish_event(
@@ -645,6 +747,91 @@ class MqttRosBridge(Node):
                 )
                 self.get_logger().info(f"Event changed: {self._last_event_type} -> {event_type}")
             self._last_event_type = event_type
+
+
+    def _cb_anomaly_report(self, msg: String):
+        """
+        Receives JSON string from /server/anomaly_report and forwards to MQTT anomaly topic.
+        Expected JSON:
+        {
+            "anomaly_type": "HUMAN|OBSTACLE|SLOT_BLOCKED",
+            "distance_cm": 12.3,
+            "event_type": "ESTOP|WARNING",
+            "state": "...",
+            "marker_id": 17,
+            "next_marker": 18
+        }
+        """
+        if not self._connected:
+            return
+
+        raw = (msg.data or "").strip()
+        if not raw:
+            return
+
+        try:
+            p = json.loads(raw)
+        except Exception as e:
+            self.get_logger().warn(f"anomaly_report invalid JSON: {e} | raw={raw[:120]}")
+            return
+
+        anomaly_type = str(p.get("anomaly_type", "SYSTEM")).upper()
+        event_type = str(p.get("event_type", "ESTOP")).upper()     # ESTOP/WARNING
+        state = str(p.get("state", ""))
+        distance_cm = float(p.get("distance_cm", -1))
+        marker_id = int(p.get("marker_id", -1))
+        next_marker = int(p.get("next_marker", -1))
+
+        now_node_id = marker_id if marker_id >= 0 else self._current_node_id
+        next_node_id = next_marker if next_marker >= 0 else now_node_id
+
+        key = f"{event_type}:{anomaly_type}:{now_node_id}:{next_node_id}:{self._current_req_id}:{self._current_vehicle_id}"
+        now_t = time.time()
+        if key == self._last_anomaly_key and (now_t - self._last_anomaly_ts) < self.anom_thr:
+            return
+        self._last_anomaly_key = key
+        self._last_anomaly_ts = now_t
+
+        self._publish_anomaly(
+            req_id=self._current_req_id or f"robot-{self.robot_id}",
+            vehicle_id=self._current_vehicle_id if self._current_vehicle_id >= 0 else -1,
+            event_type=event_type,
+            anomaly_type=anomaly_type,
+            edge_id=0,
+            now_node_id=now_node_id,
+            next_node_id=next_node_id
+        )
+
+        now_t = time.time()
+        self._anomaly_active = True
+        self._anomaly_active_until = now_t + self.anom_suppress_sec
+
+        self.get_logger().warn(
+            f"[ANOMALY] {event_type} {anomaly_type} dist={distance_cm:.1f}cm "
+            f"now={now_node_id} next={next_node_id} state={state}"
+        )
+
+        if anomaly_type == "OBSTACLE" and event_type == "ESTOP":
+            self.request_reroute()
+
+        if (anomaly_type in ("OBSTACLE", "SLOT_BLOCKED") and event_type == "ESTOP"
+            and self._current_req_id and self._current_vehicle_id >= 0):
+            self._publish_reassign_request(
+                req_id=self._current_req_id,
+                vehicle_id=self._current_vehicle_id,
+                now_node_id=now_node_id
+            )
+            self.get_logger().warn(f"[REASSIGN] requested req={self._current_req_id} vehicle={self._current_vehicle_id} nowNodeId={now_node_id}")
+
+    def _publish_reassign_request(self, req_id: str, vehicle_id: int, now_node_id: int):
+        payload = {
+            "reqId": req_id,
+            "nowNodeId": int(now_node_id),
+            "vehicleId": int(vehicle_id),
+        }
+        self._mqtt_publish(self.t_pub_reassign, payload, qos=1)
+
+
 
     def _map_status_to_event(self, status: str, state: str) -> str:
         """
@@ -787,6 +974,8 @@ class MqttRosBridge(Node):
         """Report anomaly to server (HUMAN, OBSTACLE, SYSTEM)."""
         if not self._connected:
             return
+        if anomaly_type == "SLOT_BLOCKED":
+            anomaly_type = "OBSTACLE"
 
         self._publish_anomaly(
             req_id=self._current_req_id,

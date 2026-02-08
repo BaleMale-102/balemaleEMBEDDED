@@ -125,7 +125,7 @@ class AnomalyDetectorNode(Node):
             self.socket.connect((self.server_host, self.server_port))
             self.get_logger().info(f'Connected to AI server')
         except Exception as e:
-            self.get_logger().error(f'Failed to connect to AI server: {e}')
+            # self.get_logger().error(f'Failed to connect to AI server: {e}')
             self.socket = None
 
     def _image_callback(self, msg: Image):

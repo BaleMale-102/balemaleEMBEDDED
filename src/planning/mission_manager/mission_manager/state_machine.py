@@ -337,6 +337,9 @@ class StateMachine:
     def start_mission(self, waypoint_ids: List[int], final_goal_id: int,
                       task_id: str = '', task_type: str = ''):
         """Start a navigation mission (from server command or manual)."""
+        # 재할당 시 현재 위치 보존 (초기 TURNING 용)
+        prev_marker_id = self._context.current_marker_id
+
         self._context.reset()
         self._context.waypoint_ids = waypoint_ids
         self._context.final_goal_id = final_goal_id
@@ -356,6 +359,12 @@ class StateMachine:
         # waypoint 없는 PARK/EXIT → 바로 PARK_DETECT (side camera 사용)
         if not waypoint_ids and self._context.task_type in ('PARK', 'DROPOFF', 'EXIT'):
             self._change_state(MissionState.PARK_DETECT)
+        elif prev_marker_id >= 0 and waypoint_ids:
+            # 이전 위치 알고 있음 → 첫 waypoint 방향으로 TURNING 후 DRIVE
+            # (RETURN_HOME과 동일한 idx=-1 패턴)
+            self._context.current_marker_id = prev_marker_id
+            self._context.current_waypoint_idx = -1
+            self._change_state(MissionState.TURNING)
         else:
             self._change_state(MissionState.DRIVE)
 
@@ -678,8 +687,8 @@ class StateMachine:
         return None
 
     def _return_home_transition(self) -> Optional[MissionState]:
-        """Start retreat from slot, then turn and drive home."""
-        return MissionState.RETREAT_FROM_SLOT
+        """Start turning and drive home (RETREAT_FROM_SLOT disabled)."""
+        return MissionState.TURNING
 
     def _retreat_from_slot_transition(self) -> Optional[MissionState]:
         """고정 거리 +vy 평행이동 완료 시 TURNING."""
@@ -771,6 +780,11 @@ class StateMachine:
     # Parking sub-state transitions
     def _park_detect_transition(self) -> Optional[MissionState]:
         """Wait for slot marker detection."""
+        # side_cam 안정화 대기 (렉 방지)
+        elapsed = time.time() - self._context.state_enter_time
+        if elapsed < self._delays.get('park_detect_settle', 1.0):
+            return None
+
         ctx = self._context.parking
 
         if ctx.detected_slot_id < 0:

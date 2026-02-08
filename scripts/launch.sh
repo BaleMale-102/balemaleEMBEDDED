@@ -24,12 +24,12 @@ start_all() {
     sleep 1
 
     # tmux 세션 생성
-    echo "[1/3] Starting AI Anomaly Server..."
-    tmux new-session -d -s $SESSION_NAME -n ai_anomaly
-    tmux send-keys -t $SESSION_NAME:ai_anomaly "source /home/a102/miniforge3/etc/profile.d/conda.sh && conda activate $CONDA_ENV && cd $BALEMALE_AI_PATH && python servers/anomaly_server.py" C-m
+    # echo "[1/3] Starting AI Anomaly Server..."
+    # tmux new-session -d -s $SESSION_NAME -n ai_anomaly
+    # tmux send-keys -t $SESSION_NAME:ai_anomaly "source /home/a102/miniforge3/etc/profile.d/conda.sh && conda activate $CONDA_ENV && cd $BALEMALE_AI_PATH && python servers/anomaly_server.py" C-m
 
     echo "[2/3] Starting AI OCR Server..."
-    tmux new-window -t $SESSION_NAME -n ai_ocr
+    tmux new-session -d -s $SESSION_NAME -n ai_ocr
     tmux send-keys -t $SESSION_NAME:ai_ocr "source /home/a102/miniforge3/etc/profile.d/conda.sh && conda activate $CONDA_ENV && cd $BALEMALE_AI_PATH && python servers/ocr_server.py" C-m
 
     # AI 서버 초기화 대기
@@ -74,7 +74,7 @@ stop_all() {
     tmux kill-session -t $SESSION_NAME 2>/dev/null && echo "  Session '$SESSION_NAME' terminated" || echo "  Session not running"
 
     # 개별 프로세스도 정리
-    pkill -f "anomaly_server.py" 2>/dev/null
+    # pkill -f "anomaly_server.py" 2>/dev/null
     pkill -f "ocr_server.py" 2>/dev/null
     echo "  Cleanup complete"
 }
@@ -95,11 +95,11 @@ check_status() {
     echo ""
 
     echo "[AI Servers]"
-    if pgrep -f "anomaly_server.py" > /dev/null; then
-        echo "  Anomaly Server: Running (port 9001)"
-    else
-        echo "  Anomaly Server: Not running"
-    fi
+    # if pgrep -f "anomaly_server.py" > /dev/null; then
+    #     echo "  Anomaly Server: Running (port 9001)"
+    # else
+    #     echo "  Anomaly Server: Not running"
+    # fi
     if pgrep -f "ocr_server.py" > /dev/null; then
         echo "  OCR Server: Running (port 9002)"
     else

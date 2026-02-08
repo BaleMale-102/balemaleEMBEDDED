@@ -95,6 +95,7 @@ class MissionManagerNode(Node):
         # State delay parameters
         self.declare_parameter('delay_stop_at_marker', 0.5)
         self.declare_parameter('delay_stop_bump', 0.3)
+        self.declare_parameter('delay_park_detect_settle', 1.0)  # side_cam 안정화 대기 (초)
 
         update_rate = self.get_parameter('update_rate').value
         self.default_turn_angle = self.get_parameter('default_turn_angle').value
@@ -130,6 +131,7 @@ class MissionManagerNode(Node):
         delays = {
             'stop_at_marker': self.get_parameter('delay_stop_at_marker').value,
             'stop_bump': self.get_parameter('delay_stop_bump').value,
+            'park_detect_settle': self.get_parameter('delay_park_detect_settle').value,
         }
 
         # Load marker map
@@ -644,6 +646,8 @@ class MissionManagerNode(Node):
         elif cmd == 'STOP':
             self.fsm.cancel_mission()
             self._disable_drive()
+            self._anomaly_paused = False
+            self._anomaly_type = ''
             self._send_loader_command('STOP')
         elif cmd == 'REACHED':
             self.fsm.notify_marker_reached(self.fsm.context.current_target_marker)
